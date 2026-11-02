@@ -1,0 +1,24 @@
+<mujoco>
+  <compiler angle="radian"/>
+  <option gravity="0 0 0"/>
+  <worldbody>
+    <body name="reference" quat="1 0 1 0">
+      <joint axis="0 1 0"/>
+      <geom type="sphere" size="0.1" contype="0" conaffinity="0"/>
+      <site name="reference" quat="1 0 0 1"/>
+    </body>
+    <body name="target" pos="1 0 0" quat="1 1 0 0">
+      <joint axis="1 0 0"/>
+      <geom type="sphere" size="0.1" contype="0" conaffinity="0"/>
+      <site name="target" quat="1 0 1 0"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <general site="target" refsite="reference" gear="0 0 0 1 0 0"/>
+    <general site="target" refsite="reference" gear="0 0 0 0 1 0"/>
+    <general site="target" refsite="reference" gear="0 0 0 0 0 1"/>
+  </actuator>
+  <keyframe>
+    <key qpos="0.2 -0.3"/>
+  </keyframe>
+</mujoco>
