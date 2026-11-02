@@ -225,7 +225,7 @@ def _equality_connect(is_sparse: bool, newton: bool):
     wp.atomic_add(ne_out, worldid, 3)
     efcid = wp.atomic_add(nefc_out, worldid, 3)
 
-    if efcid >= njmax_in - 3:
+    if efcid > njmax_in - 3:
       return
 
     if wp.static(is_sparse and newton):
@@ -1036,7 +1036,7 @@ def _equality_weld(is_sparse: bool, newton: bool):
     wp.atomic_add(ne_out, worldid, 6)
     efcid = wp.atomic_add(nefc_out, worldid, 6)
 
-    if efcid >= njmax_in - 6:
+    if efcid > njmax_in - 6:
       return
 
     if wp.static(is_sparse and newton):
