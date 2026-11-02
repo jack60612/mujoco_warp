@@ -467,6 +467,61 @@ class IOTest(parameterized.TestCase):
   def test_augmented_cholesky_nvmax_padding(self, nvmax, expected):
     self.assertEqual(io._nvmax_pad(nvmax), expected)
 
+  @parameterized.product(
+    joint_types=[("ball",), ("hinge", "hinge"), ("slide", "slide"), ("ball", "hinge"), ("ball", "hinge", "slide")],
+    make_data=[True, False],
+  )
+  def test_sparse_joint_limit_capacity(self, joint_types, make_data):
+    """All active joint limits fit in the default sparse Jacobian allocation."""
+    bodies = ""
+    for i, joint_type in enumerate(joint_types):
+      limit_range = "0 .2" if joint_type == "ball" else "-.2 .2"
+      bodies += f"""
+        <body pos="{i} 0 0">
+          <joint type="{joint_type}" limited="true" range="{limit_range}"/>
+          <geom size=".1" contype="0" conaffinity="0"/>
+        </body>
+      """
+    mjm = mujoco.MjModel.from_xml_string(f"""
+      <mujoco>
+        <compiler angle="radian"/>
+        <option jacobian="sparse"/>
+        <worldbody>{bodies}</worldbody>
+      </mujoco>
+    """)
+    mjd = mujoco.MjData(mjm)
+    for i, joint_type in enumerate(joint_types):
+      qposadr = mjm.jnt_qposadr[i]
+      if joint_type == "ball":
+        mjd.qpos[qposadr : qposadr + 4] = [np.cos(.25), np.sin(.25), 0, 0]
+      else:
+        mjd.qpos[qposadr] = .5
+    mujoco.mj_forward(mjm, mjd)
+
+    # A ball limit stores three entries, including numerical zeros; a scalar limit stores one.
+    expected_nnz = sum(3 if joint_type == "ball" else 1 for joint_type in joint_types)
+    self.assertEqual(mjd.nefc, len(joint_types))
+    self.assertEqual(mjd.ncon, 0)
+    self.assertEqual(mjd.efc_J.size, expected_nnz)
+    njmax = len(joint_types) + 1
+    self.assertEqual(io._default_njmax_nnz(mjm, 0, njmax), expected_nnz)
+    if make_data:
+      d = mjwarp.make_data(mjm, nconmax=0, njmax=njmax)
+      d.qpos.assign(mjd.qpos[np.newaxis])
+      mjwarp.forward(mjwarp.put_model(mjm), d)
+    else:
+      d = mjwarp.put_data(mjm, mjd, nconmax=0, njmax=njmax)
+
+    self.assertEqual(d.njmax_nnz, expected_nnz)
+    self.assertEqual(d.efc.J.shape, (1, 1, expected_nnz))
+    self.assertEqual(d.efc.J_colind.shape, (1, 1, expected_nnz))
+    self.assertEqual(d.nefc.numpy()[0], mjd.nefc)
+    rownnz = d.efc.J_rownnz.numpy()[0, : mjd.nefc]
+    rowadr = d.efc.J_rowadr.numpy()[0, : mjd.nefc]
+    np.testing.assert_array_equal(np.sort(rownnz), np.sort(mjd.efc_J_rownnz))
+    self.assertEqual(int(rownnz.sum()), expected_nnz)
+    self.assertLessEqual(int(np.max(rowadr + rownnz)), d.njmax_nnz)
+
   def test_make_put_data(self):
     """Tests that make_data and put_data are producing the same shapes for all arrays."""
     mjm, _, _, d = test_data.fixture("pendula.xml", nvmax=None)

@@ -1574,7 +1574,7 @@ def _default_njmax_nnz(mjm: mujoco.MjModel, nconmax: int, njmax: int) -> int:
   # limit constraints (assume all active)
   for i in range(mjm.njnt):
     if mjm.jnt_limited[i]:
-      jnt_type = mjm.jnt_type[i]
+      jnt_type = int(mjm.jnt_type[i])
       if jnt_type == mujoco.mjtJoint.mjJNT_BALL:
         total_nnz += 3
       elif jnt_type in (mujoco.mjtJoint.mjJNT_SLIDE, mujoco.mjtJoint.mjJNT_HINGE):
@@ -3276,12 +3276,6 @@ def _finalize_body_invweight0(
     + body_A_diag_in[body_A_diag_id, bodyid, 4]
     + body_A_diag_in[body_A_diag_id, bodyid, 5]
   )
-
-  # Prevent degenerate constraints: if one component is near zero, use the other as fallback
-  if inv_trans < mujoco.mjMINVAL and inv_rot > mujoco.mjMINVAL:
-    inv_trans = inv_rot  # use rotation as fallback for translation
-  elif inv_rot < mujoco.mjMINVAL and inv_trans > mujoco.mjMINVAL:
-    inv_rot = inv_trans  # use translation as fallback for rotation
 
   body_invweight0_out[body_invweight0_id, bodyid] = wp.vec2(inv_trans, inv_rot)
 
