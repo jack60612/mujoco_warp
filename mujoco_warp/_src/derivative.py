@@ -258,11 +258,9 @@ def _qderiv_actuator_passive(
   qDeriv_out[worldid, madr] = M_in[worldid, madr] - qderiv
 
 
-# TODO(team): improve performance with tile operations?
 @wp.kernel
 def _qderiv_tendon_damping(
   # Model:
-  ntendon: int,
   opt_timestep: wp.array[float],
   ten_J_rownnz: wp.array[int],
   ten_J_rowadr: wp.array[int],
@@ -273,49 +271,39 @@ def _qderiv_tendon_damping(
   # Data in:
   ten_J_in: wp.array2d[float],
   ten_velocity_in: wp.array2d[float],
-  # In:
-  Mi: wp.array[int],
-  Mj: wp.array[int],
   # Out:
   qDeriv_out: wp.array2d[float],
 ):
-  worldid, elemid = wp.tid()
-  dofiid = Mi[elemid]
-  dofjid = Mj[elemid]
-
-  # Off-pattern (dofiid, dofjid) pairs have no CSR entry (madr < 0).
-  madr = M_elemid[dofiid, dofjid]
-  if madr < 0:
+  worldid, tenid = wp.tid()
+  damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
+  dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
+  if damping == 0.0 and dpoly[0] == 0.0 and dpoly[1] == 0.0:
     return
 
-  qderiv = float(0.0)
-  tendon_damping_id = worldid % tendon_damping.shape[0]
-  for tenid in range(ntendon):
-    damping = tendon_damping[tendon_damping_id, tenid]
-    dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
-    if damping == 0.0 and dpoly[0] == 0.0 and dpoly[1] == 0.0:
+  v = ten_velocity_in[worldid, tenid]
+  deriv = opt_timestep[worldid % opt_timestep.shape[0]] * util_misc._poly_force_deriv(damping, dpoly, v, 1)
+  if deriv == 0.0:
+    return
+
+  # Scatter J.T @ damping' @ J into the existing lower-triangular M pattern.
+  # As for actuator damping, couplings outside that pattern are omitted.
+  rownnz = ten_J_rownnz[tenid]
+  rowadr = ten_J_rowadr[tenid]
+  for i in range(rownnz):
+    sparsei = rowadr + i
+    Ji = ten_J_in[worldid, sparsei]
+    if Ji == 0.0:
       continue
-
-    rownnz = ten_J_rownnz[tenid]
-    rowadr = ten_J_rowadr[tenid]
-    Ji = float(0.0)
-    Jj = float(0.0)
-    for k in range(rownnz):
-      if Ji != 0.0 and Jj != 0.0:
-        break
-      sparseid = rowadr + k
-      colind = ten_J_colind[sparseid]
-      if colind == dofiid:
-        Ji = ten_J_in[worldid, sparseid]
-      if colind == dofjid:
-        Jj = ten_J_in[worldid, sparseid]
-
-    v = ten_velocity_in[worldid, tenid]
-    qderiv -= Ji * Jj * util_misc._poly_force_deriv(damping, dpoly, v, 1)
-
-  qderiv *= opt_timestep[worldid % opt_timestep.shape[0]]
-
-  qDeriv_out[worldid, madr] -= qderiv
+    dofi = ten_J_colind[sparsei]
+    for j in range(i + 1):
+      sparsej = rowadr + j
+      Jj = ten_J_in[worldid, sparsej]
+      if Jj == 0.0:
+        continue
+      dofj = ten_J_colind[sparsej]
+      madr = M_elemid[dofi, dofj]
+      if madr >= 0:
+        wp.atomic_add(qDeriv_out[worldid], madr, Ji * Jj * deriv)
 
 
 @wp.kernel
@@ -1190,12 +1178,11 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
     # TODO(team): directly utilize M for these settings
     wp.copy(out, d.M)
 
-  if not (m.opt.disableflags & DisableBit.DAMPER):
+  if m.ntendon and not (m.opt.disableflags & DisableBit.DAMPER):
     wp.launch(
       _qderiv_tendon_damping,
-      dim=(d.nworld, Mi.size),
+      dim=(d.nworld, m.ntendon),
       inputs=[
-        m.ntendon,
         m.opt.timestep,
         m.ten_J_rownnz,
         m.ten_J_rowadr,
@@ -1205,8 +1192,6 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float]):
         m.M_elemid,
         d.ten_J,
         d.ten_velocity,
-        Mi,
-        Mj,
       ],
       outputs=[out],
     )
