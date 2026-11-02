@@ -45,6 +45,48 @@ def _assert_eq(a, b, name):
 
 
 class ForwardTest(parameterized.TestCase):
+  @parameterized.product(
+    integrator=("Euler", "implicit", "implicitfast"),
+    jacobian=(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+    njmax=(0, 1),
+  )
+  def test_unconstrained_integration(self, integrator, jacobian, njmax):
+    """Zero constraint capacity preserves the force used by implicit integration."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <option integrator="{integrator}" timestep=".002"/>
+        <worldbody>
+          <body>
+            <joint type="slide" axis="0 0 1" damping=".3"/>
+            <geom type="sphere" size=".1" mass="2" contype="0" conaffinity="0"/>
+          </body>
+        </worldbody>
+        <keyframe><key qvel=".2"/></keyframe>
+      </mujoco>
+      """,
+      keyframe=0,
+      njmax=njmax,
+      nworld=2,
+      overrides={"opt.jacobian": jacobian},
+    )
+    self.assertEqual(mjd.nefc, 0)
+    d.efc.Ma.fill_(wp.nan)
+    d.qfrc_constraint.fill_(123.0)
+    mjw.solve(m, d)
+    for world in range(d.nworld):
+      _assert_eq(d.qacc.numpy()[world], mjd.qacc, "qacc")
+      _assert_eq(d.efc.Ma.numpy()[world], mjd.qfrc_smooth, "Ma")
+      _assert_eq(d.qfrc_constraint.numpy()[world], mjd.qfrc_constraint, "qfrc_constraint")
+    for _ in range(3):
+      mujoco.mj_step(mjm, mjd)
+      mjw.step(m, d)
+      self.assertLess(mjd.qacc[0], -9.0)
+      for world in range(d.nworld):
+        _assert_eq(d.qacc.numpy()[world], mjd.qacc, "qacc")
+        _assert_eq(d.qvel.numpy()[world], mjd.qvel, "qvel")
+        _assert_eq(d.qpos.numpy()[world], mjd.qpos, "qpos")
+
   @parameterized.product(xml=["humanoid/humanoid.xml", "pendula.xml"])
   def test_fwd_velocity(self, xml):
     _, mjd, m, d = test_data.fixture(xml, qvel_noise=0.01, ctrl_noise=0.1)
