@@ -119,6 +119,40 @@ def _assert_efc_eq(mjm, m, d, mjd, nefc, name, nv, tol=_TOLERANCE):
 
 
 class ConstraintTest(parameterized.TestCase):
+  @parameterized.product(
+    equality=("connect", "weld"),
+    count=(1, 2),
+    spare_rows=(0, 1),
+    jacobian=(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+  )
+  def test_equality_capacity(self, equality, count, spare_rows, jacobian):
+    """Equality blocks may occupy the final rows of the constraint buffer."""
+    anchor = 'anchor="0 0 0"' if equality == "connect" else ""
+    equalities = "".join(f'<{equality} body1="body" {anchor}/>' for _ in range(count))
+    rows = count * (3 if equality == "connect" else 6)
+    mjm, mjd, m, d = test_data.fixture(
+      xml=f"""
+      <mujoco>
+        <worldbody>
+          <body name="body" pos="0 0 1">
+            <freejoint/>
+            <geom type="sphere" size=".1" mass="1" contype="0" conaffinity="0"/>
+          </body>
+        </worldbody>
+        <equality>{equalities}</equality>
+      </mujoco>
+      """,
+      njmax=rows + spare_rows,
+      overrides={"opt.jacobian": jacobian},
+    )
+    self.assertEqual(mjd.nefc, rows)
+    for arr in (d.efc.J, d.efc.D, d.efc.vel, d.efc.aref, d.efc.pos, d.efc.margin):
+      arr.fill_(wp.nan)
+    mjw.make_constraint(m, d)
+    self.assertEqual(d.nefc.numpy()[0], rows)
+    self.assertEqual(d.ne.numpy()[0], rows)
+    _assert_efc_eq(mjm, m, d, mjd, rows, "equality_capacity", m.nv)
+
   @parameterized.parameters(
     *itertools.product(
       (ConeType.PYRAMIDAL, ConeType.ELLIPTIC),
