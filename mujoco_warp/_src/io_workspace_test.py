@@ -41,7 +41,8 @@ def test_const0_workspace_matches_allocating_path(device):
     m.dof_armature.assign(np.array([[0, 0, 0, 0.0014435225, 0.0014435225, 0.0014435225], [0] * 6], dtype=np.float32))
     mjwarp.set_const_0(m, d)
     expected = {
-      name: getattr(m, name).numpy() for name in ("dof_invweight0", "body_invweight0", "tendon_invweight0", "actuator_acc0")
+      name: getattr(m, name).numpy().copy()
+      for name in ("dof_invweight0", "body_invweight0", "tendon_invweight0", "actuator_acc0")
     }
     # Warm all kernels before forbidding allocation. Repeated scratch reuse must
     # not depend on its previous contents or allocate nested tendon/transmission scratch.
