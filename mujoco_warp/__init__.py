@@ -54,6 +54,7 @@ from mujoco_warp._src.history import init_sensor_history as init_sensor_history
 from mujoco_warp._src.history import read_ctrl as read_ctrl
 from mujoco_warp._src.history import read_sensor as read_sensor
 from mujoco_warp._src.inverse import inverse as inverse
+from mujoco_warp._src.io import Const0Workspace as Const0Workspace
 from mujoco_warp._src.io import create_render_context as create_render_context
 from mujoco_warp._src.io import get_data_into as get_data_into
 from mujoco_warp._src.io import make_data as make_data

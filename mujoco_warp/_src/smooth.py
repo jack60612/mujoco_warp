@@ -2885,14 +2885,17 @@ def _transmission_body_moment_scale(
 
 
 @event_scope
-def transmission(m: Model, d: Data):
+def transmission(m: Model, d: Data, moment_nnz=None, ncon=None):
   """Computes actuator/transmission lengths and moments.
 
   Updates the actuator length and moments for all actuators in the model, including joint
   and tendon transmissions.
   """
   # TODO(team): investigate pre-computing moment_rownnz, moment_rowadr, moment_colind
-  moment_nnz = wp.zeros((d.nworld,), dtype=int)
+  if moment_nnz is None:
+    moment_nnz = wp.zeros((d.nworld,), dtype=int)
+  else:
+    moment_nnz.zero_()
 
   wp.launch(
     _transmission,
@@ -2934,7 +2937,10 @@ def transmission(m: Model, d: Data):
 
   if m.nacttrnbody:
     # compute moments
-    ncon = wp.zeros((d.nworld, m.nacttrnbody), dtype=int)
+    if ncon is None:
+      ncon = wp.zeros((d.nworld, m.nacttrnbody), dtype=int)
+    else:
+      ncon.zero_()
 
     wp.launch(
       _transmission_body_moment,
@@ -4191,7 +4197,7 @@ def _spatial_tendon_wrap(
 
 
 @event_scope
-def tendon(m: Model, d: Data):
+def tendon(m: Model, d: Data, wrap_geom_xpos=None):
   """Computes tendon lengths and moments.
 
   Updates the tendon length and moment arrays for all tendons in the model, including joint,
@@ -4204,7 +4210,8 @@ def tendon(m: Model, d: Data):
   d.ten_J.zero_()
 
   # Cartesian 3D points fro geom wrap points
-  wrap_geom_xpos = wp.empty((d.nworld, m.nwrap), dtype=wp.spatial_vector)
+  if wrap_geom_xpos is None:
+    wrap_geom_xpos = wp.empty((d.nworld, m.nwrap), dtype=wp.spatial_vector)
 
   # process joint tendons
   wp.launch(
