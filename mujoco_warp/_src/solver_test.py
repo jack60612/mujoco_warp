@@ -15,6 +15,8 @@
 
 """Tests for solver functions."""
 
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -1591,6 +1593,113 @@ class CompactSolverTest(absltest.TestCase):
       1e-5,
       f"qfrc_constraint should be zeroed, but got max abs: {np.max(np.abs(qfrc_constraint_post))}",
     )
+
+
+@wp.kernel
+def _count_active_solves(counter: wp.array[int]):
+  counter[0] += 1
+
+
+class ZeroActiveRowsTest(parameterized.TestCase):
+  @parameterized.product(integrator=("Euler", "implicitfast"), sparse=(False, True), captured=(False, True))
+  def test_zero_active_rows(self, integrator, sparse, captured):
+    """Nonzero capacity, mixed worlds and 0 -> contact -> 0 under graph replay."""
+    if captured and not wp.get_device().is_cuda:
+      self.skipTest("CUDA graph regression")
+    xml = f"""
+    <mujoco>
+      <option solver="CG" integrator="{integrator}" timestep=".0005"
+              jacobian="{'sparse' if sparse else 'dense'}"/>
+      <worldbody>
+        <geom type="plane" size="2 2 .1"/>
+        <body pos="0 0 1">
+          <joint type="free" damping=".3"/>
+          <geom type="sphere" size=".1" mass="1"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_forward(mjm, mjd)
+    m = mjw.put_model(mjm)
+    m.opt.graph_conditional = wp.get_device().is_cuda
+    fast = mjw.put_data(mjm, mjd, nworld=2, njmax=32, nconmax=8)
+    ordinary = mjw.put_data(mjm, mjd, nworld=2, njmax=32, nconmax=8)
+    self.assertEqual(fast.njmax, 32)
+    self.assertEqual(fast.naconmax, 16)
+
+    def baseline_step():
+      with mock.patch.object(solver, "_solve_active_rows", solver._solve):
+        mjw.step(m, ordinary)
+
+    calls = wp.zeros(1, dtype=int)
+    original_solve = solver._solve
+
+    def counted_solve(m, d, ctx):
+      wp.launch(_count_active_solves, dim=1, outputs=[calls])
+      original_solve(m, d, ctx)
+
+    def fast_step():
+      with mock.patch.object(solver, "_solve", counted_solve):
+        mjw.step(m, fast)
+
+    # Compile both branches before capturing; graphs must reevaluate activity.
+    fast_step()
+    baseline_step()
+    if captured:
+      with wp.ScopedCapture() as fc:
+        fast_step()
+      with wp.ScopedCapture() as bc:
+        baseline_step()
+    calls.zero_()
+    expected_calls = 0
+
+    maxima = dict.fromkeys(("qacc", "Ma", "qpos", "qvel"), 0.0)
+    for heights in ((1.0, 1.0), (.08, 1.0), (.08, .08), (1.0, .08), (1.0, 1.0)):
+      qpos = np.tile(mjm.qpos0, (2, 1)).astype(np.float32)
+      qpos[:, 2] = heights
+      for d in (fast, ordinary):
+        wp.copy(d.qpos, wp.array(qpos, dtype=float))
+        d.qvel.fill_(.01)
+        d.qacc_warmstart.fill_(.25)
+        d.qfrc_constraint.fill_(123.0)
+        d.efc.Ma.fill_(456.0)
+      if captured:
+        wp.capture_launch(fc.graph)
+        wp.capture_launch(bc.graph)
+      else:
+        fast_step()
+        baseline_step()
+      nefc = fast.nefc.numpy()
+      np.testing.assert_array_equal(nefc, ordinary.nefc.numpy())
+      empty = nefc == 0
+      np.testing.assert_array_equal(empty, np.array(heights) > .1)
+      expected_calls += int(np.any(~empty) or not captured or not m.opt.graph_conditional)
+      self.assertEqual(calls.numpy()[0], expected_calls)
+      skipped = captured and m.opt.graph_conditional and np.all(empty)
+      if skipped:
+        np.testing.assert_array_equal(fast.solver_niter.numpy(), 0)
+        np.testing.assert_array_equal(fast.qacc.numpy(), fast.qacc_smooth.numpy())
+        np.testing.assert_array_equal(fast.efc.Ma.numpy(), fast.qfrc_smooth.numpy())
+        np.testing.assert_array_equal(fast.qfrc_constraint.numpy(), 0)
+      else:
+        np.testing.assert_array_equal(fast.solver_niter.numpy(), ordinary.solver_niter.numpy())
+        np.testing.assert_array_equal(fast.qfrc_constraint.numpy(), ordinary.qfrc_constraint.numpy())
+      for name, a, b in (
+        ("qacc", fast.qacc.numpy(), ordinary.qacc.numpy()),
+        ("Ma", fast.efc.Ma.numpy(), ordinary.efc.Ma.numpy()),
+        ("qpos", fast.qpos.numpy(), ordinary.qpos.numpy()),
+        ("qvel", fast.qvel.numpy(), ordinary.qvel.numpy()),
+      ):
+        maxima[name] = max(maxima[name], float(np.max(np.abs(a - b))))
+        if skipped:
+          np.testing.assert_allclose(a, b, atol=3e-5, rtol=3e-6)
+        else:
+          np.testing.assert_array_equal(a, b)
+      np.testing.assert_array_equal(fast.qfrc_constraint.numpy()[~empty], ordinary.qfrc_constraint.numpy()[~empty])
+      np.testing.assert_array_equal(fast.solver_niter.numpy()[~empty], ordinary.solver_niter.numpy()[~empty])
+    print(f"zero-active-rows {integrator=} {sparse=} {captured=} max_abs={maxima}")
 
 
 if __name__ == "__main__":

@@ -3667,6 +3667,62 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
     _update_gradient(m, d, ctx, compact=compact)
 
 
+@wp.kernel
+def _active_rows(
+  nefc: wp.array[int],
+  active: wp.array[int],
+):
+  worldid = wp.tid()
+  if nefc[worldid] > 0:
+    wp.atomic_max(active, 0, 1)
+
+
+@wp.kernel
+def _solve_zero_rows(
+  nefc: wp.array[int],
+  qacc_smooth: wp.array2d[float],
+  qfrc_smooth: wp.array2d[float],
+  qacc: wp.array2d[float],
+  Ma: wp.array2d[float],
+  qfrc_constraint: wp.array2d[float],
+  solver_niter: wp.array[int],
+):
+  worldid, dofid = wp.tid()
+  if nefc[worldid] == 0:
+    qacc[worldid, dofid] = qacc_smooth[worldid, dofid]
+    Ma[worldid, dofid] = qfrc_smooth[worldid, dofid]
+    qfrc_constraint[worldid, dofid] = 0.0
+    if dofid == 0:
+      solver_niter[worldid] = 0
+
+
+def _solve_empty_rows(m: types.Model, d: types.Data, ctx: SolverContext):
+  wp.launch(
+    _solve_zero_rows,
+    dim=(d.nworld, m.nv),
+    inputs=[d.nefc, d.qacc_smooth, d.qfrc_smooth],
+    outputs=[d.qacc, d.efc.Ma, d.qfrc_constraint, d.solver_niter],
+  )
+
+
+def _solve_active_rows(m: types.Model, d: types.Data, ctx: SolverContext):
+  """Skip the constraint solver when every world has zero active rows.
+
+  Capacity is deliberately not used as an activity test. The device predicate
+  is reevaluated on each graph replay, including contact/equality transitions.
+  Mixed batches retain the ordinary solver for their constrained worlds.
+  """
+  # Outside capture, capture_if reads its predicate back to the host. Retain
+  # the ordinary eager path instead of adding a per-step synchronization.
+  if m.opt.graph_conditional and d.qacc.device.is_cuda and d.qacc.device.is_capturing:
+    active = wp.zeros(1, dtype=int)
+    wp.launch(_active_rows, dim=d.nworld, inputs=[d.nefc], outputs=[active])
+    wp.capture_if(active, on_true=_solve, on_false=_solve_empty_rows, m=m, d=d, ctx=ctx)
+  else:
+    _solve(m, d, ctx)
+
+
+
 @event_scope
 def solve(m: types.Model, d: types.Data):
   if m.opt.enableflags & types.EnableBit.SLEEP:
@@ -3687,7 +3743,7 @@ def solve(m: types.Model, d: types.Data):
     d.solver_niter.fill_(0)
   else:
     ctx = _create_solver_context(m, d)
-    _solve(m, d, ctx)
+    _solve_active_rows(m, d, ctx)
 
 
 def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
