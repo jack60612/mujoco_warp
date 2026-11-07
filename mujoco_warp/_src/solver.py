@@ -3715,11 +3715,11 @@ def _solve_active_rows(m: types.Model, d: types.Data, ctx: SolverContext):
   # Outside capture, capture_if reads its predicate back to the host. Retain
   # the ordinary eager path instead of adding a per-step synchronization.
   if m.opt.graph_conditional and d.qacc.device.is_cuda and d.qacc.device.is_capturing:
-    active = wp.zeros(1, dtype=int)
+    # Reuse the existing iteration-counter allocation as the outer predicate.
     # CUDA conditional bodies cannot contain allocation nodes.
-    nsolving = wp.full(1, value=d.nworld, dtype=int)
-    wp.launch(_active_rows, dim=d.nworld, inputs=[d.nefc], outputs=[active])
-    wp.capture_if(active, on_true=_solve, on_false=_solve_empty_rows, m=m, d=d, ctx=ctx, nsolving=nsolving)
+    nsolving = wp.zeros(1, dtype=int)
+    wp.launch(_active_rows, dim=d.nworld, inputs=[d.nefc], outputs=[nsolving])
+    wp.capture_if(nsolving, on_true=_solve, on_false=_solve_empty_rows, m=m, d=d, ctx=ctx, nsolving=nsolving)
   else:
     _solve(m, d, ctx)
 
@@ -3780,6 +3780,10 @@ def _solve(
 
   if nsolving is None:
     nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
+  else:
+    # The outer IF has already consumed the activity predicate. Reinitialize
+    # this shared scalar before the nested solver loop on every active replay.
+    nsolving.fill_(d.nworld)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
     # as long as condition_iteration is not zero.
