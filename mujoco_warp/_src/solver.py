@@ -3696,7 +3696,7 @@ def _solve_zero_rows(
       solver_niter[worldid] = 0
 
 
-def _solve_empty_rows(m: types.Model, d: types.Data, ctx: SolverContext):
+def _solve_empty_rows(m: types.Model, d: types.Data, ctx: SolverContext, nsolving: wp.array[int]):
   wp.launch(
     _solve_zero_rows,
     dim=(d.nworld, m.nv),
@@ -3716,8 +3716,10 @@ def _solve_active_rows(m: types.Model, d: types.Data, ctx: SolverContext):
   # the ordinary eager path instead of adding a per-step synchronization.
   if m.opt.graph_conditional and d.qacc.device.is_cuda and d.qacc.device.is_capturing:
     active = wp.zeros(1, dtype=int)
+    # CUDA conditional bodies cannot contain allocation nodes.
+    nsolving = wp.full(1, value=d.nworld, dtype=int)
     wp.launch(_active_rows, dim=d.nworld, inputs=[d.nefc], outputs=[active])
-    wp.capture_if(active, on_true=_solve, on_false=_solve_empty_rows, m=m, d=d, ctx=ctx)
+    wp.capture_if(active, on_true=_solve, on_false=_solve_empty_rows, m=m, d=d, ctx=ctx, nsolving=nsolving)
   else:
     _solve(m, d, ctx)
 
@@ -3746,7 +3748,9 @@ def solve(m: types.Model, d: types.Data):
     _solve_active_rows(m, d, ctx)
 
 
-def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
+def _solve(
+  m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False, nsolving: wp.array[int] | None = None
+):
   """Finds forces that satisfy constraints."""
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
   wp.launch(
@@ -3774,7 +3778,8 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
       block_dim=m.block_dim.solve_init_search_cg,
     )
 
-  nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
+  if nsolving is None:
+    nsolving = wp.full(shape=(1,), value=d.nworld, dtype=int)
   if m.opt.iterations != 0 and m.opt.graph_conditional:
     # Note: the iteration kernel (indicated by while_body) is repeatedly launched
     # as long as condition_iteration is not zero.

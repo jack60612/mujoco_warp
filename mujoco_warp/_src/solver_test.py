@@ -1636,9 +1636,9 @@ class ZeroActiveRowsTest(parameterized.TestCase):
     calls = wp.zeros(1, dtype=int)
     original_solve = solver._solve
 
-    def counted_solve(m, d, ctx):
+    def counted_solve(m, d, ctx, **kwargs):
       wp.launch(_count_active_solves, dim=1, outputs=[calls])
-      original_solve(m, d, ctx)
+      original_solve(m, d, ctx, **kwargs)
 
     def fast_step():
       with mock.patch.object(solver, "_solve", counted_solve):
