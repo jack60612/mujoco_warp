@@ -60,6 +60,7 @@ class BlockDim:
     segmented_sort: segmented sort block dimension (collision_driver)
     convex_ccd: convex CCD kernel block dimension (collision_convex)
     actuator_velocity: actuator velocity block dimension (forward)
+    implicit_crosstree_pcg: implicitfast cross-tree damping PCG reduction block dimension (forward)
     ray: ray block dimension (ray)
     contact_sort: contact sort block dimension (sensor)
     energy_vel_kinetic: energy velocity kinetic block dimension (sensor)
@@ -88,6 +89,7 @@ class BlockDim:
   convex_ccd: int = 64
   # forward
   actuator_velocity: int = 32
+  implicit_crosstree_pcg: int = 256
   # ray
   ray: int = 64
   # sensor
@@ -870,6 +872,10 @@ class Option:
     contact_sensor_maxmatch: max number of contacts considered by contact sensor matching criteria
                              contacts matched after this value is exceded will be ignored
     warn_overflow: warn if overflow is encountered
+    implicit_crosstree_iterations: preconditioned conjugate-gradient iterations that add actuator
+                                   and tendon damping couplings outside the kinematic-tree
+                                   sparsity of M (e.g. between trees) to the implicitfast
+                                   velocity solve; 0 (default) keeps the native tree-sparse solve
   """
 
   timestep: array("*", float)
@@ -900,6 +906,7 @@ class Option:
   run_collision_detection: bool
   contact_sensor_maxmatch: int
   warn_overflow: bool
+  implicit_crosstree_iterations: int
 
   # TODO(team): remove in future version
   @property

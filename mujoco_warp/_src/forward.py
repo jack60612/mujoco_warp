@@ -28,6 +28,7 @@ from mujoco_warp._src import sensor
 from mujoco_warp._src import sleep
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
+from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
 from mujoco_warp._src.support import next_act
 from mujoco_warp._src.support import xfrc_accumulate
@@ -575,10 +576,149 @@ def _map_m2d(
     qLU_out[worldid, elemid] = 0.0
 
 
+@wp.kernel
+def _crosstree_pcg_residual(
+  # In:
+  b_in: wp.array2d[float],
+  Ax_in: wp.array2d[float],
+  # Out:
+  r_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  r_out[worldid, dofid] = b_in[worldid, dofid] - Ax_in[worldid, dofid]
+
+
+@wp.kernel
+def _crosstree_pcg_direction_tiled(
+  # Model:
+  nv: int,
+  # In:
+  first_in: bool,
+  r_in: wp.array2d[float],
+  z_in: wp.array2d[float],
+  # Out:
+  p_out: wp.array2d[float],
+  rz_out: wp.array[float],
+):
+  """Computes rz = r'z and the search direction p = z + (rz / rz_prev) p."""
+  worldid, tid = wp.tid()
+  BLOCK_DIM = wp.block_dim()
+
+  # read before the reduction barrier; thread 0 overwrites rz after it
+  rz_prev = rz_out[worldid]
+
+  local_rz = float(0.0)
+  for dofid in range(tid, nv, BLOCK_DIM):
+    local_rz += r_in[worldid, dofid] * z_in[worldid, dofid]
+
+  rz_tile = wp.tile(local_rz, preserve_type=True)
+  rz_sum = wp.tile_reduce(wp.add, rz_tile)
+  rz = rz_sum[0]
+
+  if first_in:
+    for dofid in range(tid, nv, BLOCK_DIM):
+      p_out[worldid, dofid] = z_in[worldid, dofid]
+  else:
+    beta = float(0.0)
+    if rz_prev > 0.0:
+      beta = rz / rz_prev
+    for dofid in range(tid, nv, BLOCK_DIM):
+      p_out[worldid, dofid] = z_in[worldid, dofid] + beta * p_out[worldid, dofid]
+
+  if tid == 0:
+    rz_out[worldid] = rz
+
+
+@wp.kernel
+def _crosstree_pcg_update_tiled(
+  # Model:
+  nv: int,
+  # In:
+  p_in: wp.array2d[float],
+  Ap_in: wp.array2d[float],
+  rz_in: wp.array[float],
+  # Out:
+  x_out: wp.array2d[float],
+  r_out: wp.array2d[float],
+):
+  """Takes the step x += alpha p, r -= alpha Ap with alpha = rz / p'Ap."""
+  worldid, tid = wp.tid()
+  BLOCK_DIM = wp.block_dim()
+
+  local_pAp = float(0.0)
+  for dofid in range(tid, nv, BLOCK_DIM):
+    local_pAp += p_in[worldid, dofid] * Ap_in[worldid, dofid]
+
+  pAp_tile = wp.tile(local_pAp, preserve_type=True)
+  pAp_sum = wp.tile_reduce(wp.add, pAp_tile)
+  pAp = pAp_sum[0]
+  rz = rz_in[worldid]
+
+  # a converged world (rz == 0) or a non-SPD direction keeps the current iterate
+  if not (pAp > 0.0 and rz > 0.0):
+    return
+  alpha = rz / pAp
+
+  for dofid in range(tid, nv, BLOCK_DIM):
+    x_out[worldid, dofid] += alpha * p_in[worldid, dofid]
+    r_out[worldid, dofid] -= alpha * Ap_in[worldid, dofid]
+
+
+def _implicit_crosstree_pcg(
+  m: Model,
+  d: Data,
+  H: wp.array2d[float],
+  L: wp.array2d[float],
+  D: wp.array2d[float],
+  actuator_vel: wp.array2d[float],
+  x: wp.array2d[float],
+  b: wp.array2d[float],
+):
+  """Refines x = P^-1 b toward the solution of (P + C) x = b.
+
+  P = M - dt * qDeriv on the kinematic-tree sparsity of M (H, factored into L and D) is the
+  preconditioner. C holds the actuator/tendon damping couplings outside that sparsity and is
+  applied matrix-free. For damping (non-positive force velocity derivatives) P + C is SPD.
+  The iteration count is fixed so the step stays graph-capturable without host synchronization.
+  """
+  r = wp.empty((d.nworld, m.nv), dtype=float)
+  z = wp.empty((d.nworld, m.nv), dtype=float)
+  p = wp.empty((d.nworld, m.nv), dtype=float)
+  Ap = wp.empty((d.nworld, m.nv), dtype=float)
+  rz = wp.empty(d.nworld, dtype=float)
+  block_dim = m.block_dim.implicit_crosstree_pcg
+
+  # r = b - (P + C) x
+  support.mul_m(m, d, Ap, x, M=H)
+  derivative.crosstree_damping_mul(m, d, actuator_vel, x, Ap)
+  wp.launch(_crosstree_pcg_residual, dim=(d.nworld, m.nv), inputs=[b, Ap], outputs=[r])
+
+  for i in range(m.opt.implicit_crosstree_iterations):
+    smooth.solve_LD(m, d, L, D, z, r)
+    wp.launch_tiled(
+      _crosstree_pcg_direction_tiled,
+      dim=d.nworld,
+      inputs=[m.nv, i == 0, r, z],
+      outputs=[p, rz],
+      block_dim=block_dim,
+    )
+    support.mul_m(m, d, Ap, p, M=H)
+    derivative.crosstree_damping_mul(m, d, actuator_vel, p, Ap)
+    wp.launch_tiled(
+      _crosstree_pcg_update_tiled,
+      dim=d.nworld,
+      inputs=[m.nv, p, Ap, rz],
+      outputs=[x, r],
+      block_dim=block_dim,
+    )
+
+
 @event_scope
 def implicit(m: Model, d: Data):
   """Integrates fully implicit in velocity."""
   if m.opt.integrator == IntegratorType.IMPLICIT:
+    if m.opt.implicit_crosstree_iterations:
+      raise NotImplementedError("implicit_crosstree_iterations is only supported by the implicitfast integrator.")
     qH_M = wp.empty(d.M.shape, dtype=float)
 
     # 1. Compute M - dt * qDeriv_smooth in M-structure
@@ -604,9 +744,13 @@ def implicit(m: Model, d: Data):
     qDeriv = wp.empty((d.nworld, m.nC), dtype=float)
     qLD = wp.empty_like(d.qLD)
     qLDiagInv = wp.empty((d.nworld, m.nv), dtype=float)
-    derivative.deriv_smooth_vel(m, d, qDeriv)
+    crosstree = m.opt.implicit_crosstree_iterations > 0
+    actuator_vel = wp.empty((d.nworld, m.nu), dtype=float) if crosstree else None
+    derivative.deriv_smooth_vel(m, d, qDeriv, actuator_vel)
     qacc = wp.empty((d.nworld, m.nv), dtype=float)
     smooth.factor_solve_i(m, d, qDeriv, qLD, qLDiagInv, qacc, d.efc.Ma)
+    if crosstree:
+      _implicit_crosstree_pcg(m, d, qDeriv, qLD, qLDiagInv, actuator_vel, qacc, d.efc.Ma)
     _advance(m, d, qacc)
   else:
     _advance(m, d, d.qacc)
