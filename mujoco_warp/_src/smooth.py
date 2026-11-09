@@ -3453,7 +3453,7 @@ def solve_m_batched(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float
   if d.qLD.shape[1] > m.qLD_block_total:
     dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
     wp.launch(
-      _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates)),
+      _solve_LD_sparse_fused_batched(m.nv, m.qLD_level_offsets.shape[0] - 1),
       dim=(d.nworld, nrhs, dim_block),
       inputs=[
         m.qLD_block_adr,
