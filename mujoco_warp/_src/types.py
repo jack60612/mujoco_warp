@@ -153,7 +153,7 @@ class BlockDim:
   cholesky_solve: int = 64
   small_cholesky: int = 64
   factor_i_sparse_fused: int = 1024
-  solve_LD_sparse_fused: int = 128
+  solve_LD_sparse_fused: int = 512
   # solver
   update_gradient_cholesky: int = 64
   update_gradient_cholesky_blocked: int = 32
