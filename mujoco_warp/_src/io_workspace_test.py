@@ -124,18 +124,19 @@ def test_const0_batched_inverse_weights_match_mujoco(device, rhs_chunk):
       np.testing.assert_allclose(actual, expected, rtol=1e-3, err_msg=name)
 
 
-def test_deterministic_rhs_per_launch_fits_int32_capacity():
-  cap = smooth._DETERMINISTIC_SCATTER_CAPACITY
+def test_deterministic_rhs_per_launch_fits_record_budget():
+  budget = smooth._DETERMINISTIC_RECORD_BUDGET
+  assert budget < (1 << 31) - 1  # Warp's int32 deterministic buffer capacity
   assert smooth.deterministic_rhs_per_launch(0, 10**9, 5000) == 5000
   assert smooth.deterministic_rhs_per_launch(3, 512, 1) == 1
   assert smooth.deterministic_rhs_per_launch(4, 1, 5000) == 5000
   batch = smooth.deterministic_rhs_per_launch(13, 2 * 512, 200_000)
-  assert batch < 200_000 and batch * 13 * 2 * 512 <= cap < (batch + 1) * 13 * 2 * 512
-  assert smooth.deterministic_rhs_per_launch(cap, 2, 10) == 1
+  assert batch < 200_000 and batch * 13 * 2 * 512 <= budget < (batch + 1) * 13 * 2 * 512
+  assert smooth.deterministic_rhs_per_launch(budget, 2, 10) == 1
 
 
 def test_batched_sparse_solve_run_to_run_splits_launches(monkeypatch):
-  """A RUN_TO_RUN batched sparse solve splits over right-hand sides to fit the scatter capacity."""
+  """A RUN_TO_RUN batched sparse solve splits over right-hand sides to fit the record budget."""
   if not wp.is_cuda_available():
     pytest.skip("CUDA is unavailable")
   mjm = mujoco.MjModel.from_xml_string(_layout_coverage_xml())
@@ -174,6 +175,7 @@ def test_batched_sparse_solve_run_to_run_splits_launches(monkeypatch):
     assert launches == [9]
     # Room for exactly three right-hand sides per launch at the kernel's record bound.
     launches.clear()
-    monkeypatch.setattr(smooth, "_DETERMINISTIC_SCATTER_CAPACITY", 3 * d.nworld * m.block_dim.solve_LD_sparse_fused * records)
+    budget = 3 * d.nworld * m.block_dim.solve_LD_sparse_fused * records
+    monkeypatch.setattr(smooth, "_DETERMINISTIC_RECORD_BUDGET", budget)
     np.testing.assert_array_equal(solve(), whole)
     assert launches == [3, 3, 3]

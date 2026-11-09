@@ -3359,8 +3359,10 @@ def _tile_cholesky_solve_block_batched(tile: TileSet):
 
 
 # Warp's deterministic scatter/counter buffers hold launch threads x records per thread entries
-# and are limited to int32 indexing (warp._src.deterministic.DETERMINISTIC_SCATTER_MAX_CAPACITY).
-_DETERMINISTIC_SCATTER_CAPACITY = (1 << 31) - 1
+# (an int64 key and a value each, allocated per launch) and are limited to int32 indexing
+# (warp._src.deterministic.DETERMINISTIC_SCATTER_MAX_CAPACITY). Batched launches are split to stay
+# within 2^25 records (~0.4 GB of buffers); a single right-hand side is never split.
+_DETERMINISTIC_RECORD_BUDGET = 1 << 25
 
 
 def _deterministic_records_per_thread(kernel, device, block_dim: int) -> int:
@@ -3379,8 +3381,8 @@ def deterministic_rhs_per_launch(records_per_thread: int, threads_per_rhs: int, 
   """Right-hand sides per launch of an atomic batched kernel.
 
   A deterministic launch reserves ``threads x records_per_thread`` buffer entries, so the batch is
-  split to keep each launch within Warp's int32 capacity. Without deterministic records one launch
-  covers every right-hand side.
+  split to keep each launch within a record budget (well inside Warp's int32 capacity). Without
+  deterministic records one launch covers every right-hand side.
 
   Args:
     records_per_thread: Per-thread deterministic records of the kernel (0 if not deterministic).
@@ -3389,7 +3391,7 @@ def deterministic_rhs_per_launch(records_per_thread: int, threads_per_rhs: int, 
   """
   if records_per_thread <= 0 or nrhs <= 1:
     return max(nrhs, 1)
-  return max(1, min(nrhs, _DETERMINISTIC_SCATTER_CAPACITY // (records_per_thread * max(threads_per_rhs, 1))))
+  return max(1, min(nrhs, _DETERMINISTIC_RECORD_BUDGET // (records_per_thread * max(threads_per_rhs, 1))))
 
 
 def solve_m_batched(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float]):
