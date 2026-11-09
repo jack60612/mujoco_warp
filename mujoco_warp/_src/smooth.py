@@ -3418,6 +3418,40 @@ def _tile_cholesky_solve_block_batched(tile: TileSet):
   return kernel
 
 
+# Warp's deterministic scatter/counter buffers hold launch threads x records per thread entries
+# and are limited to int32 indexing (warp._src.deterministic.DETERMINISTIC_SCATTER_MAX_CAPACITY).
+_DETERMINISTIC_SCATTER_CAPACITY = (1 << 31) - 1
+
+
+def _deterministic_records_per_thread(kernel, device, block_dim: int) -> int:
+  """Per-thread records Warp reserves for a deterministic launch of `kernel` (0 if none)."""
+  options = kernel.module.options
+  if options.get("deterministic", wp.config.deterministic) == wp.DeterministicMode.NOT_GUARANTEED:
+    return 0
+  meta = kernel.module.load(device, block_dim).get_kernel_hooks(kernel).det_launch_meta
+  counts = [] if meta is None else [*meta.scatter_records_per_thread.values(), *meta.counter_records_per_thread.values()]
+  if not counts:
+    return 0
+  return max(max(counts), int(options.get("deterministic_max_records", 0) or 0))
+
+
+def deterministic_rhs_per_launch(records_per_thread: int, threads_per_rhs: int, nrhs: int) -> int:
+  """Right-hand sides per launch of an atomic batched kernel.
+
+  A deterministic launch reserves ``threads x records_per_thread`` buffer entries, so the batch is
+  split to keep each launch within Warp's int32 capacity. Without deterministic records one launch
+  covers every right-hand side.
+
+  Args:
+    records_per_thread: Per-thread deterministic records of the kernel (0 if not deterministic).
+    threads_per_rhs: Launch threads per right-hand side (all worlds, all block threads).
+    nrhs: Right-hand sides to solve.
+  """
+  if records_per_thread <= 0 or nrhs <= 1:
+    return max(nrhs, 1)
+  return max(1, min(nrhs, _DETERMINISTIC_SCATTER_CAPACITY // (records_per_thread * max(threads_per_rhs, 1))))
+
+
 def solve_m_batched(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float]):
   """Computes x[w, r] = inv(M[w]) * y[w, r] for every right-hand side r of every world w.
 
@@ -3451,21 +3485,29 @@ def solve_m_batched(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float
         block_dim=block_dim,
       )
   if d.qLD.shape[1] > m.qLD_block_total:
-    dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
-    wp.launch(
-      _solve_LD_sparse_fused_batched(m.nv, m.qLD_level_offsets.shape[0] - 1),
-      dim=(d.nworld, nrhs, dim_block),
-      inputs=[
-        m.qLD_block_adr,
-        d.qLD[:, m.qLD_block_total :],
-        d.qLDiagInv,
-        m.qLD_all_updates,
-        m.qLD_level_offsets,
-        y,
-      ],
-      outputs=[x],
-      block_dim=dim_block,
+    device = wp.get_device()
+    dim_block = m.block_dim.solve_LD_sparse_fused if device.is_cuda else 1
+    kernel = _solve_LD_sparse_fused_batched(m.nv, m.qLD_level_offsets.shape[0] - 1)
+    batch = deterministic_rhs_per_launch(
+      _deterministic_records_per_thread(kernel, device, dim_block), d.nworld * dim_block, nrhs
     )
+    L = d.qLD[:, m.qLD_block_total :]
+    for start in range(0, nrhs, batch):
+      stop = min(start + batch, nrhs)
+      wp.launch(
+        kernel,
+        dim=(d.nworld, stop - start, dim_block),
+        inputs=[
+          m.qLD_block_adr,
+          L,
+          d.qLDiagInv,
+          m.qLD_all_updates,
+          m.qLD_level_offsets,
+          y[:, start:stop] if batch < nrhs else y,
+        ],
+        outputs=[x[:, start:stop] if batch < nrhs else x],
+        block_dim=dim_block,
+      )
 
 
 @cache_kernel

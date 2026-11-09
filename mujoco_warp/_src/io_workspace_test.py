@@ -21,7 +21,9 @@ import warp as wp
 
 import mujoco_warp as mjwarp
 from mujoco_warp._src import io
+from mujoco_warp._src import smooth
 from mujoco_warp._src import types
+from mujoco_warp._src import warp_util
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
@@ -120,3 +122,58 @@ def test_const0_batched_inverse_weights_match_mujoco(device, rhs_chunk):
       if name == "body_invweight0":
         actual, expected = actual[:, bodies], expected[:, bodies]
       np.testing.assert_allclose(actual, expected, rtol=1e-3, err_msg=name)
+
+
+def test_deterministic_rhs_per_launch_fits_int32_capacity():
+  cap = smooth._DETERMINISTIC_SCATTER_CAPACITY
+  assert smooth.deterministic_rhs_per_launch(0, 10**9, 5000) == 5000
+  assert smooth.deterministic_rhs_per_launch(3, 512, 1) == 1
+  assert smooth.deterministic_rhs_per_launch(4, 1, 5000) == 5000
+  batch = smooth.deterministic_rhs_per_launch(13, 2 * 512, 200_000)
+  assert batch < 200_000 and batch * 13 * 2 * 512 <= cap < (batch + 1) * 13 * 2 * 512
+  assert smooth.deterministic_rhs_per_launch(cap, 2, 10) == 1
+
+
+def test_batched_sparse_solve_run_to_run_splits_launches(monkeypatch):
+  """A RUN_TO_RUN batched sparse solve splits over right-hand sides to fit the scatter capacity."""
+  if not wp.is_cuda_available():
+    pytest.skip("CUDA is unavailable")
+  mjm = mujoco.MjModel.from_xml_string(_layout_coverage_xml())
+  monkeypatch.setattr(wp.config, "deterministic", wp.DeterministicMode.RUN_TO_RUN)
+  monkeypatch.setattr(warp_util, "_KERNEL_CACHE", {})
+  launches = []
+  real_launch = smooth.wp.launch
+
+  def counting_launch(kernel, dim, *args, **kwargs):
+    if kernel.key.startswith("_solve_LD_sparse_fused_batched"):
+      launches.append(dim[1])
+    return real_launch(kernel, dim, *args, **kwargs)
+
+  monkeypatch.setattr(smooth.wp, "launch", counting_launch)
+  with wp.ScopedDevice("cuda:0"):
+    m = mjwarp.put_model(mjm)
+    d = mjwarp.make_data(mjm, nworld=2)
+    # Newton bounds the dynamic-loop atomics of MJWarp's unique kernels with
+    # deterministic_max_records; every update visited in both sweeps by one thread is a safe bound.
+    monkeypatch.setattr(wp.config, "deterministic_max_records", 2 * m.qLD_all_updates.shape[0])
+    kernel = smooth._solve_LD_sparse_fused_batched(m.nv, m.qLD_level_offsets.shape[0] - 1)
+    records = smooth._deterministic_records_per_thread(kernel, wp.get_device(), m.block_dim.solve_LD_sparse_fused)
+    assert records == 2 * m.qLD_all_updates.shape[0]
+    mjwarp.kinematics(m, d)
+    mjwarp.com_pos(m, d)
+    mjwarp.crb(m, d)
+    mjwarp.factor_m(m, d)
+    y = wp.array(np.random.default_rng(0).normal(size=(d.nworld, 9, m.nv)), dtype=float)
+
+    def solve():
+      x = wp.zeros_like(y)
+      smooth.solve_m_batched(m, d, x, y)
+      return x.numpy()
+
+    whole = solve()
+    assert launches == [9]
+    # Room for exactly three right-hand sides per launch at the kernel's record bound.
+    launches.clear()
+    monkeypatch.setattr(smooth, "_DETERMINISTIC_SCATTER_CAPACITY", 3 * d.nworld * m.block_dim.solve_LD_sparse_fused * records)
+    np.testing.assert_array_equal(solve(), whole)
+    assert launches == [3, 3, 3]
