@@ -3119,28 +3119,30 @@ def _compute_meaninertia(
 
 
 @wp.kernel
-def _set_unit_vector(
-  dofid_target: int,
-  unit_vec_out: wp.array2d[float],
+def _set_unit_vectors(
+  dofadr: int,
+  rhs_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
-  nv = unit_vec_out.shape[1]
-  for i in range(nv):
-    if i == dofid_target:
-      unit_vec_out[worldid, i] = 1.0
-    else:
-      unit_vec_out[worldid, i] = 0.0
+  worldid, rhsid, i = wp.tid()
+  if i == dofadr + rhsid:
+    rhs_out[worldid, rhsid, i] = 1.0
+  else:
+    rhs_out[worldid, rhsid, i] = 0.0
 
 
 @wp.kernel
 def _extract_dof_A_diag(
-  dofid: int,
-  result_vec_in: wp.array2d[float],
+  nv: int,
+  dofadr: int,
+  result_in: wp.array3d[float],
   dof_A_diag_out: wp.array2d[float],
 ):
-  worldid = wp.tid()
+  worldid, rhsid = wp.tid()
+  dofid = dofadr + rhsid
+  if dofid >= nv:
+    return
   dof_A_diag_id = worldid % dof_A_diag_out.shape[0]
-  dof_A_diag_out[dof_A_diag_id, dofid] = result_vec_in[worldid, dofid]
+  dof_A_diag_out[dof_A_diag_id, dofid] = result_in[worldid, rhsid, dofid]
 
 
 @wp.kernel
@@ -3188,10 +3190,9 @@ def _finalize_dof_invweight0(
 
 
 @wp.kernel
-def _compute_body_jac_row(
-  nv: int,
-  bodyid_target: int,
-  row_idx: int,
+def _compute_body_jac_rows(
+  nbody: int,
+  rowadr: int,
   body_parentid: wp.array[int],
   body_rootid: wp.array[int],
   body_dofadr: wp.array[int],
@@ -3200,12 +3201,15 @@ def _compute_body_jac_row(
   subtree_com_in: wp.array2d[wp.vec3],
   xipos_in: wp.array2d[wp.vec3],
   cdof_in: wp.array2d[wp.spatial_vector],
-  body_jac_row_out: wp.array2d[float],
+  body_jac_rows_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
-
-  for i in range(nv):
-    body_jac_row_out[worldid, i] = 0.0
+  """Writes the nonzeros of body Jacobian row (bodyid - 1) * 6 + row_idx into a zeroed row."""
+  worldid, rhsid = wp.tid()
+  jacrow = rowadr + rhsid
+  if jacrow >= (nbody - 1) * 6:
+    return
+  bodyid_target = jacrow // 6 + 1
+  row_idx = jacrow % 6
 
   bodyid = bodyid_target
   while bodyid > 0 and body_dofnum[bodyid] == 0:
@@ -3230,38 +3234,41 @@ def _compute_body_jac_row(
     if row_idx < 3:
       tmp = wp.cross(cdof_ang, offset)
       if row_idx == 0:
-        body_jac_row_out[worldid, dofid] = cdof_lin[0] + tmp[0]
+        body_jac_rows_out[worldid, rhsid, dofid] = cdof_lin[0] + tmp[0]
       elif row_idx == 1:
-        body_jac_row_out[worldid, dofid] = cdof_lin[1] + tmp[1]
+        body_jac_rows_out[worldid, rhsid, dofid] = cdof_lin[1] + tmp[1]
       else:
-        body_jac_row_out[worldid, dofid] = cdof_lin[2] + tmp[2]
+        body_jac_rows_out[worldid, rhsid, dofid] = cdof_lin[2] + tmp[2]
     else:
       if row_idx == 3:
-        body_jac_row_out[worldid, dofid] = cdof_ang[0]
+        body_jac_rows_out[worldid, rhsid, dofid] = cdof_ang[0]
       elif row_idx == 4:
-        body_jac_row_out[worldid, dofid] = cdof_ang[1]
+        body_jac_rows_out[worldid, rhsid, dofid] = cdof_ang[1]
       else:
-        body_jac_row_out[worldid, dofid] = cdof_ang[2]
+        body_jac_rows_out[worldid, rhsid, dofid] = cdof_ang[2]
 
     dofid = dof_parentid[dofid]
 
 
 @wp.kernel
-def _compute_body_A_diag_entry(
+def _compute_body_A_diag_entries(
   nv: int,
-  bodyid_target: int,
-  row_idx: int,
-  body_jac_row_in: wp.array2d[float],
-  result_vec_in: wp.array2d[float],
+  nbody: int,
+  rowadr: int,
+  body_jac_rows_in: wp.array3d[float],
+  result_in: wp.array3d[float],
   body_A_diag_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
+  worldid, rhsid = wp.tid()
+  jacrow = rowadr + rhsid
+  if jacrow >= (nbody - 1) * 6:
+    return
   body_A_diag_id = worldid % body_A_diag_out.shape[0]
-  # A[row,row] = J[row] · inv(M) · J[row]' = J[row] · result_vec
+  # A[row,row] = J[row] · inv(M) · J[row]' = J[row] · result
   dot_prod = float(0.0)
   for i in range(nv):
-    dot_prod += body_jac_row_in[worldid, i] * result_vec_in[worldid, i]
-  body_A_diag_out[body_A_diag_id, bodyid_target, row_idx] = dot_prod
+    dot_prod += body_jac_rows_in[worldid, rhsid, i] * result_in[worldid, rhsid, i]
+  body_A_diag_out[body_A_diag_id, jacrow // 6 + 1, jacrow % 6] = dot_prod
 
 
 @wp.kernel
@@ -3295,48 +3302,56 @@ def _finalize_body_invweight0(
 
 
 @wp.kernel
-def _copy_tendon_jacobian(
-  tenid_target: int,
+def _copy_tendon_jacobians(
+  ntendon: int,
+  tenadr: int,
   ten_J_rownnz: wp.array[int],
   ten_J_rowadr: wp.array[int],
   ten_J_colind: wp.array[int],
   ten_J_in: wp.array2d[float],
-  ten_J_vec_out: wp.array2d[float],
+  ten_J_rows_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
-  nv = ten_J_in.shape[2]
-  rownnz = ten_J_rownnz[tenid_target]
-  rowadr = ten_J_rowadr[tenid_target]
+  """Scatters tendon Jacobian rows into zeroed dense rows."""
+  worldid, rhsid = wp.tid()
+  tenid = tenadr + rhsid
+  if tenid >= ntendon:
+    return
+  rownnz = ten_J_rownnz[tenid]
+  rowadr = ten_J_rowadr[tenid]
   for i in range(rownnz):
     colind = ten_J_colind[rowadr + i]
-    ten_J_vec_out[worldid, colind] = ten_J_in[worldid, rowadr + i]
+    ten_J_rows_out[worldid, rhsid, colind] = ten_J_in[worldid, rowadr + i]
 
 
 @wp.kernel
-def _compute_tendon_dot_product(
+def _compute_tendon_dot_products(
   # Model:
+  ntendon: int,
   ten_J_rownnz: wp.array[int],
   ten_J_rowadr: wp.array[int],
   ten_J_colind: wp.array[int],
   # In:
-  tenid_target: int,
+  tenadr: int,
   ten_J_in: wp.array2d[float],
-  result_vec_in: wp.array2d[float],
+  result_in: wp.array3d[float],
   # Out:
   tendon_invweight0_out: wp.array2d[float],
 ):
-  worldid = wp.tid()
+  worldid, rhsid = wp.tid()
+  tenid = tenadr + rhsid
+  if tenid >= ntendon:
+    return
   tendon_invweight0_id = worldid % tendon_invweight0_out.shape[0]
   dot_prod = float(0.0)
 
-  rownnz = ten_J_rownnz[tenid_target]
-  rowadr = ten_J_rowadr[tenid_target]
+  rownnz = ten_J_rownnz[tenid]
+  rowadr = ten_J_rowadr[tenid]
   for i in range(rownnz):
     sparseid = rowadr + i
     colind = ten_J_colind[sparseid]
-    dot_prod += ten_J_in[worldid, sparseid] * result_vec_in[worldid, colind]
+    dot_prod += ten_J_in[worldid, sparseid] * result_in[worldid, rhsid, colind]
 
-  tendon_invweight0_out[tendon_invweight0_id, tenid_target] = dot_prod
+  tendon_invweight0_out[tendon_invweight0_id, tenid] = dot_prod
 
 
 @wp.kernel
@@ -3392,38 +3407,44 @@ def _compute_light_pos0(
 
 
 @wp.kernel
-def _copy_actuator_moment(
-  actid_target: int,
+def _copy_actuator_moments(
+  nu: int,
+  actadr: int,
   moment_rownnz_in: wp.array2d[int],
   moment_rowadr_in: wp.array2d[int],
   moment_colind_in: wp.array2d[int],
   actuator_moment_in: wp.array2d[float],
-  act_moment_vec_out: wp.array2d[float],
+  act_moments_out: wp.array3d[float],
 ):
-  worldid = wp.tid()
-  nv = act_moment_vec_out.shape[1]
-  for i in range(nv):
-    act_moment_vec_out[worldid, i] = 0.0
-  rownnz = moment_rownnz_in[worldid, actid_target]
-  rowadr = moment_rowadr_in[worldid, actid_target]
+  """Scatters actuator moment rows into zeroed dense rows."""
+  worldid, rhsid = wp.tid()
+  actid = actadr + rhsid
+  if actid >= nu:
+    return
+  rownnz = moment_rownnz_in[worldid, actid]
+  rowadr = moment_rowadr_in[worldid, actid]
   for i in range(rownnz):
     sparseid = rowadr + i
     col = moment_colind_in[worldid, sparseid]
-    act_moment_vec_out[worldid, col] = actuator_moment_in[worldid, sparseid]
+    act_moments_out[worldid, rhsid, col] = actuator_moment_in[worldid, sparseid]
 
 
 @wp.kernel
 def _compute_actuator_acc0(
-  actid_target: int,
   nv: int,
-  result_vec_in: wp.array2d[float],
+  nu: int,
+  actadr: int,
+  result_in: wp.array3d[float],
   actuator_acc0_out: wp.array2d[float],
 ):
-  worldid = wp.tid()
+  worldid, rhsid = wp.tid()
+  actid = actadr + rhsid
+  if actid >= nu:
+    return
   norm_sq = float(0.0)
   for i in range(nv):
-    norm_sq += result_vec_in[worldid, i] * result_vec_in[worldid, i]
-  actuator_acc0_out[worldid, actid_target] = wp.sqrt(norm_sq)
+    norm_sq += result_in[worldid, rhsid, i] * result_in[worldid, rhsid, i]
+  actuator_acc0_out[worldid, actid] = wp.sqrt(norm_sq)
 
 
 @wp.kernel
@@ -3553,27 +3574,34 @@ def set_const_fixed(m: types.Model, d: types.Data):
     )
 
 
+# Float elements per batched right-hand-side buffer in Const0Workspace (16 MiB): bounds the
+# scratch for large worlds x nv, while a few hundred columns per launch already fill a GPU.
+_CONST0_RHS_ELEMENTS = 1 << 22
+
+
 class Const0Workspace:
   """Reusable device scratch for :func:`set_const_0`, allocated before graph capture.
 
   A workspace is bound to a model's fixed dimensions, world count and device. It must
   not be shared by concurrent refreshes. All scratch is overwritten on each call.
+
+  The inverse weights solve one inertia system per DOF, body Jacobian row, tendon and
+  actuator. They run in batches of ``rhs_chunk`` right-hand sides per world (default:
+  as many as fit a fixed scratch budget, at most the largest of those counts).
   """
 
-  def __init__(self, m: types.Model, d: types.Data):
+  def __init__(self, m: types.Model, d: types.Data, rhs_chunk: Optional[int] = None):
     device = d.qpos.device
+    nrhs = max(m.nv, 6 * (m.nbody - 1), m.ntendon, m.nu, 1)
+    if rhs_chunk is None:
+      rhs_chunk = _CONST0_RHS_ELEMENTS // max(d.nworld * m.nv, 1)
+    self.rhs_chunk = min(max(rhs_chunk, 1), nrhs)
     self.qpos_saved = wp.empty_like(d.qpos)
-    self.unit_vec = wp.empty((d.nworld, m.nv), dtype=float, device=device)
-    self.result_vec = wp.empty_like(self.unit_vec)
-    self.dof_A_diag = wp.empty_like(self.unit_vec)
-    self.body_jac_row = wp.empty_like(self.unit_vec)
-    self.body_result_vec = wp.empty_like(self.unit_vec)
+    self.rhs = wp.empty((d.nworld, self.rhs_chunk, m.nv), dtype=float, device=device)
+    self.result = wp.empty_like(self.rhs)
+    self.dof_A_diag = wp.empty((d.nworld, m.nv), dtype=float, device=device)
     self.body_A_diag = wp.zeros((d.nworld, m.nbody, 6), dtype=float, device=device)
-    self.ten_J_vec = wp.empty_like(self.unit_vec)
-    self.ten_result_vec = wp.empty_like(self.unit_vec)
-    self.act_moment_vec = wp.empty_like(self.unit_vec)
-    self.act_result_vec = wp.empty_like(self.unit_vec)
-    self.dof_M0 = wp.empty_like(self.unit_vec)
+    self.dof_M0 = wp.empty((d.nworld, m.nv), dtype=float, device=device)
     self.moment_nnz = wp.empty((d.nworld,), dtype=int, device=device)
     self.transmission_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int, device=device)
     self.wrap_geom_xpos = wp.empty((d.nworld, m.nwrap), dtype=wp.spatial_vector, device=device)
@@ -3640,16 +3668,16 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True, workspace: 
   # FREE: 6 DOFs, trans gets mean(A[0:3]), rot gets mean(A[3:6])
   # BALL: 3 DOFs, all get mean(A[0:3])
   # HINGE/SLIDE: 1 DOF, gets A[0,0]
+  rhs = workspace.rhs
+  result = workspace.result
+  chunk = workspace.rhs_chunk
   if m.nv > 0:
-    unit_vec = workspace.unit_vec
-    result_vec = workspace.result_vec
     dof_A_diag = workspace.dof_A_diag
 
-    # TODO(team): more efficient approach instead of looping over nv?
-    for dofid in range(m.nv):
-      wp.launch(_set_unit_vector, dim=d.nworld, inputs=[dofid], outputs=[unit_vec])
-      smooth.solve_m(m, d, result_vec, unit_vec)
-      wp.launch(_extract_dof_A_diag, dim=d.nworld, inputs=[dofid, result_vec], outputs=[dof_A_diag])
+    for dofadr in range(0, m.nv, chunk):
+      wp.launch(_set_unit_vectors, dim=(d.nworld, chunk, m.nv), inputs=[dofadr], outputs=[rhs])
+      smooth.solve_m_batched(m, d, result, rhs)
+      wp.launch(_extract_dof_A_diag, dim=(d.nworld, chunk), inputs=[m.nv, dofadr, result], outputs=[dof_A_diag])
 
     wp.launch(
       _finalize_dof_invweight0,
@@ -3661,38 +3689,35 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True, workspace: 
   # body_invweight0: computed as mean diagonal of J * inv(M) * J'
   # where J is the 6xnv body Jacobian (3 rows translation, 3 rows rotation)
   if m.nv > 0:
-    body_jac_row = workspace.body_jac_row
-    body_result_vec = workspace.body_result_vec
     body_A_diag = workspace.body_A_diag
 
-    # TODO(team): more efficient approach instead of nested iterations?
-    for bodyid in range(1, m.nbody):
-      for row_idx in range(6):
-        wp.launch(
-          _compute_body_jac_row,
-          dim=d.nworld,
-          inputs=[
-            m.nv,
-            bodyid,
-            row_idx,
-            m.body_parentid,
-            m.body_rootid,
-            m.body_dofadr,
-            m.body_dofnum,
-            m.dof_parentid,
-            d.subtree_com,
-            d.xipos,
-            d.cdof,
-          ],
-          outputs=[body_jac_row],
-        )
-        smooth.solve_m(m, d, body_result_vec, body_jac_row)
-        wp.launch(
-          _compute_body_A_diag_entry,
-          dim=d.nworld,
-          inputs=[m.nv, bodyid, row_idx, body_jac_row, body_result_vec],
-          outputs=[body_A_diag],
-        )
+    # Jacobian row (bodyid - 1) * 6 + row_idx for every non-world body
+    for rowadr in range(0, 6 * (m.nbody - 1), chunk):
+      rhs.zero_()
+      wp.launch(
+        _compute_body_jac_rows,
+        dim=(d.nworld, chunk),
+        inputs=[
+          m.nbody,
+          rowadr,
+          m.body_parentid,
+          m.body_rootid,
+          m.body_dofadr,
+          m.body_dofnum,
+          m.dof_parentid,
+          d.subtree_com,
+          d.xipos,
+          d.cdof,
+        ],
+        outputs=[rhs],
+      )
+      smooth.solve_m_batched(m, d, result, rhs)
+      wp.launch(
+        _compute_body_A_diag_entries,
+        dim=(d.nworld, chunk),
+        inputs=[m.nv, m.nbody, rowadr, rhs, result],
+        outputs=[body_A_diag],
+      )
 
     wp.launch(
       _finalize_body_invweight0,
@@ -3705,22 +3730,19 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True, workspace: 
 
   # tendon_invweight0[t] = J_t * inv(M) * J_t'
   if m.ntendon > 0:
-    ten_J_vec = workspace.ten_J_vec
-    ten_result_vec = workspace.ten_result_vec
-
-    for tenid in range(m.ntendon):
-      ten_J_vec.zero_()
+    for tenadr in range(0, m.ntendon, chunk):
+      rhs.zero_()
       wp.launch(
-        _copy_tendon_jacobian,
-        dim=d.nworld,
-        inputs=[tenid, m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, d.ten_J],
-        outputs=[ten_J_vec],
+        _copy_tendon_jacobians,
+        dim=(d.nworld, chunk),
+        inputs=[m.ntendon, tenadr, m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, d.ten_J],
+        outputs=[rhs],
       )
-      smooth.solve_m(m, d, ten_result_vec, ten_J_vec)
+      smooth.solve_m_batched(m, d, result, rhs)
       wp.launch(
-        _compute_tendon_dot_product,
-        dim=m.tendon_invweight0.shape[0],
-        inputs=[m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, tenid, d.ten_J, ten_result_vec],
+        _compute_tendon_dot_products,
+        dim=(m.tendon_invweight0.shape[0], chunk),
+        inputs=[m.ntendon, m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, tenadr, d.ten_J, result],
         outputs=[m.tendon_invweight0],
       )
 
@@ -3742,19 +3764,20 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True, workspace: 
 
   # actuator_acc0[i] = ||inv(M) * actuator_moment[i]|| - acceleration from unit actuator force
   if m.nu > 0 and m.nv > 0:
-    act_moment_vec = workspace.act_moment_vec
-    act_result_vec = workspace.act_result_vec
-
-    for actid in range(m.nu):
+    for actadr in range(0, m.nu, chunk):
+      rhs.zero_()
       wp.launch(
-        _copy_actuator_moment,
-        dim=d.nworld,
-        inputs=[actid, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
-        outputs=[act_moment_vec],
+        _copy_actuator_moments,
+        dim=(d.nworld, chunk),
+        inputs=[m.nu, actadr, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
+        outputs=[rhs],
       )
-      smooth.solve_m(m, d, act_result_vec, act_moment_vec)
+      smooth.solve_m_batched(m, d, result, rhs)
       wp.launch(
-        _compute_actuator_acc0, dim=m.actuator_acc0.shape[0], inputs=[actid, m.nv, act_result_vec], outputs=[m.actuator_acc0]
+        _compute_actuator_acc0,
+        dim=(m.actuator_acc0.shape[0], chunk),
+        inputs=[m.nv, m.nu, actadr, result],
+        outputs=[m.actuator_acc0],
       )
 
   # resolve dampratio: compute dof_M0, then convert dampratio to damping
