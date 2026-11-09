@@ -68,6 +68,7 @@ class BlockDim:
     cholesky_factorize_solve: block-dense Cholesky factorize+solve block dimension (smooth)
     cholesky_solve: Cholesky solve block dimension (smooth)
     small_cholesky: scalar small-block Cholesky block dimension (smooth)
+    factor_i_sparse_fused: factor I sparse fused block dimension (smooth)
     solve_LD_sparse_fused: solve LD sparse fused block dimension (smooth)
     update_gradient_cholesky: update gradient Cholesky block dimension (solver)
     update_gradient_cholesky_blocked: update gradient Cholesky blocked block dimension (solver)
@@ -100,6 +101,7 @@ class BlockDim:
   cholesky_factorize_solve: int = 32
   cholesky_solve: int = 64
   small_cholesky: int = 64
+  factor_i_sparse_fused: int = 1024
   solve_LD_sparse_fused: int = 128
   # solver
   update_gradient_cholesky: int = 64
@@ -1447,9 +1449,12 @@ class Model:
     taxel_vertadr: tactile sensor vertex address             (nsensortaxel,)
     taxel_sensorid: address for tactile sensors
     M_tiles: scalar and tiled block-factorization groups
-    qLD_updates: sparse factor updates grouped by tree level
-    qLD_all_updates: tuple of all levels concatenated
-    qLD_level_offsets: tuple of start offsets for each level
+    qLD_all_updates: sparse factor updates (row i, descendant k, CSR address of (k, i)),
+                     grouped by the tree depth of i
+    qLD_level_offsets: start offset of each depth level in qLD_all_updates
+    qLD_factor_elem: CSR addresses (M(i,j), M(k,j), M(k,i), M(k,k)) of every element update
+                     M(i,j) -= M(k,j) * M(k,i) / M(k,k) of the sparse factorization, by level
+    qLD_factor_elem_offsets: start offset of each depth level in qLD_factor_elem
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -1926,9 +1931,10 @@ class Model:
   taxel_vertadr: array("nsensortaxel", int)
   taxel_sensorid: array("nsensortaxel", int)
   M_tiles: tuple[TileSet, ...]
-  qLD_updates: tuple[array("nqLD_all_updates", wp.vec3i), ...]
   qLD_all_updates: array("nqLD_all_updates", wp.vec3i)
   qLD_level_offsets: array("nqLD_level_offsets", int)
+  qLD_factor_elem: array("nqLD_factor_elem", wp.vec4i)
+  qLD_factor_elem_offsets: array("nqLD_level_offsets", int)
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

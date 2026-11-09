@@ -157,7 +157,7 @@ def test_batched_sparse_solve_run_to_run_splits_launches(monkeypatch):
     # Newton bounds the dynamic-loop atomics of MJWarp's unique kernels with
     # deterministic_max_records; every update visited in both sweeps by one thread is a safe bound.
     monkeypatch.setattr(wp.config, "deterministic_max_records", 2 * m.qLD_all_updates.shape[0])
-    kernel = smooth._solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates))
+    kernel = smooth._solve_LD_sparse_fused_batched(m.nv, m.qLD_level_offsets.shape[0] - 1)
     records = smooth._deterministic_records_per_thread(kernel, wp.get_device(), m.block_dim.solve_LD_sparse_fused)
     assert records == 2 * m.qLD_all_updates.shape[0]
     mjwarp.kinematics(m, d)

@@ -1181,55 +1181,115 @@ def tendon_armature(m: Model, d: Data):
   )
 
 
-@wp.kernel
-def _qLD_acc(
-  # Model:
-  M_rownnz: wp.array[int],
-  M_rowadr: wp.array[int],
-  # In:
-  qLD_updates_: wp.array[wp.vec3i],
-  L_in: wp.array2d[float],
-  # Out:
-  L_out: wp.array2d[float],
-):
-  worldid, nodeid = wp.tid()
-  update = qLD_updates_[nodeid]
-  i, k, Madr_ki = update[0], update[1], update[2]
-  Madr_i = M_rowadr[i]  # Address of row being updated
-  diag_k = M_rowadr[k] + M_rownnz[k] - 1  # Address of diagonal element of k
-  # tmp = M(k,i) / M(k,k)
-  tmp = L_out[worldid, Madr_ki] / L_out[worldid, diag_k]
-  for j in range(M_rownnz[i]):
-    # M(i,j) -= M(k,j) * tmp
-    wp.atomic_sub(L_out[worldid], Madr_i + j, L_in[worldid, M_rowadr[k] + j] * tmp)
-  # M(k,i) = tmp
-  L_out[worldid, Madr_ki] = tmp
+@cache_kernel
+def _factor_i_sparse_fused(nv: int, nlevels: int):
+  """Fused sparse L'*D*L factorization: copy, every tree level and the diagonal in one kernel.
 
+  One block per world runs the levels deepest first with a barrier between them, like
+  _solve_LD_sparse_fused. Each level's row updates are split into one thread per element
+  M(i,j) -= M(k,j) * M(k,i) / M(k,k), the same arithmetic as the serial loop. Within a level,
+  rows i are only written (atomically, as before) and rows k only read, so the multiplier
+  M(k,i) is stored once the level is done, together with the next level's updates.
+  """
 
-@wp.kernel
-def _qLDiag_div(
-  # Model:
-  M_rownnz: wp.array[int],
-  M_rowadr: wp.array[int],
-  # In:
-  L_in: wp.array2d[float],
-  # Out:
-  D_out: wp.array2d[float],
-):
-  worldid, dofid = wp.tid()
-  diag_i = M_rowadr[dofid] + M_rownnz[dofid] - 1  # Address of diagonal element of i
-  D_out[worldid, dofid] = 1.0 / L_in[worldid, diag_i]
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.func
+  def _store_multipliers(
+    # Model:
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    qLD_all_updates: wp.array[wp.vec3i],
+    qLD_level_offsets: wp.array[int],
+    # In:
+    worldid: int,
+    tid: int,
+    nthread: int,
+    level_idx: int,
+    # Out:
+    L_out: wp.array2d[float],
+  ):
+    for u in range(qLD_level_offsets[level_idx] + tid, qLD_level_offsets[level_idx + 1], nthread):
+      update = qLD_all_updates[u]
+      k, Madr_ki = update[1], update[2]
+      diag_k = M_rowadr[k] + M_rownnz[k] - 1
+      # M(k,i) = M(k,i) / M(k,k)
+      L_out[worldid, Madr_ki] = L_out[worldid, Madr_ki] / L_out[worldid, diag_k]
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    M_rownnz: wp.array[int],
+    M_rowadr: wp.array[int],
+    qLD_all_updates: wp.array[wp.vec3i],
+    qLD_level_offsets: wp.array[int],
+    qLD_factor_elem: wp.array[wp.vec4i],
+    qLD_factor_elem_offsets: wp.array[int],
+    # Data in:
+    M_in: wp.array2d[float],
+    # Out:
+    L_out: wp.array2d[float],
+    D_out: wp.array2d[float],
+  ):
+    worldid, tid = wp.tid()
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    BLOCK_DIM = wp.block_dim()
+
+    for adr in range(tid, M_in.shape[1], BLOCK_DIM):
+      L_out[worldid, adr] = M_in[worldid, adr]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      level_idx = NLEVELS - 1 - level
+      if level > 0:
+        _store_multipliers(
+          M_rownnz, M_rowadr, qLD_all_updates, qLD_level_offsets, worldid, tid, BLOCK_DIM, level_idx + 1, L_out
+        )
+
+      for e in range(qLD_factor_elem_offsets[level_idx] + tid, qLD_factor_elem_offsets[level_idx + 1], BLOCK_DIM):
+        # CSR addresses of M(i,j), M(k,j), M(k,i), M(k,k)
+        elem = qLD_factor_elem[e]
+        # tmp = M(k,i) / M(k,k)
+        tmp = L_out[worldid, elem[2]] / L_out[worldid, elem[3]]
+        # M(i,j) -= M(k,j) * tmp
+        wp.atomic_sub(L_out[worldid], elem[0], L_out[worldid, elem[1]] * tmp)
+      _syncthreads()
+
+    if NLEVELS > 0:
+      _store_multipliers(M_rownnz, M_rowadr, qLD_all_updates, qLD_level_offsets, worldid, tid, BLOCK_DIM, 0, L_out)
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      diag_i = M_rowadr[dofid] + M_rownnz[dofid] - 1
+      D_out[worldid, dofid] = 1.0 / L_out[worldid, diag_i]
+
+  return kernel
 
 
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
-  wp.copy(L, M)
+  if wp.get_device().is_cuda:
+    dim_block = m.block_dim.factor_i_sparse_fused
+  else:
+    dim_block = 1
 
-  for i in reversed(range(len(m.qLD_updates))):
-    qLD_updates = m.qLD_updates[i]
-    wp.launch(_qLD_acc, dim=(d.nworld, qLD_updates.size), inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L], outputs=[L])
-
-  wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
+  wp.launch(
+    _factor_i_sparse_fused(m.nv, m.qLD_level_offsets.shape[0] - 1),
+    dim=(d.nworld, dim_block),
+    inputs=[
+      m.M_rownnz,
+      m.M_rowadr,
+      m.qLD_all_updates,
+      m.qLD_level_offsets,
+      m.qLD_factor_elem,
+      m.qLD_factor_elem_offsets,
+      M,
+    ],
+    outputs=[L, D],
+    block_dim=dim_block,
+  )
 
 
 @cache_kernel
@@ -3058,7 +3118,7 @@ def _solve_LD_sparse(
   y: wp.array2d[float],
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y."""
-  nlevels = len(m.qLD_updates)
+  nlevels = m.qLD_level_offsets.shape[0] - 1
   if wp.get_device().is_cuda:
     dim_block = m.block_dim.solve_LD_sparse_fused
   else:
@@ -3429,7 +3489,7 @@ def solve_m_batched(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float
   if d.qLD.shape[1] > m.qLD_block_total:
     device = wp.get_device()
     dim_block = m.block_dim.solve_LD_sparse_fused if device.is_cuda else 1
-    kernel = _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates))
+    kernel = _solve_LD_sparse_fused_batched(m.nv, m.qLD_level_offsets.shape[0] - 1)
     batch = deterministic_rhs_per_launch(
       _deterministic_records_per_thread(kernel, device, dim_block), d.nworld * dim_block, nrhs
     )
