@@ -1297,14 +1297,22 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       Madr_ki -= 1
   m.qLD_updates = tuple(wp.array(sparse_updates[i], dtype=wp.vec3i) for i in sorted(sparse_updates))
 
-  # Build concatenated updates for fused kernel
-  all_updates_flat = []
-  level_offsets = [0]
+  # Concatenate the levels for the fused factorization and backsubstitution kernels. The
+  # factorization splits every update's row loop into one element M(i,j) -= M(k,j) * M(k,i) / M(k,k)
+  # per row entry j, in the serial (update, j) order, with its four CSR addresses precomputed.
+  all_updates_flat, level_offsets = [], [0]
+  factor_elem, factor_elem_offsets = [], [0]
   for level in sorted(sparse_updates):
-    all_updates_flat.extend(sparse_updates[level])
+    for i, k, Madr_ki in sparse_updates[level]:
+      diag_k = mjm.M_rowadr[k] + mjm.M_rownnz[k] - 1
+      factor_elem.extend((mjm.M_rowadr[i] + j, mjm.M_rowadr[k] + j, Madr_ki, diag_k) for j in range(mjm.M_rownnz[i]))
+      all_updates_flat.append((i, k, Madr_ki))
     level_offsets.append(len(all_updates_flat))
+    factor_elem_offsets.append(len(factor_elem))
   m.qLD_all_updates = all_updates_flat if all_updates_flat else [(0, 0, 0)]
   m.qLD_level_offsets = level_offsets
+  m.qLD_factor_elem = factor_elem if factor_elem else [(0, 0, 0, 0)]
+  m.qLD_factor_elem_offsets = factor_elem_offsets
 
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
@@ -1675,6 +1683,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nsensor_collision_start_adr": len(m.sensor_collision_start_adr),
       "nqLD_all_updates": len(m.qLD_all_updates),
       "nqLD_level_offsets": len(m.qLD_level_offsets),
+      "nqLD_factor_elem": len(m.qLD_factor_elem),
       "nM_fullm": len(m.M_fullm_i),
       "nqD_fullm": len(m.qD_fullm_i),
       "nv_plus_1": len(m.M_mulm_rowadr),

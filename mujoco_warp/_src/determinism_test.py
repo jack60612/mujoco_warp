@@ -416,6 +416,9 @@ class DeterminismTest(parameterized.TestCase):
     self.assertEqual([name for name, mode, _ in launches if mode == _RUN_TO_RUN], [])
     if "smooth._solve_LD_sparse_level" in covers:
       self.assertIn("smooth._solve_LD_sparse_fused", {name for name, _, nonzero in launches if nonzero})
+    if "smooth._qLD_acc" in covers:
+      self.assertIn("smooth._factor_i_sparse_fused", {name for name, _, nonzero in launches if nonzero})
+      self.assertNotIn("smooth._qLD_acc", {name for name, _, _ in launches})
     self._assert_default_path_keys()
 
     with _record_launches() as launches:
@@ -423,6 +426,7 @@ class DeterminismTest(parameterized.TestCase):
     for name, mode, _ in launches:
       self.assertEqual(mode == _RUN_TO_RUN, name in _DET_FACTORIES, name)
     self.assertNotIn("smooth._solve_LD_sparse_fused", {name for name, _, _ in launches})
+    self.assertNotIn("smooth._factor_i_sparse_fused", {name for name, _, _ in launches})
     launched = {name for name, mode, nonzero in launches if mode == _RUN_TO_RUN and nonzero}
     self.assertEqual(set(covers) - launched, set(), "factories not exercised")
 
