@@ -24,7 +24,7 @@ from absl.testing import parameterized
 import mujoco_warp as mjw
 from mujoco_warp import test_data
 from mujoco_warp._src import derivative
-
+from mujoco_warp._src import util_misc
 
 _XML = """
 <mujoco>
@@ -64,7 +64,111 @@ _XML = """
 """
 
 
+@wp.kernel
+def _qderiv_tendon_damping_serial(
+  # Model:
+  opt_timestep: wp.array[float],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  tendon_damping: wp.array2d[float],
+  tendon_dampingpoly: wp.array2d[wp.vec2],
+  M_elemid: wp.array2d[int],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  ten_velocity_in: wp.array2d[float],
+  # Out:
+  qDeriv_out: wp.array2d[float],
+):
+  """The one-thread-per-tendon kernel that the (world, tendon, J entry) launch replaced."""
+  worldid, tenid = wp.tid()
+  damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
+  dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
+  if damping == 0.0 and dpoly[0] == 0.0 and dpoly[1] == 0.0:
+    return
+  v = ten_velocity_in[worldid, tenid]
+  deriv = opt_timestep[worldid % opt_timestep.shape[0]] * util_misc._poly_force_deriv(damping, dpoly, v, 1)
+  if deriv == 0.0:
+    return
+  rownnz = ten_J_rownnz[tenid]
+  rowadr = ten_J_rowadr[tenid]
+  for i in range(rownnz):
+    sparsei = rowadr + i
+    Ji = ten_J_in[worldid, sparsei]
+    if Ji == 0.0:
+      continue
+    dofi = ten_J_colind[sparsei]
+    for j in range(i + 1):
+      sparsej = rowadr + j
+      Jj = ten_J_in[worldid, sparsej]
+      if Jj == 0.0:
+        continue
+      dofj = ten_J_colind[sparsej]
+      madr = M_elemid[dofi, dofj]
+      if madr >= 0:
+        wp.atomic_add(qDeriv_out[worldid], madr, Ji * Jj * deriv)
+
+
+def _branched_tendons_xml() -> str:
+  """Spatial tendons from every leaf of a branched tree to a shared anchor: overlapping J rows."""
+
+  def branch(depth: int, name: str) -> str:
+    if depth == 0:
+      return f'<site name="{name}"/>'
+    joints = '<joint type="hinge" axis="1 0 0"/><joint type="hinge" axis="0 1 0"/>'
+    children = "".join(f'<body pos="{0.1 * c - 0.05} 0 .2">{branch(depth - 1, f"{name}{c}")}</body>' for c in range(2))
+    return f'{joints}<geom type="capsule" size=".02 .1"/>{children}'
+
+  leaves = [f"s{a}{b}{c}" for a in range(2) for b in range(2) for c in range(2)]
+  tendons = "".join(
+    f'<spatial damping="{1 + n} {0.1 * n} .05"><site site="anchor"/><site site="{leaf}"/></spatial>'
+    for n, leaf in enumerate(leaves)
+  )
+  return f"""
+    <mujoco>
+      <option integrator="implicitfast"/>
+      <default><geom contype="0" conaffinity="0"/></default>
+      <worldbody>
+        <site name="anchor" pos="0 0 3"/>
+        <body pos="0 0 1"><freejoint/><geom type="box" size=".1 .1 .1"/><body>{branch(3, "s")}</body></body>
+      </worldbody>
+      <tendon>{tendons}</tendon>
+    </mujoco>
+  """
+
+
 class TendonDampingTest(parameterized.TestCase):
+  def test_entry_parallel_matches_serial(self):
+    """One thread per J entry adds the same terms as the serial per-tendon loop."""
+    mjm, _, m, d = test_data.fixture(xml=_branched_tendons_xml(), nworld=3)
+    rng = np.random.default_rng(0)
+    wp.copy(d.qvel, wp.array(rng.normal(size=(d.nworld, mjm.nv)).astype(np.float32), dtype=float))
+    mjw.forward(m, d)
+    self.assertGreater(m.max_ten_J_rownnz, 6)
+    inputs = [
+      m.opt.timestep,
+      m.ten_J_rownnz,
+      m.ten_J_rowadr,
+      m.ten_J_colind,
+      m.tendon_damping,
+      m.tendon_dampingpoly,
+      m.M_elemid,
+      d.ten_J,
+      d.ten_velocity,
+    ]
+    serial = wp.clone(d.M)
+    wp.launch(_qderiv_tendon_damping_serial, dim=(d.nworld, m.ntendon), inputs=inputs, outputs=[serial])
+    parallel = wp.clone(d.M)
+    wp.launch(
+      derivative._qderiv_tendon_damping, dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz), inputs=inputs, outputs=[parallel]
+    )
+    self.assertFalse(np.array_equal(serial.numpy(), d.M.numpy()))
+    if wp.get_device().is_cuda:
+      # tendons sharing an M entry add in GPU scheduling order, before and after
+      np.testing.assert_allclose(parallel.numpy(), serial.numpy(), rtol=1e-6, atol=1e-7)
+    else:
+      np.testing.assert_array_equal(parallel.numpy(), serial.numpy())
+
   @parameterized.product(jacobian=(0, 1), disabled=(False, True))
   def test_native_derivative(self, jacobian, disabled):
     """Match native implicitfast, including polynomial and off-pattern entries."""
@@ -94,15 +198,15 @@ class TendonDampingTest(parameterized.TestCase):
     """Scatter overlapping tendons with broadcast parameters and missing M pairs."""
     # Lower M pattern: (0,0), (1,0), (1,1), (2,0), (2,2).
     elemid = np.array([[0, 1, 3], [1, 2, -1], [3, -1, 4]], dtype=np.int32)
-    jac = np.array([[1, -2, .5, 0, 3], [-1, 0, 2, 4, 0]], dtype=np.float32)
+    jac = np.array([[1, -2, 0.5, 0, 3], [-1, 0, 2, 4, 0]], dtype=np.float32)
     velocity = np.array([[-2, 1], [3, -1]], dtype=np.float32)
     damping = np.array([[2, 0], [0, 1]], dtype=np.float32)
-    poly = np.array([[[.3, .2], [.4, .1]]], dtype=np.float32)
-    timestep = np.array([.01, .02], dtype=np.float32)
+    poly = np.array([[[0.3, 0.2], [0.4, 0.1]]], dtype=np.float32)
+    timestep = np.array([0.01, 0.02], dtype=np.float32)
     out = wp.full((2, 5), 7.0, dtype=float)
     wp.launch(
       derivative._qderiv_tendon_damping,
-      dim=(2, 2),
+      dim=(2, 2, 3),
       inputs=[
         wp.array(timestep),
         wp.array(np.array([3, 2], dtype=np.int32)),
@@ -156,7 +260,6 @@ class TendonDampingTest(parameterized.TestCase):
       mjw.step(m, d)
     np.testing.assert_allclose(d.qpos.numpy()[0], mjd.qpos, atol=2e-6, rtol=2e-6)
     np.testing.assert_allclose(d.qvel.numpy()[0], mjd.qvel, atol=2e-6, rtol=2e-6)
-
 
 
 if __name__ == "__main__":
