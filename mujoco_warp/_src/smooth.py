@@ -3228,6 +3228,187 @@ def solve_m(m: Model, d: Data, x: wp.array2d[float], y: wp.array2d[float]):
 
 
 @cache_kernel
+def _solve_LD_sparse_fused_batched(nv: int, nlevels: int):
+  """`_solve_LD_sparse_fused` with one thread block per (world, right-hand side)."""
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    all_updates: wp.array[wp.vec3i],
+    level_offsets: wp.array[int],
+    y: wp.array3d[float],
+    # Out:
+    x_out: wp.array3d[float],
+  ):
+    worldid, rhsid, tid = wp.tid()
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    BLOCK_DIM = wp.block_dim()
+    x = x_out[worldid, rhsid]
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x[dofid] = y[worldid, rhsid, dofid]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      level_idx = NLEVELS - 1 - level
+      level_offset = level_offsets[level_idx]
+      level_size = level_offsets[level_idx + 1] - level_offset
+
+      for u in range(tid, level_size, BLOCK_DIM):
+        update = all_updates[level_offset + u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        wp.atomic_sub(x, i, L[worldid, Madr_ki] * x[k])
+      _syncthreads()
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x[dofid] *= D[worldid, dofid]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      level_idx = level
+      level_offset = level_offsets[level_idx]
+      level_size = level_offsets[level_idx + 1] - level_offset
+
+      for u in range(tid, level_size, BLOCK_DIM):
+        update = all_updates[level_offset + u]
+        i, k, Madr_ki = update[0], update[1], update[2]
+        wp.atomic_sub(x, k, L[worldid, Madr_ki] * x[i])
+      _syncthreads()
+
+  return kernel
+
+
+@cache_kernel
+def _small_cholesky_solve_block_batched(block_size: int):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    block_dof: wp.array[int],
+    D_in: wp.array2d[float],
+    L_in: wp.array2d[float],
+    y_in: wp.array3d[float],
+    # Out:
+    x_out: wp.array3d[float],
+  ):
+    worldid, rhsid, blk = wp.tid()
+    start = block_dof[blk]
+    size = wp.static(block_size)
+    factor_adr = qLD_block_adr[start]
+    y = y_in[worldid, rhsid]
+    x = x_out[worldid, rhsid]
+    if factor_adr == Q_LD_BLOCK_COMPACT:
+      for i in range(wp.static(block_size)):
+        x[start + i] = D_in[worldid, start + i] * y[start + i]
+    else:
+      for i in range(size):
+        value = y[start + i]
+        for k in range(i):
+          value -= L_in[worldid, factor_adr + k * size + i] * x[start + k]
+        x[start + i] = value / L_in[worldid, factor_adr + i * size + i]
+
+      for reverse_i in range(size):
+        i = size - 1 - reverse_i
+        value = x[start + i]
+        for k in range(i + 1, size):
+          value -= L_in[worldid, factor_adr + i * size + k] * x[start + k]
+        x[start + i] = value / L_in[worldid, factor_adr + i * size + i]
+
+  return kernel
+
+
+@cache_kernel
+def _tile_cholesky_solve_block_batched(tile: TileSet):
+  block_size = tile.size
+  block_area = block_size * block_size
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    block_dof: wp.array[int],
+    L_in: wp.array2d[float],
+    y: wp.array3d[float],
+    # Out:
+    x: wp.array3d[float],
+  ):
+    worldid, rhsid, blk = wp.tid()
+    start = block_dof[blk]
+
+    L = wp.tile_reshape(
+      wp.tile_load(L_in[worldid], shape=(block_area,), offset=(qLD_block_adr[start],)), (block_size, block_size)
+    )
+    rhs = wp.tile_load(y[worldid, rhsid], shape=(block_size,), offset=(start,))
+    sol = wp.tile_cholesky_solve(L, rhs, fill_mode="upper")
+    wp.tile_store(x[worldid, rhsid], sol, offset=(start,))
+
+  return kernel
+
+
+def solve_m_batched(m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float]):
+  """Computes x[w, r] = inv(M[w]) * y[w, r] for every right-hand side r of every world w.
+
+  Uses the factorization from the most recent `factor_m`. Each right-hand side runs the
+  same per-block arithmetic as `solve_m`, so a batch of k columns costs a few launches
+  instead of k sequential solves.
+
+  Args:
+    m: The model containing inertia and factorization information.
+    d: The data object containing factorization results.
+    x: Output solutions, shape (nworld, nrhs, nv).
+    y: Input right-hand sides, shape (nworld, nrhs, nv).
+  """
+  nrhs = y.shape[1]
+  for tile in m.M_tiles:
+    if tile.elemid.size == 0:
+      wp.launch(
+        _small_cholesky_solve_block_batched(tile.size),
+        dim=(d.nworld, nrhs, tile.adr.size),
+        inputs=[m.qLD_block_adr, tile.adr, d.qLDiagInv, d.qLD, y],
+        outputs=[x],
+        block_dim=m.block_dim.small_cholesky,
+      )
+    else:
+      block_dim = m.block_dim.cholesky_solve if tile.size <= 40 else 32
+      wp.launch_tiled(
+        _tile_cholesky_solve_block_batched(tile),
+        dim=(d.nworld, nrhs, tile.adr.size),
+        inputs=[m.qLD_block_adr, tile.adr, d.qLD, y],
+        outputs=[x],
+        block_dim=block_dim,
+      )
+  if d.qLD.shape[1] > m.qLD_block_total:
+    dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
+    wp.launch(
+      _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates)),
+      dim=(d.nworld, nrhs, dim_block),
+      inputs=[
+        m.qLD_block_adr,
+        d.qLD[:, m.qLD_block_total :],
+        d.qLDiagInv,
+        m.qLD_all_updates,
+        m.qLD_level_offsets,
+        y,
+      ],
+      outputs=[x],
+      block_dim=dim_block,
+    )
+
+
+@cache_kernel
 def _tile_cholesky_factorize_solve_block(tile: TileSet):
   # Fused factor+solve: densify the block, factor it, and back-substitute in one launch (avoids
   # re-loading the factor). Grid/densify structure matches _tile_cholesky_factorize_block.
