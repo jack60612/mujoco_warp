@@ -276,7 +276,11 @@ def _qderiv_tendon_damping(
   # Out:
   qDeriv_out: wp.array2d[float],
 ):
-  worldid, tenid = wp.tid()
+  worldid, tenid, i = wp.tid()
+  rownnz = ten_J_rownnz[tenid]
+  if i >= rownnz:
+    return
+
   damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
   dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
   if damping == 0.0 and dpoly[0] == 0.0 and dpoly[1] == 0.0:
@@ -287,25 +291,24 @@ def _qderiv_tendon_damping(
   if deriv == 0.0:
     return
 
-  # Scatter J.T @ damping' @ J into the existing lower-triangular M pattern.
+  # Scatter row i of J.T @ damping' @ J into the existing lower-triangular M pattern, one thread
+  # per Jacobian entry i: a tendon's (i, j) pairs hit distinct M entries.
   # As for actuator damping, couplings outside that pattern are omitted.
-  rownnz = ten_J_rownnz[tenid]
   rowadr = ten_J_rowadr[tenid]
-  for i in range(rownnz):
-    sparsei = rowadr + i
-    Ji = ten_J_in[worldid, sparsei]
-    if Ji == 0.0:
+  sparsei = rowadr + i
+  Ji = ten_J_in[worldid, sparsei]
+  if Ji == 0.0:
+    return
+  dofi = ten_J_colind[sparsei]
+  for j in range(i + 1):
+    sparsej = rowadr + j
+    Jj = ten_J_in[worldid, sparsej]
+    if Jj == 0.0:
       continue
-    dofi = ten_J_colind[sparsei]
-    for j in range(i + 1):
-      sparsej = rowadr + j
-      Jj = ten_J_in[worldid, sparsej]
-      if Jj == 0.0:
-        continue
-      dofj = ten_J_colind[sparsej]
-      madr = M_elemid[dofi, dofj]
-      if madr >= 0:
-        wp.atomic_add(qDeriv_out[worldid], madr, Ji * Jj * deriv)
+    dofj = ten_J_colind[sparsej]
+    madr = M_elemid[dofi, dofj]
+    if madr >= 0:
+      wp.atomic_add(qDeriv_out[worldid], madr, Ji * Jj * deriv)
 
 
 @wp.kernel
@@ -1304,7 +1307,7 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel: Op
   if m.ntendon and not (m.opt.disableflags & DisableBit.DAMPER):
     wp.launch(
       _qderiv_tendon_damping,
-      dim=(d.nworld, m.ntendon),
+      dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
       inputs=[
         m.opt.timestep,
         m.ten_J_rownnz,
