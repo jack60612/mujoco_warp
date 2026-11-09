@@ -1197,6 +1197,52 @@ class SolverTest(parameterized.TestCase):
     self.assertGreater(qfrc[0], 0.0, "early-converged world was zeroed")
     self.assertGreater(qfrc[1], 0.0)
 
+  @parameterized.product(
+    solver_=(mujoco.mjtSolver.mjSOL_CG, mujoco.mjtSolver.mjSOL_NEWTON),
+    jacobian=(mujoco.mjtJacobian.mjJAC_DENSE, mujoco.mjtJacobian.mjJAC_SPARSE),
+  )
+  def test_free_tree_starts_at_qacc_smooth(self, solver_, jacobian):
+    """Trees that no active row touches start the solve at qacc_smooth, not the warmstart."""
+    xml = """
+    <mujoco>
+      <worldbody>
+        <geom type="plane" size="10 10 .1"/>
+        <body pos="0 0 .049"><freejoint/><geom type="sphere" size=".05"/></body>
+        <body pos="1 0 1"><freejoint/><geom type="box" size=".05 .1 .2"/></body>
+      </worldbody>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjm.opt.solver = solver_
+    mjm.opt.jacobian = jacobian
+    mjd = mujoco.MjData(mjm)
+    mjd.qvel[9:12] = (1.0, 2.0, 3.0)  # spin the airborne box: gyroscopic bias in qacc_smooth
+    mujoco.mj_forward(mjm, mjd)
+    mjd.qacc_warmstart[:] = 1.0  # far from the solution in both trees
+
+    # One iteration from the bad warmstart: CG cannot converge the sphere (contact rows), but
+    # the airborne box (no rows) already sits at its exact solution.
+    mjm.opt.iterations = 1
+    mjm.opt.ls_iterations = 1
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    mjw.forward(m, d)
+
+    self.assertGreater(d.nefc.numpy()[0], 0)
+    qacc = d.qacc.numpy()[0]
+    qacc_smooth = d.qacc_smooth.numpy()[0]
+    np.testing.assert_allclose(qacc[6:], qacc_smooth[6:], rtol=1e-6, atol=1e-6)
+    if solver_ == mujoco.mjtSolver.mjSOL_CG:
+      self.assertGreater(np.abs(qacc[:6] - mjd.qacc[:6]).max(), 1e-3)
+
+    # Converged, the solve matches MuJoCo.
+    mjm.opt.iterations = 100
+    mjm.opt.ls_iterations = 50
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    mjw.forward(m, d)
+    _assert_eq(d.qacc.numpy()[0], mjd.qacc, "qacc")
+
 
 _FRICTION_CHAIN_XML = """
 <mujoco>
