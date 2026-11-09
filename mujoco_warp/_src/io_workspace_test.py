@@ -166,16 +166,16 @@ def test_batched_sparse_solve_run_to_run_splits_launches(monkeypatch):
     mjwarp.factor_m(m, d)
     y = wp.array(np.random.default_rng(0).normal(size=(d.nworld, 9, m.nv)), dtype=float)
 
-    def solve():
+    def solve(rhs_per_launch):
+      # Room for exactly rhs_per_launch right-hand sides per launch at the kernel's record bound.
+      budget = rhs_per_launch * d.nworld * m.block_dim.solve_LD_sparse_fused * records
+      monkeypatch.setattr(smooth, "_DETERMINISTIC_RECORD_BUDGET", budget)
+      launches.clear()
       x = wp.zeros_like(y)
       smooth.solve_m_batched(m, d, x, y)
       return x.numpy()
 
-    whole = solve()
+    whole = solve(9)
     assert launches == [9]
-    # Room for exactly three right-hand sides per launch at the kernel's record bound.
-    launches.clear()
-    budget = 3 * d.nworld * m.block_dim.solve_LD_sparse_fused * records
-    monkeypatch.setattr(smooth, "_DETERMINISTIC_RECORD_BUDGET", budget)
-    np.testing.assert_array_equal(solve(), whole)
+    np.testing.assert_array_equal(solve(3), whole)
     assert launches == [3, 3, 3]
