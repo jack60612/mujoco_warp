@@ -177,7 +177,7 @@ class SparseLDLTest(parameterized.TestCase):
     np.testing.assert_allclose(D_new[1, sparse], mjd.qLDiagInv[sparse], rtol=1e-3, atol=1e-3)
 
   def test_factor_path_choice(self):
-    """Fused unless levels are wide while most SMs idle; always fused (serial) on the CPU."""
+    """Fused unless levels are wide and most SMs idle; fused on CPU and in deterministic mode."""
     _, m, _ = _fixture(nworld=1)
     width = m.qLD_factor_elem_offsets_host[-1] / (len(m.qLD_level_offsets_host) - 1)
     self.assertLess(width, types.M_SPARSE_LEVEL_WIDTH_MIN)
@@ -188,6 +188,9 @@ class SparseLDLTest(parameterized.TestCase):
       if device.is_cuda:
         self.assertFalse(smooth._factor_sparse_fused(m, 1))
         self.assertTrue(smooth._factor_sparse_fused(m, device.sm_count // 2))
+        # deterministic launches would reserve scatter records for every element thread
+        with mock.patch.object(smooth, "_deterministic_records_per_thread", return_value=1):
+          self.assertTrue(smooth._factor_sparse_fused(m, 1))
       else:
         self.assertTrue(smooth._factor_sparse_fused(m, 1))
 

@@ -1328,6 +1328,9 @@ def _factor_sparse_fused(m: Model, nworld: int) -> bool:
   count over one SM's throughput while nworld < sm_count. Per-level launches spread every level
   over the device and pay two launches per level. They win for wide levels (deep, branched trees
   with thousands of dofs) while most SMs would otherwise idle; see M_SPARSE_LEVEL_WIDTH_MIN.
+
+  Deterministic launches keep the fused kernel: Warp reserves scatter records per launched thread,
+  one block per world there but one thread per element for per-level launches.
   """
   device = wp.get_device()
   nlevels = len(m.qLD_level_offsets_host) - 1
@@ -1335,7 +1338,9 @@ def _factor_sparse_fused(m: Model, nworld: int) -> bool:
     return True
   width = m.qLD_factor_elem_offsets_host[-1] / nlevels
   idle = 1.0 - 2.0 * nworld / device.sm_count
-  return width * idle < M_SPARSE_LEVEL_WIDTH_MIN
+  if width * idle < M_SPARSE_LEVEL_WIDTH_MIN:
+    return True
+  return _deterministic_records_per_thread(_qLD_acc_level, device, 256) > 0
 
 
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
