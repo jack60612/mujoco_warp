@@ -275,6 +275,11 @@ _TREE_CASES = (
     ),
   ),
   dict(testcase_name="implicitfast", overrides={"opt.integrator": "IMPLICITFAST"}, covers=()),
+  dict(
+    testcase_name="implicitfast_crosstree",
+    overrides={"opt.integrator": "IMPLICITFAST", "opt.implicit_crosstree_iterations": 2},
+    covers=("derivative._crosstree_actuator_damping_mul", "derivative._crosstree_tendon_damping_mul"),
+  ),
   dict(testcase_name="rk4", overrides={"opt.integrator": "RK4"}, covers=()),
   dict(
     testcase_name="discrete",

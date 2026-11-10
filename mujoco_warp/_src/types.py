@@ -71,6 +71,7 @@ class BlockDim:
     segmented_sort: segmented sort block dimension (collision_driver)
     nxn_broadphase: NXN broadphase block dimension (collision_driver)
     convex_ccd: convex CCD kernel block dimension (collision_convex)
+    implicit_crosstree_pcg: implicitfast cross-tree damping PCG reduction block dimension (forward)
     island_dsu: island discovery DSU block dimension (island)
     ray: ray block dimension (ray)
     contact_sort: contact sort block dimension (sensor)
@@ -99,6 +100,8 @@ class BlockDim:
   nxn_broadphase: int = 128
   # collision_convex
   convex_ccd: int = 64
+  # forward
+  implicit_crosstree_pcg: int = 256
   # island
   island_dsu: int = 32
   # ray
@@ -1001,6 +1004,10 @@ class Option:
       sensors are disabled or no sensors are present
     contact_sensor_maxmatch: max number of contacts considered by contact sensor matching criteria
                              contacts matched after this value is exceded will be ignored
+    implicit_crosstree_iterations: preconditioned conjugate-gradient iterations that add actuator
+                                   and tendon damping couplings outside the kinematic-tree
+                                   sparsity of M (e.g. between trees) to the implicitfast
+                                   velocity solve; 0 (default) keeps the native tree-sparse solve
     warn_overflow: overflow warning bitmask (OverflowType)
     deterministic: determinism bitmask (DeterminismType)
   """
@@ -1035,6 +1042,7 @@ class Option:
   run_collision_detection: bool
   run_rne_postconstraint: bool
   contact_sensor_maxmatch: int
+  implicit_crosstree_iterations: int
   warn_overflow: int
   deterministic: int
 
