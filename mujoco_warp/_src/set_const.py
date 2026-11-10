@@ -603,7 +603,35 @@ def set_const_fixed(m: types.Model, d: types.Data):
   )
 
 
-def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
+class Const0Workspace:
+  """Reusable device scratch for :func:`set_const_0`, allocated before graph capture.
+
+  A workspace is bound to a model's fixed dimensions, world count and device. It must
+  not be shared by concurrent refreshes. All scratch is overwritten on each call.
+  """
+
+  def __init__(self, m: types.Model, d: types.Data):
+    device = d.qpos.device
+    self.qpos_saved = wp.empty_like(d.qpos)
+    self.mocap_pos_saved = wp.empty_like(d.mocap_pos)
+    self.mocap_quat_saved = wp.empty_like(d.mocap_quat)
+    self.nacon_saved = wp.empty_like(d.nacon)
+    self.unit_vec = wp.empty((d.nworld, m.nv), dtype=float, device=device)
+    self.result_vec = wp.empty_like(self.unit_vec)
+    self.dof_A_diag = wp.empty_like(self.unit_vec)
+    self.body_jac_row = wp.empty_like(self.unit_vec)
+    self.body_result_vec = wp.empty_like(self.unit_vec)
+    self.body_A_diag = wp.zeros((d.nworld, m.nbody, 6), dtype=float, device=device)
+    self.ten_J_vec = wp.empty_like(self.unit_vec)
+    self.ten_result_vec = wp.empty_like(self.unit_vec)
+    self.act_moment_vec = wp.empty_like(self.unit_vec)
+    self.act_result_vec = wp.empty_like(self.unit_vec)
+    self.moment_nnz = wp.empty((d.nworld,), dtype=int, device=device)
+    self.transmission_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int, device=device)
+    self.wrap_geom_xpos = wp.empty((d.nworld, m.nwrap), dtype=wp.spatial_vector, device=device)
+
+
+def set_const_0(m: types.Model, d: types.Data, restore: bool = True, workspace: Const0Workspace | None = None):
   """Compute quantities that depend on qpos0.
 
   Computes:
@@ -621,15 +649,23 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
     restore: Whether to restore state fields to correspond to d.qpos.
+    workspace: Optional preallocated scratch; supplying it makes this function allocation-free.
   """
-  qpos_saved = wp.clone(d.qpos)
-  mocap_pos_saved = wp.clone(d.mocap_pos) if m.nmocap else None
-  mocap_quat_saved = wp.clone(d.mocap_quat) if m.nmocap else None
+  if workspace is None:
+    workspace = Const0Workspace(m, d)
+  qpos_saved = workspace.qpos_saved
+  wp.copy(qpos_saved, d.qpos)
+  mocap_pos_saved = workspace.mocap_pos_saved
+  mocap_quat_saved = workspace.mocap_quat_saved
+  if m.nmocap:
+    wp.copy(mocap_pos_saved, d.mocap_pos)
+    wp.copy(mocap_quat_saved, d.mocap_quat)
 
   # the constants do not depend on the contacts of d, which transmission averages for adhesion
   # actuators: hide them while the constants are computed, as mj_setConst clears them
-  nacon_saved = wp.clone(d.nacon) if m.nacttrnbody else None
+  nacon_saved = workspace.nacon_saved
   if m.nacttrnbody:
+    wp.copy(nacon_saved, d.nacon)
     d.nacon.zero_()
 
   wp.launch(_copy_qpos0_to_qpos, dim=(d.nworld, m.nq), inputs=[m.qpos0], outputs=[d.qpos])
@@ -645,11 +681,11 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
   smooth.com_pos(m, d)
   smooth.camlight(m, d)
   smooth.flex(m, d)
-  smooth.tendon(m, d)
+  smooth.tendon(m, d, workspace.wrap_geom_xpos)
   smooth.crb(m, d)
   smooth.tendon_armature(m, d)
   smooth.factor_m(m, d)
-  smooth.transmission(m, d)
+  smooth.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
 
   wp.launch(_copy_tendon_length0, dim=(m.tendon_length0.shape[0], m.ntendon), inputs=[d.ten_length], outputs=[m.tendon_length0])
 
@@ -665,9 +701,9 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
   # BALL: 3 DOFs, all get mean(A[0:3])
   # HINGE/SLIDE: 1 DOF, gets A[0,0]
   if m.nv > 0:
-    unit_vec = wp.zeros((d.nworld, m.nv), dtype=float)
-    result_vec = wp.zeros((d.nworld, m.nv), dtype=float)
-    dof_A_diag = wp.zeros((d.nworld, m.nv), dtype=float)
+    unit_vec = workspace.unit_vec
+    result_vec = workspace.result_vec
+    dof_A_diag = workspace.dof_A_diag
 
     # TODO(team): more efficient approach instead of looping over nv?
     for dofid in range(m.nv):
@@ -685,9 +721,9 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
   # body_invweight0: computed as mean diagonal of J * inv(M) * J'
   # where J is the 6xnv body Jacobian (3 rows translation, 3 rows rotation)
   if m.nv > 0:
-    body_jac_row = wp.zeros((d.nworld, m.nv), dtype=float)
-    body_result_vec = wp.zeros((d.nworld, m.nv), dtype=float)
-    body_A_diag = wp.zeros((d.nworld, m.nbody, 6), dtype=float)
+    body_jac_row = workspace.body_jac_row
+    body_result_vec = workspace.body_result_vec
+    body_A_diag = workspace.body_A_diag
 
     # TODO(team): more efficient approach instead of nested iterations?
     for bodyid in range(1, m.nbody):
@@ -729,8 +765,8 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
 
   # tendon_invweight0[t] = J_t * inv(M) * J_t'
   if m.ntendon > 0:
-    ten_J_vec = wp.empty((d.nworld, m.nv), dtype=float)
-    ten_result_vec = wp.empty((d.nworld, m.nv), dtype=float)
+    ten_J_vec = workspace.ten_J_vec
+    ten_result_vec = workspace.ten_result_vec
 
     for tenid in range(m.ntendon):
       ten_J_vec.zero_()
@@ -766,8 +802,8 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
 
   # actuator_acc0[i] = ||inv(M) * actuator_moment[i]|| - acceleration from unit actuator force
   if m.nactuator > 0 and m.nv > 0:
-    act_moment_vec = wp.zeros((d.nworld, m.nv), dtype=float)
-    act_result_vec = wp.zeros((d.nworld, m.nv), dtype=float)
+    act_moment_vec = workspace.act_moment_vec
+    act_result_vec = workspace.act_result_vec
 
     for actid in range(m.nactuator):
       wp.launch(
@@ -793,11 +829,11 @@ def set_const_0(m: types.Model, d: types.Data, restore: bool = True):
     smooth.com_pos(m, d)
     smooth.camlight(m, d)
     smooth.flex(m, d)
-    smooth.tendon(m, d)
+    smooth.tendon(m, d, workspace.wrap_geom_xpos)
     smooth.crb(m, d)
     smooth.tendon_armature(m, d)
     smooth.factor_m(m, d)
-    smooth.transmission(m, d)
+    smooth.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
 
 
 def set_const(m: types.Model, d: types.Data, restore: bool = True):
