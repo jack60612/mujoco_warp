@@ -1190,6 +1190,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_level_offsets = level_offsets
   m.qLD_factor_elem = factor_elem if factor_elem else [(0, 0, 0, 0)]
   m.qLD_factor_elem_offsets = factor_elem_offsets
+  m.qLD_level_offsets_host = tuple(level_offsets)
+  m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
 
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block

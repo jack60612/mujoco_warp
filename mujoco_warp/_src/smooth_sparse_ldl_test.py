@@ -15,6 +15,8 @@
 
 """Sparse LDL factorization paths against the original per-level kernels; backsolve block widths."""
 
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -153,14 +155,17 @@ class SparseLDLTest(parameterized.TestCase):
       ]
       np.testing.assert_array_equal(elems[elem_offsets[level] : elem_offsets[level + 1]], expected)
     self.assertEqual(elem_offsets[-1], len(elems))
+    self.assertEqual(m.qLD_level_offsets_host, tuple(int(x) for x in offsets))
+    self.assertEqual(m.qLD_factor_elem_offsets_host, tuple(int(x) for x in elem_offsets))
 
-  @parameterized.parameters(1, 32, 256, 1024)
-  def test_factor_matches_level_kernels(self, block_dim):
-    """The fused kernel equals the original per-level kernels."""
+  @parameterized.parameters((True, 1), (True, 32), (True, 256), (True, 1024), (False, 1024))
+  def test_factor_matches_level_kernels(self, fused, block_dim):
+    """The fused kernel and the per-level element launches equal the original per-level kernels."""
     mjm, m, d = _fixture()
     m.block_dim.factor_i_sparse_fused = block_dim
     L_region = d.qLD[:, m.qLD_block_total :]
-    smooth._factor_i_sparse(m, d, d.M, L_region, d.qLDiagInv)
+    with mock.patch.object(smooth, "_factor_sparse_fused", return_value=fused):
+      smooth._factor_i_sparse(m, d, d.M, L_region, d.qLDiagInv)
     L_new, D_new = L_region.numpy(), d.qLDiagInv.numpy()
 
     L_ref = wp.empty_like(L_region)
@@ -215,6 +220,62 @@ class SparseLDLTest(parameterized.TestCase):
     np.testing.assert_allclose(L_det[:, sparse], L_ref[:, sparse], rtol=1e-4, atol=1e-5 * np.abs(L_ref).max())
     np.testing.assert_allclose(D_det, D_ref, rtol=1e-4, atol=1e-5 * np.abs(D_ref).max())
     _assert_solves(mjm, d.M.numpy(), x_det, y.numpy())
+
+  def test_deterministic_element_launches(self):
+    """Deterministic element launches (a deterministic smooth module) take the per-level path."""
+    mjm, m, d = _fixture()
+    mjw.factor_m(m, d)
+    L_ref, D_ref = d.qLD.numpy(), d.qLDiagInv.numpy()
+    launched = []
+    launch = wp.launch
+
+    def record(kernel, *args, **kwargs):
+      launched.append(kernel)
+      return launch(kernel, *args, **kwargs)
+
+    with (
+      mock.patch.object(smooth, "_factor_sparse_fused", return_value=False),
+      mock.patch.object(smooth, "_deterministic_launch", side_effect=lambda k: k is smooth._qLD_acc_level),
+      mock.patch.object(wp, "launch", record),
+    ):
+      d.qLD.zero_()
+      mjw.factor_m(m, d)
+    self.assertNotIn(smooth._qLD_acc_level, launched)
+    self.assertIn(smooth._qLD_acc(m.nv, True), launched)
+    sparse = slice(m.qLD_block_total, None)
+    np.testing.assert_allclose(d.qLD.numpy()[:, sparse], L_ref[:, sparse], rtol=1e-4, atol=1e-5 * np.abs(L_ref).max())
+    np.testing.assert_allclose(d.qLDiagInv.numpy(), D_ref, rtol=1e-4, atol=1e-5 * np.abs(D_ref).max())
+
+  def test_factor_path_choice(self):
+    """Fused unless levels are wide and most SMs idle; fused on CPU."""
+    _, m, _ = _fixture(nworld=1)
+    width = m.qLD_factor_elem_offsets_host[-1] / (len(m.qLD_level_offsets_host) - 1)
+    self.assertLess(width, types.M_SPARSE_LEVEL_WIDTH_MIN)
+    self.assertTrue(smooth._factor_sparse_fused(m, 1))
+
+    device = wp.get_device()
+    with mock.patch.object(smooth, "M_SPARSE_LEVEL_WIDTH_MIN", width / 2):
+      if device.is_cuda:
+        self.assertFalse(smooth._factor_sparse_fused(m, 1))
+        self.assertTrue(smooth._factor_sparse_fused(m, device.sm_count // 2))
+      else:
+        self.assertTrue(smooth._factor_sparse_fused(m, 1))
+
+  def test_factor_m_levels_captured(self):
+    """factor_m on the per-level path replays from a CUDA graph like an eager call."""
+    if not wp.get_device().is_cuda:
+      self.skipTest("CUDA graph capture")
+    _, m, d = _fixture()
+    with mock.patch.object(smooth, "_factor_sparse_fused", return_value=False):
+      mjw.factor_m(m, d)
+      L_eager, D_eager = d.qLD.numpy(), d.qLDiagInv.numpy()
+      d.qLD.zero_()
+      d.qLDiagInv.zero_()
+      with wp.ScopedCapture() as capture:
+        mjw.factor_m(m, d)
+    wp.capture_launch(capture.graph)
+    _assert_same_class(d.qLD.numpy(), L_eager, "qLD")
+    _assert_same_class(d.qLDiagInv.numpy(), D_eager, "qLDiagInv")
 
   @parameterized.parameters(32, 512, 1024)
   def test_solve_block_dims(self, block_dim):
