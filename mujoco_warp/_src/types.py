@@ -41,6 +41,13 @@ M_BLOCK_DENSE_MAX = 64
 # max M block size where scalar Cholesky beats dense tile-Cholesky
 M_BLOCK_SCALAR_MAX = 6
 
+# Sparse LDL: min elements per tree level, times the share of the device the fused factorization
+# leaves idle (1 - 2 * nworld / sm_count), for per-level launches instead of the fused kernel. The
+# fused kernel runs each world on one block (one SM); per-level launches spread a level over the
+# device for two launches per level. Break-even is ~4.5k on an RTX 5070 Ti; the margin keeps trees
+# with moderately wide levels on the fused kernel (per-level launches win 4-12x at 65k-187k).
+M_SPARSE_LEVEL_WIDTH_MIN = 32768
+
 # qLD_block_adr sentinels for factorless block layouts
 Q_LD_BLOCK_COMPACT = -2
 Q_LD_BLOCK_SPARSE = -1
@@ -1455,6 +1462,8 @@ class Model:
     qLD_factor_elem: CSR addresses (M(i,j), M(k,j), M(k,i), M(k,k)) of every element update
                      M(i,j) -= M(k,j) * M(k,i) / M(k,k) of the sparse factorization, by level
     qLD_factor_elem_offsets: start offset of each depth level in qLD_factor_elem
+    qLD_level_offsets_host: host copy of qLD_level_offsets, for per-level factorization launches
+    qLD_factor_elem_offsets_host: host copy of qLD_factor_elem_offsets
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -1935,6 +1944,8 @@ class Model:
   qLD_level_offsets: array("nqLD_level_offsets", int)
   qLD_factor_elem: array("nqLD_factor_elem", wp.vec4i)
   qLD_factor_elem_offsets: array("nqLD_level_offsets", int)
+  qLD_level_offsets_host: tuple[int, ...]
+  qLD_factor_elem_offsets_host: tuple[int, ...]
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

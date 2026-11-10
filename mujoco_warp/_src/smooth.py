@@ -19,6 +19,7 @@ import warp as wp
 from mujoco_warp._src import math
 from mujoco_warp._src import support
 from mujoco_warp._src import util_misc
+from mujoco_warp._src.types import M_SPARSE_LEVEL_WIDTH_MIN
 from mujoco_warp._src.types import MJ_MAXVAL
 from mujoco_warp._src.types import MJ_MINVAL
 from mujoco_warp._src.types import Q_LD_BLOCK_COMPACT
@@ -1268,8 +1269,100 @@ def _factor_i_sparse_fused(nv: int, nlevels: int):
   return kernel
 
 
+@wp.kernel
+def _qLD_acc_level(
+  # Model:
+  qLD_factor_elem: wp.array[wp.vec4i],
+  # In:
+  elem_adr: int,
+  # Out:
+  L_out: wp.array2d[float],
+):
+  worldid, elemid = wp.tid()
+  # CSR addresses of M(i,j), M(k,j), M(k,i), M(k,k)
+  elem = qLD_factor_elem[elem_adr + elemid]
+  # tmp = M(k,i) / M(k,k)
+  tmp = L_out[worldid, elem[2]] / L_out[worldid, elem[3]]
+  # M(i,j) -= M(k,j) * tmp
+  wp.atomic_sub(L_out[worldid], elem[0], L_out[worldid, elem[1]] * tmp)
+
+
+@wp.kernel
+def _qLD_multipliers_level(
+  # Model:
+  M_rownnz: wp.array[int],
+  M_rowadr: wp.array[int],
+  qLD_all_updates: wp.array[wp.vec3i],
+  # In:
+  update_adr: int,
+  # Out:
+  L_out: wp.array2d[float],
+):
+  worldid, updateid = wp.tid()
+  update = qLD_all_updates[update_adr + updateid]
+  k, Madr_ki = update[1], update[2]
+  diag_k = M_rowadr[k] + M_rownnz[k] - 1
+  # M(k,i) = M(k,i) / M(k,k)
+  L_out[worldid, Madr_ki] = L_out[worldid, Madr_ki] / L_out[worldid, diag_k]
+
+
+@wp.kernel
+def _qLDiag_div(
+  # Model:
+  M_rownnz: wp.array[int],
+  M_rowadr: wp.array[int],
+  # In:
+  L_in: wp.array2d[float],
+  # Out:
+  D_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  diag_i = M_rowadr[dofid] + M_rownnz[dofid] - 1  # Address of diagonal element of i
+  D_out[worldid, dofid] = 1.0 / L_in[worldid, diag_i]
+
+
+def _factor_sparse_fused(m: Model, nworld: int) -> bool:
+  """Whether the fused kernel or per-level launches factor the sparse region faster.
+
+  The fused kernel runs each world on one block, i.e. one SM, so its time is the world's element
+  count over one SM's throughput while nworld < sm_count. Per-level launches spread every level
+  over the device and pay two launches per level. They win for wide levels (deep, branched trees
+  with thousands of dofs) while most SMs would otherwise idle; see M_SPARSE_LEVEL_WIDTH_MIN.
+  """
+  device = wp.get_device()
+  nlevels = len(m.qLD_level_offsets_host) - 1
+  if not device.is_cuda or nlevels == 0:
+    return True
+  width = m.qLD_factor_elem_offsets_host[-1] / nlevels
+  idle = 1.0 - 2.0 * nworld / device.sm_count
+  return width * idle < M_SPARSE_LEVEL_WIDTH_MIN
+
+
 def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
-  """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd."""
+  """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd.
+
+  Fused kernel or one launch per level for the element updates and one for the multipliers; both
+  apply the same element updates M(i,j) -= M(k,j) * M(k,i) / M(k,k), level by level.
+  """
+  if not _factor_sparse_fused(m, d.nworld):
+    wp.copy(L, M)
+    levels, elems = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host
+    for level in reversed(range(len(levels) - 1)):
+      wp.launch(
+        _qLD_acc_level,
+        dim=(d.nworld, elems[level + 1] - elems[level]),
+        inputs=[m.qLD_factor_elem, elems[level]],
+        outputs=[L],
+      )
+      wp.launch(
+        _qLD_multipliers_level,
+        dim=(d.nworld, levels[level + 1] - levels[level]),
+        inputs=[m.M_rownnz, m.M_rowadr, m.qLD_all_updates, levels[level]],
+        outputs=[L],
+      )
+    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
+    return
+
   if wp.get_device().is_cuda:
     dim_block = m.block_dim.factor_i_sparse_fused
   else:
