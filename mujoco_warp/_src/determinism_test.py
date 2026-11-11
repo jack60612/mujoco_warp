@@ -296,8 +296,16 @@ _TREE_CASES = (
       "solver._add_actuator_metric_dense",
       "solver._add_tendon_metric_dense",
     ),
+    # the tendons and actuators couple dofs outside M's pattern: the coupled metric is assembled
+    # per element and factored and solved with the sparse tree launches
+    owned=("derivative._eff_qH_assemble", "smooth._qLD_acc_level_owned", "smooth._solve_LD_sparse_fused_owned"),
   ),
-  dict(testcase_name="discrete_cg", overrides={"opt.integrator": "DISCRETE", "opt.solver": "CG"}, covers=()),
+  dict(
+    testcase_name="discrete_cg",
+    overrides={"opt.integrator": "DISCRETE", "opt.solver": "CG"},
+    covers=(),
+    owned=("derivative._eff_qH_assemble", "smooth._qLD_acc_level_owned", "smooth._solve_LD_sparse_fused_owned"),
+  ),
   dict(
     testcase_name="dense_blocks",
     overrides={"opt.jacobian": "DENSE"},

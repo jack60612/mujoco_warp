@@ -77,18 +77,66 @@ def _create_array(data: Any, spec, sizes: dict[str, int], batch_size: int = 1) -
   return array
 
 
-def _target_segments(indices, entries, field: int) -> tuple[list[list[int]], list[list[int]]]:
-  """Groups `indices` by `entries[index][field]` in index order, ordered by that target.
+def _group_by_target(passes: Sequence[tuple[np.ndarray, int, Sequence[int]]]) -> tuple[np.ndarray, np.ndarray, list, list]:
+  """Groups the entries of each level by the address they update, in entry order.
 
-  Returns the segments of at most M_SPARSE_SEGMENT_SERIAL_MAX indices, then the longer ones.
+  A pass is (entries, field, level offsets): the entries of level l are
+  entries[offsets[l]:offsets[l + 1]] and entry[field] is the address it updates. A level has one
+  segment per updated address, in ascending address order; the segments of at most
+  M_SPARSE_SEGMENT_SERIAL_MAX entries come first, then the longer ones. The levels of the passes
+  follow each other.
+
+  Returns the entry indices in segment order, the start of each segment in them (then their
+  number), the first segment of each level (then the number of segments) and the first longer
+  segment of each level.
   """
-  segments = {}
-  for index in indices:
-    segments.setdefault(int(entries[index][field]), []).append(index)
-  ordered = [segments[target] for target in sorted(segments)]
-  serial = [segment for segment in ordered if len(segment) <= types.M_SPARSE_SEGMENT_SERIAL_MAX]
-  warp = [segment for segment in ordered if len(segment) > types.M_SPARSE_SEGMENT_SERIAL_MAX]
-  return serial, warp
+  index, start, level_first, level_long = [], [], [0], []
+  nindex = nsegment = 0
+  for entries, field, offsets in passes:
+    for level in range(len(offsets) - 1):
+      lo, hi = offsets[level], offsets[level + 1]
+      order = np.argsort(entries[lo:hi, field], kind="stable")
+      target = entries[lo:hi, field][order]
+      first = np.flatnonzero(np.concatenate(([True], target[1:] != target[:-1]))) if hi > lo else np.zeros(0, dtype=int)
+      size = np.diff(np.append(first, hi - lo))
+      serial = size <= types.M_SPARSE_SEGMENT_SERIAL_MAX
+      segment = np.concatenate((np.flatnonzero(serial), np.flatnonzero(~serial)))
+      first, size = first[segment], size[segment]
+      segment_start = np.cumsum(size) - size
+      member = np.arange(size.sum()) - np.repeat(segment_start, size) + np.repeat(first, size)
+      index.append(lo + order[member])
+      start.append(nindex + segment_start)
+      level_long.append(nsegment + int(serial.sum()))
+      nindex += int(size.sum())
+      nsegment += len(segment)
+      level_first.append(nsegment)
+  start.append(np.array([nindex]))
+  return np.concatenate((np.zeros(0, dtype=int), *index)), np.concatenate(start), level_first, level_long
+
+
+def _ldl_targets(factor_elem, factor_elem_offsets, all_updates, level_offsets) -> dict:
+  """The sparse L'*D*L schedule grouped by what each factorization element and update writes.
+
+  Deterministic launches sum a group in one thread (or warp) without atomics: the factorization
+  elements by the address M(i,j) they update, the backsubstitution's updates by the dof they
+  update, x(i) in the up pass of every level, then x(k) in the down pass.
+  """
+  factor_elem = np.asarray(factor_elem, dtype=int).reshape(-1, 4)
+  all_updates = np.asarray(all_updates, dtype=int).reshape(-1, 3)
+  elem, adr, offsets, long = _group_by_target([(factor_elem, 0, factor_elem_offsets)])
+  update, solve_adr, solve_offsets, solve_long = _group_by_target(
+    [(all_updates, 0, level_offsets), (all_updates, 1, level_offsets)]
+  )
+  return {
+    "factor_target_elem": elem if len(elem) else [0],
+    "factor_target_adr": adr,
+    "factor_target_offsets_host": tuple(offsets),
+    "factor_target_long_host": tuple(long),
+    "solve_target_update": update if len(update) else [0],
+    "solve_target_adr": solve_adr,
+    "solve_target_offsets": solve_offsets,
+    "solve_target_long": solve_long if solve_long else [0],
+  }
 
 
 def _create_constraint(
@@ -271,6 +319,281 @@ def _get_efm_data(mjm: mujoco.MjModel) -> mujoco.MjData | None:
   d = mujoco.MjData(mjm_tmp)
   mujoco.mj_fwdPosition(mjm_tmp, d)
   return d
+
+
+def _dof_chain(mjm: mujoco.MjModel, bodyid: int) -> list[int]:
+  """Dofs that move a body: its own and every ancestor's."""
+  while bodyid > 0 and mjm.body_dofnum[bodyid] == 0:
+    bodyid = mjm.body_parentid[bodyid]
+  if mjm.body_dofnum[bodyid] == 0:
+    return []
+  chain, dofid = [], mjm.body_dofadr[bodyid] + mjm.body_dofnum[bodyid] - 1
+  while dofid >= 0:
+    chain.append(int(dofid))
+    dofid = mjm.dof_parentid[dofid]
+  return chain
+
+
+# Bias and gain types with metric terms in the discrete integrator. Enums are compared by value:
+# `in` with a numpy scalar against a tuple of enums never matches.
+_EFM_METRIC_BIAS = frozenset(
+  int(e)
+  for e in (
+    mujoco.mjtBias.mjBIAS_AFFINE,
+    mujoco.mjtBias.mjBIAS_SO3,
+    mujoco.mjtBias.mjBIAS_DCMOTOR,
+    mujoco.mjtBias.mjBIAS_MUSCLE,
+  )
+)
+_EFM_METRIC_GAIN = frozenset(
+  int(e)
+  for e in (
+    mujoco.mjtGain.mjGAIN_AFFINE,
+    mujoco.mjtGain.mjGAIN_SO3,
+    mujoco.mjtGain.mjGAIN_MUSCLE,
+    mujoco.mjtGain.mjGAIN_DCMOTOR,
+  )
+)
+
+
+def _efm_actuator_dofs(mjm: mujoco.MjModel, a: int) -> Optional[list[int]]:
+  """Dofs an actuator's moment can touch, None if they depend on the state (body transmission)."""
+  trntype, (id0, id1) = int(mjm.actuator_trntype[a]), mjm.actuator_trnid[a]
+  if trntype in (int(mujoco.mjtTrn.mjTRN_JOINT), int(mujoco.mjtTrn.mjTRN_JOINTINPARENT)):
+    jnt_dofnum = {int(mujoco.mjtJoint.mjJNT_FREE): 6, int(mujoco.mjtJoint.mjJNT_BALL): 3}.get(int(mjm.jnt_type[id0]), 1)
+    return list(range(mjm.jnt_dofadr[id0], mjm.jnt_dofadr[id0] + jnt_dofnum))
+  if trntype == int(mujoco.mjtTrn.mjTRN_TENDON):
+    return list(mjm.ten_J_colind[mjm.ten_J_rowadr[id0] : mjm.ten_J_rowadr[id0] + mjm.ten_J_rownnz[id0]])
+  if trntype in (int(mujoco.mjtTrn.mjTRN_SITE), int(mujoco.mjtTrn.mjTRN_SLIDERCRANK)):
+    dofs = _dof_chain(mjm, mjm.site_bodyid[id0])
+    if id1 >= 0:
+      dofs += _dof_chain(mjm, mjm.site_bodyid[id1])
+    return dofs
+  return None
+
+
+def _efm_couplings(mjm: mujoco.MjModel) -> Optional[tuple[list[int], list[tuple[int, list[int]]]]]:
+  """The tendons and actuators that couple the discrete metric's dofs beyond M's pattern.
+
+  The metric M + h*D + h^2*K couples every pair of dofs in a damped or stiff tendon's Jacobian and
+  in a metric actuator's moment. Returns the ids of those tendons and, per metric actuator, its id
+  and the dofs its moment can touch; or None when the couplings are not known statically: flexes
+  contribute metric terms, or an actuator's moment depends on the state (body transmission).
+  """
+  if mjm.nflex:
+    return None
+
+  tendons = []
+  for t in range(mjm.ntendon):
+    has_metric = (
+      mjm.tendon_stiffness[t] != 0
+      or np.any(mjm.tendon_stiffnesspoly[t] != 0)
+      or mjm.tendon_damping[t] != 0
+      or np.any(mjm.tendon_dampingpoly[t] != 0)
+    )
+    if not has_metric:
+      has_metric = any(
+        mjm.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_TENDON
+        and mjm.actuator_trnid[a, 0] == t
+        and (mjm.actuator_damping[a] != 0 or np.any(mjm.actuator_dampingpoly[a] != 0))
+        for a in range(mjm.nu)
+      )
+    if has_metric:
+      tendons.append(t)
+  actuators = []
+  for a in range(mjm.nu):
+    if int(mjm.actuator_biastype[a]) in _EFM_METRIC_BIAS or int(mjm.actuator_gaintype[a]) in _EFM_METRIC_GAIN:
+      dofs = _efm_actuator_dofs(mjm, a)
+      if dofs is None:
+        return None
+      actuators.append((a, dofs))
+  return tendons, actuators
+
+
+def _efm_tendon_dofs(mjm: mujoco.MjModel, t: int) -> np.ndarray:
+  """Dofs in a tendon's static Jacobian row."""
+  return mjm.ten_J_colind[mjm.ten_J_rowadr[t] : mjm.ten_J_rowadr[t] + mjm.ten_J_rownnz[t]]
+
+
+def _efm_coupling_groups(mjm: mujoco.MjModel) -> Optional[list[np.ndarray]]:
+  """Dof sets (two or more dofs each) that the discrete metric couples beyond M's pattern.
+
+  None when the couplings are not known statically (see _efm_couplings).
+  """
+  couplings = _efm_couplings(mjm)
+  if couplings is None:
+    return None
+  tendons, actuators = couplings
+  groups = [np.unique(_efm_tendon_dofs(mjm, t)) for t in tendons] + [np.unique(dofs) for _, dofs in actuators]
+  return [g for g in groups if g.size > 1]
+
+
+def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
+  """Elimination tree of the discrete integrator's metric with its tendon and actuator couplings.
+
+  The metric couples the dofs of each set in _efm_coupling_groups. Under MuJoCo's reverse
+  elimination (the last dof first), dof i's factor row holds the dofs j < i it shares a coupling
+  with, plus the fill of the dofs eliminated before it; parent[i] is the largest of them. A factor
+  whose rows hold every ancestor in this tree has the prefix layout of M's own factor, so the tree
+  factorization and back-substitution apply unchanged.
+
+  Returns None (the backbone path) when the integrator is not discrete, flexes contribute metric
+  terms, an actuator's moment depends on the state (body transmission), or no tendon or actuator
+  couples two dofs.
+  """
+  if mjm.opt.integrator != mujoco.mjtIntegrator.mjINT_DISCRETE:
+    return None
+  groups = _efm_coupling_groups(mjm)
+  if not groups:
+    return None
+
+  # lower[i]: dofs j < i coupled to i, by M's pattern or a shared tendon/actuator row
+  lower = [set() for _ in range(mjm.nv)]
+  for i in range(mjm.nv):
+    lower[i].update(int(j) for j in mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i] - 1])
+  for cols in groups:
+    for n in range(1, cols.size):
+      lower[cols[n]].update(int(j) for j in cols[:n])
+
+  # eliminating i connects its lower dofs, i.e. they join the lower set of its parent
+  parent = np.full(mjm.nv, -1, dtype=int)
+  for i in reversed(range(mjm.nv)):
+    if lower[i]:
+      parent[i] = max(lower[i])
+      lower[parent[i]].update(lower[i] - {parent[i]})
+  return parent
+
+
+def _efm_qH_depth(parent: np.ndarray) -> np.ndarray:
+  """Depth of every dof in the elimination tree `parent` (roots 0)."""
+  depth = np.zeros(len(parent), dtype=int)
+  for i in range(len(parent)):
+    depth[i] = depth[parent[i]] + 1 if parent[i] >= 0 else 0
+  return depth
+
+
+def efm_qH_layout(mjm: mujoco.MjModel, parent: Optional[np.ndarray]) -> dict:
+  """Row layout, sparse L'*D*L schedule and assembly lists of the coupled metric factor.
+
+  Row i holds every ancestor of i in the elimination tree `parent`, then i: the prefix layout of
+  M's factor, so the update lists follow put_model's qLD_* construction. `madr` gives the address
+  of M's sparsity (and of qH, which shares it) that holds each element's backbone value, -1 for
+  the elements outside it. For every element (i, j), j < i, the pair lists hold the tendons
+  (their ten_J addresses of i and j) and the actuators (i and j) whose pair product enters it, in
+  tendon then actuator order: an owned assembly sums them in that order, with no atomics.
+  """
+  couplings = _efm_couplings(mjm) if parent is not None else ([], [])
+  nv = mjm.nv
+  if parent is None:
+    rownnz, rowadr = np.zeros(nv, dtype=int), np.zeros(nv, dtype=int)
+    colind, madr = np.zeros(0, dtype=int), np.zeros(0, dtype=int)
+    updates = {}
+  else:
+    depth = _efm_qH_depth(parent)
+    rownnz = depth + 1
+    rowadr = np.concatenate(([0], np.cumsum(rownnz)[:-1]))
+    colind = np.zeros(rownnz.sum(), dtype=int)
+    for i in range(nv):
+      j, adr = i, rowadr[i] + rownnz[i] - 1
+      while j >= 0:
+        colind[adr] = j
+        j, adr = parent[j], adr - 1
+
+    madr = np.full(len(colind), -1, dtype=int)
+    for i in range(nv):
+      row = colind[rowadr[i] : rowadr[i] + rownnz[i]]
+      cols = mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]]
+      pos = np.searchsorted(row, cols)
+      assert np.array_equal(row[pos], cols), "M's sparsity must lie in the coupled metric's"
+      madr[rowadr[i] + pos] = mjm.M_rowadr[i] + np.arange(mjm.M_rownnz[i])
+
+    # update (i, k, address of (k, i)) for every ancestor i of k, grouped by the depth of i
+    updates = {}
+    for k in range(nv):
+      i, Madr_ki = parent[k], rowadr[k] + rownnz[k] - 2
+      while i >= 0:
+        updates.setdefault(depth[i], []).append((i, k, Madr_ki))
+        i, Madr_ki = parent[i], Madr_ki - 1
+
+  all_updates, level_offsets, factor_elem, factor_elem_offsets = [], [0], [], [0]
+  for level in sorted(updates):
+    u = np.array(updates[level], dtype=int)
+    i, k, Madr_ki = u[:, 0], u[:, 1], u[:, 2]
+    n = rownnz[i]
+    j = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)
+    factor_elem.append(
+      np.stack(
+        (
+          np.repeat(rowadr[i], n) + j,
+          np.repeat(rowadr[k], n) + j,
+          np.repeat(Madr_ki, n),
+          np.repeat(rowadr[k] + rownnz[k] - 1, n),
+        ),
+        axis=1,
+      )
+    )
+    all_updates.append(u)
+    level_offsets.append(level_offsets[-1] + len(u))
+    factor_elem_offsets.append(factor_elem_offsets[-1] + n.sum())
+  all_updates = np.concatenate(all_updates) if all_updates else np.zeros((1, 3), dtype=int)
+  factor_elem = np.concatenate(factor_elem) if factor_elem else np.zeros((1, 4), dtype=int)
+
+  def element(rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
+    """Addresses of the elements (rows[n], cols[n]) of the factor's layout."""
+    adr = np.empty(len(rows), dtype=int)
+    for i in np.unique(rows):
+      row = colind[rowadr[i] : rowadr[i] + rownnz[i]]
+      sel = rows == i
+      pos = np.searchsorted(row, cols[sel])
+      assert np.array_equal(row[pos], cols[sel]), "a coupling's pairs must lie in the coupled metric's"
+      adr[sel] = rowadr[i] + pos
+    return adr
+
+  def pairs(sources: list[tuple[int, np.ndarray, np.ndarray]]):
+    """CSR lists, by element, of the (source id, first, second) triples of the pair products.
+
+    A source is (id, dofs, labels): a pair is a dof i and a dof j < i of the source, and its triple
+    holds the source id and the labels of i and j.
+    """
+    elem, triple = [np.zeros(0, dtype=int)], [np.zeros((0, 3), dtype=int)]
+    for source, dofs, labels in sources:
+      a, b = np.nonzero(dofs[None, :] < dofs[:, None])  # dofs[b] < dofs[a], in (a, b) order
+      elem.append(element(dofs[a], dofs[b]))
+      triple.append(np.stack((np.full(len(a), source), labels[a], labels[b]), axis=1))
+    elem, triple = np.concatenate(elem), np.concatenate(triple)
+    adr = np.concatenate(([0], np.cumsum(np.bincount(elem, minlength=len(colind)))))
+    return adr, triple[np.argsort(elem, kind="stable")] if len(elem) else np.zeros((1, 3), dtype=int)
+
+  tendons, actuators = couplings
+  # a tendon's pairs carry the ten_J addresses of its dofs; an actuator's, the dofs themselves
+  ten_adr, ten_pair = pairs(
+    [(t, _efm_tendon_dofs(mjm, t), mjm.ten_J_rowadr[t] + np.arange(mjm.ten_J_rownnz[t])) for t in tendons]
+  )
+  actuator_dofs = [(a, np.unique(np.asarray(dofs, dtype=int))) for a, dofs in actuators]
+  act_adr, act_pair = pairs([(a, dofs, dofs) for a, dofs in actuator_dofs])
+
+  return {
+    "rownnz": rownnz,
+    "rowadr": rowadr,
+    "colind": colind,
+    "madr": madr,
+    "ten_adr": ten_adr,
+    "ten_pair": ten_pair,
+    "act_adr": act_adr,
+    "act_pair": act_pair,
+    "all_updates": all_updates,
+    "level_offsets": level_offsets,
+    "factor_elem": factor_elem,
+    "factor_elem_offsets": factor_elem_offsets,
+  }
+
+
+def efm_qH_nnz(mjm: mujoco.MjModel) -> int:
+  """Element count of the coupled metric factor, 0 without one (see efm_qH_parent)."""
+  parent = efm_qH_parent(mjm)
+  if parent is None:
+    return 0
+  return int((_efm_qH_depth(parent) + 1).sum())
 
 
 def is_sparse(mjm: mujoco.MjModel) -> bool:
@@ -1222,38 +1545,50 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
 
   # The same elements grouped by the CSR address they update, one segment per M(i,j) and level, in
-  # element order: deterministic factorizations add a segment without atomics, in one thread or,
-  # past M_SPARSE_SEGMENT_SERIAL_MAX elements, one warp. A level lists its serial segments first.
-  target_elem, target_adr, target_offsets, target_long = [], [], [0], []
-  for level in range(len(factor_elem_offsets) - 1):
-    serial, warp = _target_segments(range(factor_elem_offsets[level], factor_elem_offsets[level + 1]), factor_elem, 0)
-    target_long.append(len(target_adr) + len(serial))
-    for segment in serial + warp:
-      target_adr.append(len(target_elem))
-      target_elem.extend(segment)
-    target_offsets.append(len(target_adr))
-  target_adr.append(len(target_elem))
-  m.qLD_factor_target_elem = target_elem if target_elem else [0]
-  m.qLD_factor_target_adr = target_adr
-  m.qLD_factor_target_offsets_host = tuple(target_offsets)
-  m.qLD_factor_target_long_host = tuple(target_long)
+  # element order, and the updates of each level grouped by the dof they update, in update order:
+  # x(i) in the backsubstitution's up pass, x(k) in its down pass. Deterministic launches add a
+  # segment without atomics, in one thread or, past M_SPARSE_SEGMENT_SERIAL_MAX elements, one warp.
+  # A level lists its serial segments first.
+  targets = _ldl_targets(factor_elem, factor_elem_offsets, all_updates_flat, level_offsets)
+  m.qLD_factor_target_elem = targets["factor_target_elem"]
+  m.qLD_factor_target_adr = targets["factor_target_adr"]
+  m.qLD_factor_target_offsets_host = targets["factor_target_offsets_host"]
+  m.qLD_factor_target_long_host = targets["factor_target_long_host"]
+  m.qLD_solve_target_update = targets["solve_target_update"]
+  m.qLD_solve_target_adr = targets["solve_target_adr"]
+  m.qLD_solve_target_offsets = targets["solve_target_offsets"]
+  m.qLD_solve_target_long = targets["solve_target_long"]
 
-  # The updates of each level grouped by the dof they update, in update order: x(i) in the
-  # backsubstitution's up pass, x(k) in its down pass, segments as for the factorization.
-  solve_update, solve_adr, solve_offsets, solve_long = [], [], [0], []
-  for target in (0, 1):
-    for level in range(len(level_offsets) - 1):
-      serial, warp = _target_segments(range(level_offsets[level], level_offsets[level + 1]), all_updates_flat, target)
-      solve_long.append(len(solve_adr) + len(serial))
-      for segment in serial + warp:
-        solve_adr.append(len(solve_update))
-        solve_update.extend(segment)
-      solve_offsets.append(len(solve_adr))
-  solve_adr.append(len(solve_update))
-  m.qLD_solve_target_update = solve_update if solve_update else [0]
-  m.qLD_solve_target_adr = solve_adr
-  m.qLD_solve_target_offsets = solve_offsets
-  m.qLD_solve_target_long = solve_long if solve_long else [0]
+  # Discrete integrator: layout of the metric factored with its tendon and actuator couplings
+  efm_parent = efm_qH_parent(mjm)
+  efm_lay = efm_qH_layout(mjm, efm_parent)
+  efm_targets = _ldl_targets(
+    efm_lay["factor_elem"], efm_lay["factor_elem_offsets"], efm_lay["all_updates"], efm_lay["level_offsets"]
+  )
+  m.efm_qH_coupled = efm_parent is not None
+  m.efm_qH_rownnz = efm_lay["rownnz"]
+  m.efm_qH_rowadr = efm_lay["rowadr"]
+  m.efm_qH_colind = efm_lay["colind"]
+  m.efm_qH_madr = efm_lay["madr"]
+  m.efm_qH_ten_adr = efm_lay["ten_adr"]
+  m.efm_qH_ten_pair = efm_lay["ten_pair"]
+  m.efm_qH_act_adr = efm_lay["act_adr"]
+  m.efm_qH_act_pair = efm_lay["act_pair"]
+  m.efm_qH_all_updates = efm_lay["all_updates"]
+  m.efm_qH_level_offsets = efm_lay["level_offsets"]
+  m.efm_qH_factor_elem = efm_lay["factor_elem"]
+  m.efm_qH_factor_elem_offsets = efm_lay["factor_elem_offsets"]
+  m.efm_qH_level_offsets_host = tuple(int(x) for x in efm_lay["level_offsets"])
+  m.efm_qH_factor_elem_offsets_host = tuple(int(x) for x in efm_lay["factor_elem_offsets"])
+  m.efm_qH_factor_target_elem = efm_targets["factor_target_elem"]
+  m.efm_qH_factor_target_adr = efm_targets["factor_target_adr"]
+  m.efm_qH_factor_target_offsets_host = efm_targets["factor_target_offsets_host"]
+  m.efm_qH_factor_target_long_host = efm_targets["factor_target_long_host"]
+  m.efm_qH_solve_target_update = efm_targets["solve_target_update"]
+  m.efm_qH_solve_target_adr = efm_targets["solve_target_adr"]
+  m.efm_qH_solve_target_offsets = efm_targets["solve_target_offsets"]
+  m.efm_qH_solve_target_long = efm_targets["solve_target_long"]
+  m.efm_qH_block_adr = np.full(mjm.nv, types.Q_LD_BLOCK_SPARSE, dtype=int)
 
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
@@ -1508,6 +1843,18 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nten_J_pair": len(m.ten_J_pair),
       "nten_J_pair_adr": len(m.ten_J_pair_adr),
       "nten_J_pair_madr": len(m.ten_J_pair_madr),
+      "nefm_qH": len(m.efm_qH_colind),
+      "nefm_qH_plus_1": len(m.efm_qH_ten_adr),
+      "nefm_qH_ten_pair": len(m.efm_qH_ten_pair),
+      "nefm_qH_act_pair": len(m.efm_qH_act_pair),
+      "nefm_qH_all_updates": len(m.efm_qH_all_updates),
+      "nefm_qH_level_offsets": len(m.efm_qH_level_offsets),
+      "nefm_qH_factor_elem": len(m.efm_qH_factor_elem),
+      "nefm_qH_factor_target_adr": len(m.efm_qH_factor_target_adr),
+      "nefm_qH_solve_target_update": len(m.efm_qH_solve_target_update),
+      "nefm_qH_solve_target_adr": len(m.efm_qH_solve_target_adr),
+      "nefm_qH_solve_target_offsets": len(m.efm_qH_solve_target_offsets),
+      "nefm_qH_solve_target_long": len(m.efm_qH_solve_target_long),
       "nM_fullm": len(m.M_fullm_i),
       "nqD_fullm": len(m.qD_fullm_i),
       "nv_plus_1": len(m.M_mulm_rowadr),
@@ -2088,6 +2435,7 @@ def make_data(
   _lay = m_block_layout(mjm)
   qld_total = _lay["total"] + (mjm.nC if _lay["has_sparse"] else 0)
   sizes["qld_total"] = qld_total
+  sizes["nefm_qH"] = efm_qH_nnz(mjm)
 
   if njmax_nnz is None:
     if is_sparse(mjm):
@@ -2318,6 +2666,7 @@ def put_data(
   lay = m_block_layout(mjm)
   qld_total = lay["total"] + (mjm.nC if lay["has_sparse"] else 0)
   sizes["qld_total"] = qld_total
+  sizes["nefm_qH"] = efm_qH_nnz(mjm)
 
   if njmax_nnz is None:
     if is_sparse(mjm):

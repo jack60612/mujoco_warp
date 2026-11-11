@@ -1696,8 +1696,8 @@ class Model:
     qLD_factor_target_long_host: first segment of each level with more than
                                  M_SPARSE_SEGMENT_SERIAL_MAX indices (host)
     qLD_solve_target_update: qLD_all_updates indices grouped by the dof they update in the
-                             sparse backsubstitution, per level, in update order: x(i) in the
-                             up pass, then x(k) in the down pass; segments ordered as
+                             sparse backsubstitution, per level, in update order (x(i) in the
+                             up pass, then x(k) in the down pass); segments ordered as
                              qLD_factor_target_elem's
     qLD_solve_target_adr: start of each segment in qLD_solve_target_update, then the number of
                           indices
@@ -1705,6 +1705,36 @@ class Model:
                               then the number of segments
     qLD_solve_target_long: first segment of each up-pass, then down-pass level with more than
                            M_SPARSE_SEGMENT_SERIAL_MAX indices
+    efm_qH_coupled: discrete integrator factors the metric with its tendon and actuator
+                    couplings (efm_qH_* layout) instead of the qH backbone
+    efm_qH_rownnz: coupled metric factor row lengths (every elimination-tree ancestor) (nv,)
+    efm_qH_rowadr: coupled metric factor row addresses                         (nv,)
+    efm_qH_colind: coupled metric factor column indices                        (nefm_qH,)
+    efm_qH_madr: qH address (M's sparsity) of each coupled metric element, -1 outside it (nefm_qH,)
+    efm_qH_ten_adr: start of each coupled metric element's segment in efm_qH_ten_pair, then
+                    the number of pairs                                        (nefm_qH + 1,)
+    efm_qH_ten_pair: (tendon, ten_J address of entry i, of entry j) of every tendon pair product
+                     J(t,i) * J(t,j) for dofs j < i, grouped by the coupled metric element
+                     (i, j) in tendon order
+    efm_qH_act_adr: start of each coupled metric element's segment in efm_qH_act_pair, then
+                    the number of pairs                                        (nefm_qH + 1,)
+    efm_qH_act_pair: (actuator, dof i, dof j) of every actuator whose moment can hold both dofs
+                     j < i, grouped by the coupled metric element (i, j) in actuator order
+    efm_qH_all_updates: qLD_all_updates of the coupled metric factor
+    efm_qH_level_offsets: qLD_level_offsets of the coupled metric factor
+    efm_qH_factor_elem: qLD_factor_elem of the coupled metric factor
+    efm_qH_factor_elem_offsets: qLD_factor_elem_offsets of the coupled metric factor
+    efm_qH_level_offsets_host: host copy of efm_qH_level_offsets
+    efm_qH_factor_elem_offsets_host: host copy of efm_qH_factor_elem_offsets
+    efm_qH_factor_target_elem: qLD_factor_target_elem of the coupled metric factor
+    efm_qH_factor_target_adr: qLD_factor_target_adr of the coupled metric factor
+    efm_qH_factor_target_offsets_host: qLD_factor_target_offsets_host of the coupled metric factor
+    efm_qH_factor_target_long_host: qLD_factor_target_long_host of the coupled metric factor
+    efm_qH_solve_target_update: qLD_solve_target_update of the coupled metric factor
+    efm_qH_solve_target_adr: qLD_solve_target_adr of the coupled metric factor
+    efm_qH_solve_target_offsets: qLD_solve_target_offsets of the coupled metric factor
+    efm_qH_solve_target_long: qLD_solve_target_long of the coupled metric factor
+    efm_qH_block_adr: Q_LD_BLOCK_SPARSE for every dof (back-substitution guard)  (nv,)
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2248,6 +2278,30 @@ class Model:
   qLD_solve_target_adr: array("nqLD_solve_target_adr", int)
   qLD_solve_target_offsets: array("nqLD_solve_target_offsets", int)
   qLD_solve_target_long: array("nqLD_solve_target_long", int)
+  efm_qH_coupled: bool
+  efm_qH_rownnz: array("nv", int)
+  efm_qH_rowadr: array("nv", int)
+  efm_qH_colind: array("nefm_qH", int)
+  efm_qH_madr: array("nefm_qH", int)
+  efm_qH_ten_adr: array("nefm_qH_plus_1", int)
+  efm_qH_ten_pair: array("nefm_qH_ten_pair", wp.vec3i)
+  efm_qH_act_adr: array("nefm_qH_plus_1", int)
+  efm_qH_act_pair: array("nefm_qH_act_pair", wp.vec3i)
+  efm_qH_all_updates: array("nefm_qH_all_updates", wp.vec3i)
+  efm_qH_level_offsets: array("nefm_qH_level_offsets", int)
+  efm_qH_factor_elem: array("nefm_qH_factor_elem", wp.vec4i)
+  efm_qH_factor_elem_offsets: array("nefm_qH_level_offsets", int)
+  efm_qH_level_offsets_host: tuple[int, ...]
+  efm_qH_factor_elem_offsets_host: tuple[int, ...]
+  efm_qH_factor_target_elem: array("nefm_qH_factor_elem", int)
+  efm_qH_factor_target_adr: array("nefm_qH_factor_target_adr", int)
+  efm_qH_factor_target_offsets_host: tuple[int, ...]
+  efm_qH_factor_target_long_host: tuple[int, ...]
+  efm_qH_solve_target_update: array("nefm_qH_solve_target_update", int)
+  efm_qH_solve_target_adr: array("nefm_qH_solve_target_adr", int)
+  efm_qH_solve_target_offsets: array("nefm_qH_solve_target_offsets", int)
+  efm_qH_solve_target_long: array("nefm_qH_solve_target_long", int)
+  efm_qH_block_adr: array("nv", int)
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)
@@ -2508,6 +2562,8 @@ class Data:
     efm_K_val: effective flex stiffness CSR values              (nworld, nefmK)
     efm_L: factored 3x3 diagonal blocks of M+K                  (nworld, nefmL)
     qHLD: factor of modified mass matrix qH                     (nworld, qld_total)
+    efm_qH: metric with tendon/actuator couplings (efm_qH_*)    (nworld, nefm_qH)
+    efm_qHLD: factor of efm_qH (diagonal in qHDiagInv)          (nworld, nefm_qH)
     efm_ts: tendon metric scale h^2*k + h*b                     (nworld, ntendon)
     efm_as: actuator metric scale h^2*gp + h*gv                 (nworld, nactuator)
     contact: contact data
@@ -2667,6 +2723,8 @@ class Data:
   efm_K_val: array("nworld", "nefmK", float)
   efm_L: array("nworld", "nefmL", float)
   qHLD: array("nworld", "qld_total", float)
+  efm_qH: array("nworld", "nefm_qH", float)
+  efm_qHLD: array("nworld", "nefm_qH", float)
   efm_ts: array("nworld", "ntendon", float)
   efm_as: array("nworld", "nactuator", float)
   contact: Contact

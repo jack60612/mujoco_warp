@@ -3595,7 +3595,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       if m.nefmK > 0 or m.efm0_active or (m.opt.enableflags & types.EnableBit.SLEEP):
         derivative.eff_prec(m, d, ctx.Mgrad, ctx.grad)
       else:
-        smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, ctx.Mgrad, ctx.grad, done=ctx.done)
+        derivative.eff_solve_qH(m, d, ctx.Mgrad, ctx.grad, done=ctx.done)
     else:
       smooth.solve_m(m, d, ctx.Mgrad, ctx.grad, done=ctx.done, tree_active=ctx.tree_active, sparse_active=ctx.sparse_active)
   elif m.opt.solver == types.SolverType.NEWTON:

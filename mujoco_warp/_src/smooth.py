@@ -14,7 +14,7 @@
 # ==============================================================================
 
 
-from typing import Optional
+from typing import NamedTuple, Optional
 
 import warp as wp
 
@@ -1484,7 +1484,7 @@ def _qLD_multipliers_level(
   L_out[worldid, Madr_ki] = L_out[worldid, Madr_ki] / L_out[worldid, diag_k]
 
 
-def _factor_sparse_fused(m: Model, nworld: int) -> bool:
+def _factor_sparse_fused(m: Model, nworld: int, coupled: bool = False) -> bool:
   """Whether the fused kernel or per-level launches factor the sparse region faster.
 
   The fused kernel runs each world on one block, i.e. one SM, so its time is the world's element
@@ -1493,12 +1493,82 @@ def _factor_sparse_fused(m: Model, nworld: int) -> bool:
   with thousands of dofs) while most SMs would otherwise idle; see M_SPARSE_LEVEL_WIDTH_MIN.
   """
   device = wp.get_device()
-  nlevels = len(m.qLD_level_offsets_host) - 1
+  layout = _sparse_layout(m, coupled)
+  nlevels = layout.nlevels
   if not device.is_cuda or nlevels == 0:
     return True
-  width = m.qLD_factor_elem_offsets_host[-1] / nlevels
+  width = layout.elems_host[-1] / nlevels
   idle = 1.0 - 2.0 * nworld / device.sm_count
   return width * idle < M_SPARSE_LEVEL_WIDTH_MIN
+
+
+class _SparseLayout(NamedTuple):
+  """Arrays of a level-scheduled sparse L'*D*L layout (M's sparse region or the coupled metric)."""
+
+  rownnz: wp.array
+  rowadr: wp.array
+  block_adr: wp.array
+  all_updates: wp.array
+  level_offsets: wp.array
+  factor_elem: wp.array
+  factor_elem_offsets: wp.array
+  levels_host: tuple
+  elems_host: tuple
+  factor_target_elem: wp.array
+  factor_target_adr: wp.array
+  targets_host: tuple
+  targets_long_host: tuple
+  solve_target_update: wp.array
+  solve_target_adr: wp.array
+  solve_target_offsets: wp.array
+  solve_target_long: wp.array
+
+  @property
+  def nlevels(self) -> int:
+    return len(self.levels_host) - 1
+
+
+def _sparse_layout(m: Model, coupled: bool) -> _SparseLayout:
+  """The layout of M's sparse LDL region, or of the discrete coupled metric's factor (efm_qH_*)."""
+  if coupled:
+    return _SparseLayout(
+      m.efm_qH_rownnz,
+      m.efm_qH_rowadr,
+      m.efm_qH_block_adr,
+      m.efm_qH_all_updates,
+      m.efm_qH_level_offsets,
+      m.efm_qH_factor_elem,
+      m.efm_qH_factor_elem_offsets,
+      m.efm_qH_level_offsets_host,
+      m.efm_qH_factor_elem_offsets_host,
+      m.efm_qH_factor_target_elem,
+      m.efm_qH_factor_target_adr,
+      m.efm_qH_factor_target_offsets_host,
+      m.efm_qH_factor_target_long_host,
+      m.efm_qH_solve_target_update,
+      m.efm_qH_solve_target_adr,
+      m.efm_qH_solve_target_offsets,
+      m.efm_qH_solve_target_long,
+    )
+  return _SparseLayout(
+    m.M_rownnz,
+    m.M_rowadr,
+    m.qLD_block_adr,
+    m.qLD_all_updates,
+    m.qLD_level_offsets,
+    m.qLD_factor_elem,
+    m.qLD_factor_elem_offsets,
+    m.qLD_level_offsets_host,
+    m.qLD_factor_elem_offsets_host,
+    m.qLD_factor_target_elem,
+    m.qLD_factor_target_adr,
+    m.qLD_factor_target_offsets_host,
+    m.qLD_factor_target_long_host,
+    m.qLD_solve_target_update,
+    m.qLD_solve_target_adr,
+    m.qLD_solve_target_offsets,
+    m.qLD_solve_target_long,
+  )
 
 
 def _factor_i_sparse(
@@ -1507,6 +1577,7 @@ def _factor_i_sparse(
   M: wp.array2d[float],
   L: wp.array2d[float],
   D: wp.array2d[float],
+  coupled: bool = False,
 ):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd.
 
@@ -1515,12 +1586,13 @@ def _factor_i_sparse(
   atomics take the per-level launches with one thread, or one warp, per updated M(i,j), which sums
   its elements in a fixed order without atomics: the fused kernel reads its own atomics, and
   deterministic element atomics would reserve scatter records, which captured graphs sort in full
-  on every replay.
+  on every replay. `coupled` factors the discrete coupled metric's layout (efm_qH_*) instead of M's.
   """
+  layout = _sparse_layout(m, coupled)
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = _factor_sparse_fused(m, d.nworld)
+  fused = _factor_sparse_fused(m, d.nworld, coupled)
   if not det_atomics:
-    kernel = _factor_i_sparse_fused(m.nv, len(m.qLD_updates)) if fused else _qLD_acc_level
+    kernel = _factor_i_sparse_fused(m.nv, layout.nlevels) if fused else _qLD_acc_level
     det_atomics = _deterministic_launch(kernel)
 
   if fused and not det_atomics:
@@ -1529,12 +1601,12 @@ def _factor_i_sparse(
       kernel,
       dim=(d.nworld, dim_block),
       inputs=[
-        m.M_rownnz,
-        m.M_rowadr,
-        m.qLD_all_updates,
-        m.qLD_level_offsets,
-        m.qLD_factor_elem,
-        m.qLD_factor_elem_offsets,
+        layout.rownnz,
+        layout.rowadr,
+        layout.all_updates,
+        layout.level_offsets,
+        layout.factor_elem,
+        layout.factor_elem_offsets,
         M,
       ],
       outputs=[L, D],
@@ -1543,8 +1615,8 @@ def _factor_i_sparse(
     return
 
   wp.copy(L, M)
-  levels, elems = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host
-  targets, targets_long = m.qLD_factor_target_offsets_host, m.qLD_factor_target_long_host
+  levels, elems = layout.levels_host, layout.elems_host
+  targets, targets_long = layout.targets_host, layout.targets_long_host
   lanes = _segment_lanes()
   for level in reversed(range(len(levels) - 1)):
     if det_atomics:
@@ -1553,9 +1625,9 @@ def _factor_i_sparse(
         _qLD_acc_level_owned,
         dim=(d.nworld, serial_threads + lanes * (targets[level + 1] - targets_long[level])),
         inputs=[
-          m.qLD_factor_elem,
-          m.qLD_factor_target_elem,
-          m.qLD_factor_target_adr,
+          layout.factor_elem,
+          layout.factor_target_elem,
+          layout.factor_target_adr,
           targets[level],
           targets_long[level],
           serial_threads,
@@ -1567,16 +1639,16 @@ def _factor_i_sparse(
       wp.launch(
         _qLD_acc_level,
         dim=(d.nworld, elems[level + 1] - elems[level]),
-        inputs=[m.qLD_factor_elem, elems[level]],
+        inputs=[layout.factor_elem, elems[level]],
         outputs=[L],
       )
     wp.launch(
       _qLD_multipliers_level,
       dim=(d.nworld, levels[level + 1] - levels[level]),
-      inputs=[m.M_rownnz, m.M_rowadr, m.qLD_all_updates, levels[level]],
+      inputs=[layout.rownnz, layout.rowadr, layout.all_updates, levels[level]],
       outputs=[L],
     )
-  wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
+  wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[layout.rownnz, layout.rowadr, L], outputs=[D])
 
 
 @cache_kernel
@@ -4125,13 +4197,16 @@ def _solve_LD_sparse(
   y: wp.array2d[float],
   done: Optional[wp.array] = None,
   sparse_active: Optional[wp.array] = None,
+  coupled: bool = False,
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y.
 
   Deterministic atomics take the owned fused kernel, as the fused kernel reads its own atomics.
-  With `done`, either kernel leaves the rows of done worlds unchanged.
+  With `done`, either kernel leaves the rows of done worlds unchanged. `coupled` solves with the
+  discrete coupled metric's layout (efm_qH_*) instead of M's.
   """
-  nlevels, masked, tree_masked = len(m.qLD_updates), done is not None, sparse_active is not None
+  layout = _sparse_layout(m, coupled)
+  nlevels, masked, tree_masked = layout.nlevels, done is not None, sparse_active is not None
   sparse_active = sparse_active if tree_masked else wp.empty(0, dtype=int)
   owned = bool(m.opt.deterministic & DeterminismType.ATOMICS) or _deterministic_launch(
     _solve_LD_sparse_fused(m.nv, nlevels, masked, tree_masked)
@@ -4142,12 +4217,12 @@ def _solve_LD_sparse(
       _solve_LD_sparse_fused_owned(m.nv, nlevels, masked, tree_masked),
       dim=(d.nworld, dim_block),
       inputs=[
-        m.qLD_block_adr,
-        m.qLD_all_updates,
-        m.qLD_solve_target_update,
-        m.qLD_solve_target_adr,
-        m.qLD_solve_target_offsets,
-        m.qLD_solve_target_long,
+        layout.block_adr,
+        layout.all_updates,
+        layout.solve_target_update,
+        layout.solve_target_adr,
+        layout.solve_target_offsets,
+        layout.solve_target_long,
         _segment_lanes(dim_block),
         L,
         D,
@@ -4164,11 +4239,11 @@ def _solve_LD_sparse(
     _solve_LD_sparse_fused(m.nv, nlevels, masked, tree_masked),
     dim=(d.nworld, dim_block),
     inputs=[
-      m.qLD_block_adr,
+      layout.block_adr,
       L,
       D,
-      m.qLD_all_updates,
-      m.qLD_level_offsets,
+      layout.all_updates,
+      layout.level_offsets,
       y,
       done,
       sparse_active,

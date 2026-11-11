@@ -2493,6 +2493,61 @@ def _find_csr_col(rowadr: int, rownnz: int, target_col: int, colind: wp.array[in
   return -1
 
 
+@wp.kernel
+def _eff_qH_assemble(
+  # Model:
+  efm_qH_madr: wp.array[int],
+  efm_qH_ten_adr: wp.array[int],
+  efm_qH_ten_pair: wp.array[wp.vec3i],
+  efm_qH_act_adr: wp.array[int],
+  efm_qH_act_pair: wp.array[wp.vec3i],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  moment_rownnz_in: wp.array2d[int],
+  moment_rowadr_in: wp.array2d[int],
+  moment_colind_in: wp.array2d[int],
+  actuator_moment_in: wp.array2d[float],
+  qH_in: wp.array2d[float],
+  efm_ts_in: wp.array2d[float],
+  efm_as_in: wp.array2d[float],
+  # Data out:
+  efm_qH_out: wp.array2d[float],
+):
+  """Assembles the metric with its tendon and actuator couplings, one thread per element.
+
+  An element takes its backbone value from qH (zero outside M's sparsity), then adds the pair
+  products of the tendons and actuators that couple its two dofs, tendons first, in a fixed order
+  with no atomics: the same result in every run, and no deterministic scatter records.
+  """
+  worldid, adr = wp.tid()
+  value = float(0.0)
+  madr = efm_qH_madr[adr]
+  if madr >= 0:
+    value = qH_in[worldid, madr]
+
+  for p in range(efm_qH_ten_adr[adr], efm_qH_ten_adr[adr + 1]):
+    pair = efm_qH_ten_pair[p]
+    ts = efm_ts_in[worldid, pair[0]]
+    if ts != 0.0:
+      value += ts * ten_J_in[worldid, pair[1]] * ten_J_in[worldid, pair[2]]
+
+  for p in range(efm_qH_act_adr[adr], efm_qH_act_adr[adr + 1]):
+    pair = efm_qH_act_pair[p]
+    as_val = efm_as_in[worldid, pair[0]]
+    if as_val != 0.0:
+      # a moment row lists only the dofs its transmission moves (a site and its reference site drop
+      # their common ancestors), so either dof of the pair may be absent
+      rowadr = moment_rowadr_in[worldid, pair[0]]
+      rownnz = moment_rownnz_in[worldid, pair[0]]
+      colind = moment_colind_in[worldid]
+      row = _find_csr_col(rowadr, rownnz, pair[1], colind)
+      col = _find_csr_col(rowadr, rownnz, pair[2], colind)
+      if row >= 0 and col >= 0:
+        value += as_val * actuator_moment_in[worldid, row] * actuator_moment_in[worldid, col]
+
+  efm_qH_out[worldid, adr] = value
+
+
 @cache_kernel
 def _eff_flex_stretch_stiff_vert(deterministic: bool = False):
   module_options = {"enable_backward": False}
@@ -3985,7 +4040,7 @@ def eff_shift(m: Model, d: Data):
 
 @event_scope
 def eff_actuation(m: Model, d: Data):
-  """Evaluates actuation-stage metric terms and factors the backbone qH."""
+  """Evaluates actuation-stage metric terms and factors the metric (efm_qH if coupled, else qH)."""
   if m.opt.integrator != IntegratorType.DISCRETE:
     return
 
@@ -4084,11 +4139,58 @@ def eff_actuation(m: Model, d: Data):
       outputs=[d.qH],
     )
 
+  if m.efm_qH_coupled:
+    # the metric with its tendon and actuator couplings (d.qH keeps the backbone, which the
+    # constraint regularization and the Newton Hessian read)
+    wp.launch(
+      _eff_qH_assemble,
+      dim=(d.nworld, d.efm_qH.shape[1]),
+      inputs=[
+        m.efm_qH_madr,
+        m.efm_qH_ten_adr,
+        m.efm_qH_ten_pair,
+        m.efm_qH_act_adr,
+        m.efm_qH_act_pair,
+        d.ten_J,
+        d.moment_rownnz,
+        d.moment_rowadr,
+        d.moment_colind,
+        d.actuator_moment,
+        d.qH,
+        d.efm_ts,
+        d.efm_as,
+      ],
+      outputs=[d.efm_qH],
+    )
+    smooth._factor_i_sparse(m, d, d.efm_qH, d.efm_qHLD, d.qHDiagInv, coupled=True)
+    return
+
   # Factor qH into qHLD and qHDiagInv
   if m.M_tiles:
     smooth._factor_blocks(m, d, d.qH, d.qHLD, d.qHDiagInv)
   if d.qHLD.shape[1] > m.qLD_block_total:
     smooth._factor_i_sparse(m, d, d.qH, d.qHLD[:, m.qLD_block_total :], d.qHDiagInv)
+
+
+def eff_solve_qH(
+  m: Model,
+  d: Data,
+  res: wp.array2d[float],
+  vec: wp.array2d[float],
+  done: Optional[wp.array] = None,
+  tree_active: Optional[wp.array] = None,
+  sparse_active: Optional[wp.array] = None,
+):
+  """Solves with the factored metric: efm_qH's factor when coupled, else the qH backbone's.
+
+  With `done`, the rows of done worlds are left unchanged. `tree_active` and `sparse_active` (see
+  smooth.solve_LD) restrict the backbone's solve to trees with a non-zero right-hand side; for the
+  coupled factor, whose dofs all take the sparse path, `sparse_active` flags the worlds with any.
+  """
+  if m.efm_qH_coupled:
+    smooth._solve_LD_sparse(m, d, d.efm_qHLD, d.qHDiagInv, res, vec, done=done, sparse_active=sparse_active, coupled=True)
+  else:
+    smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, vec, done=done, tree_active=tree_active, sparse_active=sparse_active)
 
 
 def eff_mul_m_scratch(m: Model, d: Data) -> tuple[Optional[tuple], Optional[tuple]]:
@@ -4639,7 +4741,7 @@ def eff_prec(
         inputs=[m.nv, m.efm_dofblk, vec],
         outputs=[res],
       )
-      smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res)
+      eff_solve_qH(m, d, res, res)
     wp.launch(
       _eff_prec_efm0_solve,
       dim=d.nworld,
@@ -4686,7 +4788,7 @@ def eff_prec(
     inputs=[m.nv, dofblk, vec],
     outputs=[res],
   )
-  smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res)
+  eff_solve_qH(m, d, res, res)
   wp.launch(
     _eff_block_solve,
     dim=(d.nworld, m.nefmdof),
@@ -4700,6 +4802,29 @@ def eff_prec(
       inputs=[m.dof_treeid, d.tree_awake],
       outputs=[res],
     )
+
+
+def _eff_metric_terms(m: Model) -> tuple[bool, bool, bool]:
+  """Whether the metric has tendon, actuator and flex terms beyond the backbone's diagonal."""
+  has_spring_or_damper = not ((m.opt.disableflags & DisableBit.SPRING) and (m.opt.disableflags & DisableBit.DAMPER))
+  has_efm_tendon = (m.has_tendon_stiffness and not (m.opt.disableflags & DisableBit.SPRING)) or (
+    m.has_tendon_damping and not (m.opt.disableflags & DisableBit.DAMPER)
+  )
+  has_efm_actuator = m.has_efm_actuator and not (m.opt.disableflags & DisableBit.ACTUATION)
+  has_flex_any = has_spring_or_damper and (
+    m.nefmK > 0 or m.has_non_simple_flex or m.efm0_active or m.has_flex_passive or not m.flex_interp_assemblable
+  )
+  return has_efm_tendon, has_efm_actuator, has_flex_any
+
+
+def eff_solve_direct(m: Model) -> bool:
+  """Whether eff_solve_qH solves the effective metric itself, not a preconditioner of it.
+
+  The factor is the exact metric when it holds the tendon and actuator couplings (efm_qH), or when
+  the metric has no term beyond the backbone's diagonal.
+  """
+  has_efm_tendon, has_efm_actuator, has_flex_any = _eff_metric_terms(m)
+  return m.efm_qH_coupled or not (has_flex_any or has_efm_tendon or has_efm_actuator)
 
 
 @event_scope
@@ -4733,16 +4858,9 @@ def eff_solve(m: Model, d: Data, qacc: wp.array2d[float], qfrc: Optional[wp.arra
   else:
     rhs = qfrc
 
-  has_spring_or_damper = not ((m.opt.disableflags & DisableBit.SPRING) and (m.opt.disableflags & DisableBit.DAMPER))
-  has_efm_tendon = (m.has_tendon_stiffness and not (m.opt.disableflags & DisableBit.SPRING)) or (
-    m.has_tendon_damping and not (m.opt.disableflags & DisableBit.DAMPER)
-  )
-  has_efm_actuator = m.has_efm_actuator and not (m.opt.disableflags & DisableBit.ACTUATION)
-  has_flex_any = has_spring_or_damper and (
-    m.nefmK > 0 or m.has_non_simple_flex or m.efm0_active or m.has_flex_passive or not m.flex_interp_assemblable
-  )
-  if not has_flex_any and not has_efm_tendon and not has_efm_actuator:
-    smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, qacc, rhs)
+  has_efm_tendon, has_efm_actuator, has_flex_any = _eff_metric_terms(m)
+  if eff_solve_direct(m):
+    eff_solve_qH(m, d, qacc, rhs)
     if m.opt.enableflags & EnableBit.SLEEP:
       wp.launch(
         _zero_sleeping_dofs,
