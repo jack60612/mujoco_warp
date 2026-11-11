@@ -126,8 +126,12 @@ def test_const0_batched_inverse_weights_match_mujoco(device, rhs_chunk):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("source", ["option", "warp_config"])
-def test_const0_batched_deterministic(device, source):
-  """Deterministic batched solves (per-level launches) agree with the default path, run to run."""
+@pytest.mark.parametrize("budget", [None, 1])
+def test_const0_batched_deterministic(device, source, budget):
+  """Deterministic batched solves (per-level launches) agree with the default path, run to run.
+
+  A record budget of 1 splits every launch into single right-hand sides.
+  """
   if device.startswith("cuda") and not wp.is_cuda_available():
     pytest.skip("CUDA is unavailable")
   mjm = mujoco.MjModel.from_xml_string(_layout_coverage_xml())
@@ -152,7 +156,8 @@ def test_const0_batched_deterministic(device, source):
       for _ in range(2):
         for name in names:
           getattr(m, name).zero_()
-        mjwarp.set_const_0(m, d, workspace=workspace)
+        with mock.patch.object(smooth, "_DETERMINISTIC_RECORD_BUDGET", budget or smooth._DETERMINISTIC_RECORD_BUDGET):
+          mjwarp.set_const_0(m, d, workspace=workspace)
         runs.append({name: getattr(m, name).numpy().copy() for name in names})
     finally:
       wp.config.deterministic = saved

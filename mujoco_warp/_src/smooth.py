@@ -4246,6 +4246,12 @@ def _solve_LD_sparse_level_batched(up: bool, deterministic: bool = False):
   return kernel
 
 
+# Threads (one deterministic scatter record each) per deterministic batched backsubstitution
+# launch: ~0.2 GB of scatter buffers. Unsplit, set_const_0's default 16 MiB right-hand-side chunk
+# ran out of memory on a 1455-dof, 371-level tree.
+_DETERMINISTIC_RECORD_BUDGET = 1 << 24
+
+
 def solve_m_batched(
   m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float], x_scratch: Optional[wp.array3d[float]] = None
 ):
@@ -4299,25 +4305,35 @@ def solve_m_batched(
     )
     return
 
+  # Each deterministic launch reserves one scatter record (an int64 key and a value, plus sort
+  # workspace) per thread: split the right-hand sides to bound a level launch by
+  # _DETERMINISTIC_RECORD_BUDGET threads.
   x_in = x_scratch if x_scratch is not None else wp.empty_like(x)
-  wp.launch(_solve_LD_sparse_copy_batched, dim=(d.nworld, nrhs, m.nv), inputs=[m.qLD_block_adr, y], outputs=[x])
-  for qLD_updates in reversed(m.qLD_updates):
-    wp.copy(x_in, x)
-    wp.launch(
-      _solve_LD_sparse_level_batched(True, True),
-      dim=(d.nworld, nrhs, qLD_updates.size),
-      inputs=[L, qLD_updates, x_in],
-      outputs=[x],
-    )
-  wp.launch(_solve_LD_sparse_diag_batched, dim=(d.nworld, nrhs, m.nv), inputs=[m.qLD_block_adr, d.qLDiagInv], outputs=[x])
-  for qLD_updates in m.qLD_updates:
-    wp.copy(x_in, x)
-    wp.launch(
-      _solve_LD_sparse_level_batched(False, True),
-      dim=(d.nworld, nrhs, qLD_updates.size),
-      inputs=[L, qLD_updates, x_in],
-      outputs=[x],
-    )
+  levels = m.qLD_level_offsets_host
+  widest = max(levels[i + 1] - levels[i] for i in range(len(levels) - 1))
+  batch = max(1, min(nrhs, _DETERMINISTIC_RECORD_BUDGET // max(d.nworld * widest, 1)))
+  for start in range(0, nrhs, batch):
+    stop = min(start + batch, nrhs)
+    xs, ys, xs_in = (x, y, x_in) if batch == nrhs else (x[:, start:stop], y[:, start:stop], x_in[:, start:stop])
+    n = stop - start
+    wp.launch(_solve_LD_sparse_copy_batched, dim=(d.nworld, n, m.nv), inputs=[m.qLD_block_adr, ys], outputs=[xs])
+    for qLD_updates in reversed(m.qLD_updates):
+      wp.copy(xs_in, xs)
+      wp.launch(
+        _solve_LD_sparse_level_batched(True, True),
+        dim=(d.nworld, n, qLD_updates.size),
+        inputs=[L, qLD_updates, xs_in],
+        outputs=[xs],
+      )
+    wp.launch(_solve_LD_sparse_diag_batched, dim=(d.nworld, n, m.nv), inputs=[m.qLD_block_adr, d.qLDiagInv], outputs=[xs])
+    for qLD_updates in m.qLD_updates:
+      wp.copy(xs_in, xs)
+      wp.launch(
+        _solve_LD_sparse_level_batched(False, True),
+        dim=(d.nworld, n, qLD_updates.size),
+        inputs=[L, qLD_updates, xs_in],
+        outputs=[xs],
+      )
 
 
 @cache_kernel
