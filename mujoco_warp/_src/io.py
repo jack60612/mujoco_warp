@@ -288,21 +288,15 @@ def _efm_actuator_dofs(mjm: mujoco.MjModel, a: int) -> Optional[list[int]]:
   return None
 
 
-def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
-  """Elimination tree of the discrete integrator's metric with its tendon and actuator couplings.
+def _efm_coupling_groups(mjm: mujoco.MjModel) -> Optional[list[np.ndarray]]:
+  """Dof sets that the discrete integrator's metric couples beyond M's pattern.
 
   The metric M + h*D + h^2*K couples every pair of dofs in a damped or stiff tendon's Jacobian and
-  in a metric actuator's moment. Under MuJoCo's reverse elimination (the last dof first), dof i's
-  factor row holds the dofs j < i it shares a coupling with, plus the fill of the dofs eliminated
-  before it; parent[i] is the largest of them. A factor whose rows hold every ancestor in this
-  tree has the prefix layout of M's own factor, so the tree factorization and back-substitution
-  apply unchanged.
-
-  Returns None (the backbone path) when the integrator is not discrete, flexes contribute metric
-  terms, an actuator's moment depends on the state (body transmission), or no tendon or actuator
-  couples two dofs.
+  in a metric actuator's moment. Returns those sets (two or more dofs each), or None when the
+  couplings are not known statically: flexes contribute metric terms, or an actuator's moment
+  depends on the state (body transmission).
   """
-  if mjm.opt.integrator != mujoco.mjtIntegrator.mjINT_DISCRETE or mjm.nflex:
+  if mjm.nflex:
     return None
 
   groups = []
@@ -341,7 +335,55 @@ def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
         return None
       groups.append(dofs)
 
-  groups = [np.unique(g) for g in groups if np.unique(g).size > 1]
+  return [np.unique(g) for g in groups if np.unique(g).size > 1]
+
+
+def tree_coupledid(mjm: mujoco.MjModel) -> np.ndarray:
+  """Per kinematic tree, the smallest id of the trees its acceleration metric couples it to.
+
+  The metric is M, under the discrete integrator M + h*D + h^2*K with its tendon and actuator
+  couplings. A set of coupled trees that no active constraint row touches decouples from the
+  constrained problem, so its constrained solution is qacc_smooth. Every tree gets id 0 (one set)
+  when the discrete metric's couplings are not known statically (see _efm_coupling_groups).
+  """
+  groups = [mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]] for i in range(mjm.nv)]
+  if mjm.opt.integrator == mujoco.mjtIntegrator.mjINT_DISCRETE:
+    efm_groups = _efm_coupling_groups(mjm)
+    if efm_groups is None:
+      return np.zeros(mjm.ntree, dtype=int)
+    groups += efm_groups
+
+  root = np.arange(mjm.ntree)
+
+  def find(t):
+    while root[t] != t:
+      t = root[t]
+    return t
+
+  for cols in groups:
+    trees = {find(int(mjm.dof_treeid[c])) for c in cols}
+    low = min(trees, default=0)
+    for t in trees:
+      root[t] = low
+  return np.array([find(t) for t in range(mjm.ntree)], dtype=int)
+
+
+def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
+  """Elimination tree of the discrete integrator's metric with its tendon and actuator couplings.
+
+  The metric couples the dofs of each set in _efm_coupling_groups. Under MuJoCo's reverse
+  elimination (the last dof first), dof i's factor row holds the dofs j < i it shares a coupling
+  with, plus the fill of the dofs eliminated before it; parent[i] is the largest of them. A factor
+  whose rows hold every ancestor in this tree has the prefix layout of M's own factor, so the tree
+  factorization and back-substitution apply unchanged.
+
+  Returns None (the backbone path) when the integrator is not discrete, flexes contribute metric
+  terms, an actuator's moment depends on the state (body transmission), or no tendon or actuator
+  couples two dofs.
+  """
+  if mjm.opt.integrator != mujoco.mjtIntegrator.mjINT_DISCRETE:
+    return None
+  groups = _efm_coupling_groups(mjm)
   if not groups:
     return None
 
@@ -1401,6 +1443,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_factor_elem_offsets = factor_elem_offsets
   m.qLD_level_offsets_host = tuple(level_offsets)
   m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
+
+  # trees that the solver starts together (row-free sets start at qacc_smooth)
+  m.tree_coupledid = tree_coupledid(mjm)
 
   # Discrete integrator: layout of the metric factored with its tendon and actuator couplings
   efm_parent = efm_qH_parent(mjm)

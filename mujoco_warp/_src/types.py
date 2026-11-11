@@ -1668,6 +1668,9 @@ class Model:
     qLD_factor_elem_offsets: start offset of each depth level in qLD_factor_elem
     qLD_level_offsets_host: host copy of qLD_level_offsets, for per-level factorization launches
     qLD_factor_elem_offsets_host: host copy of qLD_factor_elem_offsets
+    tree_coupledid: smallest id of the trees the acceleration metric couples to each tree
+                    (with the discrete metric's tendon and actuator couplings; every tree 0
+                    when those are not known statically) (ntree,)
     efm_qH_coupled: discrete integrator factors the metric with its tendon and actuator
                     couplings (efm_qH_* layout) instead of the qH backbone
     efm_qH_rownnz: coupled metric factor row lengths (every elimination-tree ancestor) (nv,)
@@ -2214,6 +2217,7 @@ class Model:
   qLD_factor_elem_offsets: array("nqLD_level_offsets", int)
   qLD_level_offsets_host: tuple[int, ...]
   qLD_factor_elem_offsets_host: tuple[int, ...]
+  tree_coupledid: array("ntree", int)
   efm_qH_coupled: bool
   efm_qH_rownnz: array("nv", int)
   efm_qH_rowadr: array("nv", int)
