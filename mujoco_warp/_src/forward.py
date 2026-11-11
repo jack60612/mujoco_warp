@@ -1125,19 +1125,18 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
   def _discrete_free_gyro(
     # Model:
     nactuator: int,
-    ntendon: int,
     opt_timestep: wp.array[float],
     opt_enableflags: int,
     body_dofadr: wp.array[int],
     dof_treeid: wp.array[int],
-    ten_J_rownnz: wp.array[int],
-    ten_J_rowadr: wp.array[int],
-    ten_J_colind: wp.array[int],
     M_rownnz: wp.array[int],
     M_rowadr: wp.array[int],
     M_colind: wp.array[int],
     efm_K_rownnz: wp.array[int],
     body_freeadr: wp.array[int],
+    body_free_tenadr: wp.array[int],
+    body_free_tennum: wp.array[int],
+    body_free_tenid: wp.array[int],
     # Data in:
     nefc_in: wp.array[int],
     qvel_in: wp.array2d[float],
@@ -1180,10 +1179,23 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
     if (opt_enableflags & EnableBit.SLEEP) and (tree_awake_in[worldid, treeid] == 0):
       return
 
-    # Decoupling guards (mjd_freeGyroPossible): skip if K, constraints, or rank-1 touch DOFs
+    # Decoupling guards (mjd_freeGyroPossible): skip if K, constraints, or rank-1 touch DOFs.
+    # Static guards first: tendons come from the precomputed list of tendons whose Jacobian
+    # sparsity touches the body, so coupled bodies return before the per-step efc scan.
     for r in range(6):
       if efm_K_rownnz[dof_adr + r] != 0:
         return
+    tenadr = body_free_tenadr[freeid]
+    for k in range(body_free_tennum[freeid]):
+      if efm_ts_in[worldid, body_free_tenid[tenadr + k]] != 0.0:
+        return
+    for a in range(nactuator):
+      if efm_as_in[worldid, a] != 0.0:
+        radr = moment_rowadr_in[worldid, a]
+        for j in range(moment_rownnz_in[worldid, a]):
+          c = moment_colind_in[worldid, radr + j]
+          if c >= dof_adr and c < dof_adr + 6:
+            return
     nefc = nefc_in[worldid]
     for i in range(nefc):
       if wp.static(is_sparse):
@@ -1197,20 +1209,6 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
       else:
         for r in range(6):
           if efc_J_in[worldid, i, dof_adr + r] != 0.0:
-            return
-    for t in range(ntendon):
-      if efm_ts_in[worldid, t] != 0.0:
-        radr = ten_J_rowadr[t]
-        for j in range(ten_J_rownnz[t]):
-          c = ten_J_colind[radr + j]
-          if c >= dof_adr and c < dof_adr + 6:
-            return
-    for a in range(nactuator):
-      if efm_as_in[worldid, a] != 0.0:
-        radr = moment_rowadr_in[worldid, a]
-        for j in range(moment_rownnz_in[worldid, a]):
-          c = moment_colind_in[worldid, radr + j]
-          if c >= dof_adr and c < dof_adr + 6:
             return
     if wp.static(has_flex_passive):
       nacon = nacon_in[0]
@@ -1309,19 +1307,18 @@ def _launch_discrete_free_gyro(m: Model, d: Data, out: wp.array2d[float], qacc: 
     dim=(d.nworld, m.body_freeadr.size),
     inputs=[
       m.nactuator,
-      m.ntendon,
       m.opt.timestep,
       m.opt.enableflags,
       m.body_dofadr,
       m.dof_treeid,
-      m.ten_J_rownnz,
-      m.ten_J_rowadr,
-      m.ten_J_colind,
       m.M_rownnz,
       m.M_rowadr,
       m.M_colind,
       m.efm_K_rownnz,
       m.body_freeadr,
+      m.body_free_tenadr,
+      m.body_free_tennum,
+      m.body_free_tenid,
       d.nefc,
       d.qvel,
       qacc,
