@@ -43,6 +43,7 @@ from mujoco_warp._src.types import GainType
 from mujoco_warp._src.types import IntegratorType
 from mujoco_warp._src.types import JointType
 from mujoco_warp._src.types import Model
+from mujoco_warp._src.types import mat66
 from mujoco_warp._src.types import vec6
 from mujoco_warp._src.types import vec10
 from mujoco_warp._src.warp_util import cache_kernel
@@ -367,6 +368,8 @@ def _crosstree_actuator_damping_mul(nv: int, deterministic: bool = False):
   def kernel(
     # Model:
     opt_timestep: wp.array[float],
+    dof_bodyid: wp.array[int],
+    body_is_free: wp.array[bool],
     M_elemid: wp.array2d[int],
     # Data in:
     moment_rownnz_in: wp.array2d[int],
@@ -381,7 +384,8 @@ def _crosstree_actuator_damping_mul(nv: int, deterministic: bool = False):
   ):
     """Adds the actuator pairs omitted by _qderiv_actuator_passive_actuation_sparse.
 
-    res += -dt * vel * m m' @ vec, restricted to the pairs whose lower-triangular M entry is absent.
+    res += -dt * vel * m m' @ vec, restricted to the pairs whose lower-triangular M entry is absent,
+    except pairs inside one standalone free body: its local block (implicit_free_body) holds them.
     """
     worldid, actid = wp.tid()
 
@@ -415,7 +419,7 @@ def _crosstree_actuator_damping_mul(nv: int, deterministic: bool = False):
           elemid = M_elemid[dofi, dofj]
         else:
           elemid = M_elemid[dofj, dofi]
-        if elemid < 0:
+        if elemid < 0 and not (dof_bodyid[dofi] == dof_bodyid[dofj] and body_is_free[dof_bodyid[dofi]]):
           acc += moment_j * vec_in[worldid, dofj]
 
       if acc != 0.0:
@@ -435,11 +439,13 @@ def _crosstree_tendon_damping_mul(max_ten_J_rownnz: int, deterministic: bool = F
   def kernel(
     # Model:
     opt_timestep: wp.array[float],
+    dof_bodyid: wp.array[int],
     ten_J_rownnz: wp.array[int],
     ten_J_rowadr: wp.array[int],
     ten_J_colind: wp.array[int],
     tendon_damping: wp.array2d[float],
     tendon_dampingpoly: wp.array2d[wp.vec2],
+    body_is_free: wp.array[bool],
     M_elemid: wp.array2d[int],
     # Data in:
     ten_J_in: wp.array2d[float],
@@ -451,7 +457,8 @@ def _crosstree_tendon_damping_mul(max_ten_J_rownnz: int, deterministic: bool = F
   ):
     """Adds the tendon damping pairs omitted by _qderiv_tendon_damping.
 
-    res += dt * b' J J' @ vec, restricted to the pairs whose lower-triangular M entry is absent.
+    res += dt * b' J J' @ vec, restricted to the pairs whose lower-triangular M entry is absent,
+    except pairs inside one standalone free body: its local block (implicit_free_body) holds them.
     """
     worldid, tenid = wp.tid()
     damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
@@ -487,7 +494,7 @@ def _crosstree_tendon_damping_mul(max_ten_J_rownnz: int, deterministic: bool = F
           madr = M_elemid[dofi, dofj]
         else:
           madr = M_elemid[dofj, dofi]
-        if madr < 0:
+        if madr < 0 and not (dof_bodyid[dofi] == dof_bodyid[dofj] and body_is_free[dof_bodyid[dofi]]):
           acc += Jj * vec_in[worldid, dofj]
 
       if acc != 0.0:
@@ -1375,8 +1382,116 @@ def _qderiv_box_fluid(deterministic: bool = False):
   return kernel
 
 
+@wp.kernel
+def _free_body_block(
+  # Model:
+  opt_timestep: wp.array[float],
+  body_dofadr: wp.array[int],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  tendon_damping: wp.array2d[float],
+  tendon_dampingpoly: wp.array2d[wp.vec2],
+  M_rownnz: wp.array[int],
+  M_rowadr: wp.array[int],
+  M_colind: wp.array[int],
+  body_freeadr: wp.array[int],
+  M_elemid: wp.array2d[int],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  moment_rownnz_in: wp.array2d[int],
+  moment_rowadr_in: wp.array2d[int],
+  moment_colind_in: wp.array2d[int],
+  actuator_moment_in: wp.array2d[float],
+  ten_velocity_in: wp.array2d[float],
+  # In:
+  qDeriv_in: wp.array2d[float],
+  ntendon_damped: int,
+  actuator_vel_in: wp.array2d[float],
+  # Out:
+  block_out: wp.array2d[mat66],
+):
+  """Assembles each standalone free body's full 6x6 block of M - dt * (damping derivatives).
+
+  Gathers the block of qH (M-structure lower triangle). M's sparsity can omit off-diagonal pairs
+  inside the block (a simple body stores only the diagonal); the actuator and tendon damping
+  couplings the in-pattern scatters dropped there are added from the same per-actuator derivative
+  (actuator_vel_in, empty without actuation) and tendon damping, as MuJoCo's D-structure qDeriv
+  keeps them for mjd_freeMhat.
+  """
+  worldid, freeid = wp.tid()
+  dof_adr = body_dofadr[body_freeadr[freeid]]
+
+  A = mat66(0.0)
+  dense = True
+  for r in range(6):
+    row = dof_adr + r
+    start = M_rowadr[row]
+    nnz = M_rownnz[row]
+    if nnz != r + 1:
+      dense = False
+    for k in range(nnz):
+      c = M_colind[start + k] - dof_adr
+      val = qDeriv_in[worldid, start + k]
+      A[r, c] = val
+      A[c, r] = val
+
+  if not dense:
+    timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+
+    # actuators: -dt * vel * m_i m_j, for the pairs the scatter's (later, earlier) lookup dropped
+    for actid in range(actuator_vel_in.shape[1]):
+      vel = actuator_vel_in[worldid, actid]
+      if vel == 0.0:
+        continue
+      rowadr = moment_rowadr_in[worldid, actid]
+      for i in range(moment_rownnz_in[worldid, actid]):
+        moment_i = actuator_moment_in[worldid, rowadr + i]
+        dofi = moment_colind_in[worldid, rowadr + i]
+        if moment_i == 0.0 or dofi < dof_adr or dofi >= dof_adr + 6:
+          continue
+        for j in range(i):
+          moment_j = actuator_moment_in[worldid, rowadr + j]
+          dofj = moment_colind_in[worldid, rowadr + j]
+          if moment_j == 0.0 or dofj < dof_adr or dofj >= dof_adr + 6 or M_elemid[dofi, dofj] >= 0:
+            continue
+          val = timestep * vel * moment_i * moment_j
+          A[dofi - dof_adr, dofj - dof_adr] -= val
+          A[dofj - dof_adr, dofi - dof_adr] -= val
+
+    # tendons: dt * damping' * J_i J_j, for the pairs outside the pattern
+    for tenid in range(ntendon_damped):
+      damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
+      dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
+      deriv = timestep * util_misc._poly_force_deriv(damping, dpoly, ten_velocity_in[worldid, tenid], 1)
+      if deriv == 0.0:
+        continue
+      rowadr = ten_J_rowadr[tenid]
+      for i in range(ten_J_rownnz[tenid]):
+        Ji = ten_J_in[worldid, rowadr + i]
+        dofi = ten_J_colind[rowadr + i]
+        if Ji == 0.0 or dofi < dof_adr or dofi >= dof_adr + 6:
+          continue
+        for j in range(i):
+          Jj = ten_J_in[worldid, rowadr + j]
+          dofj = ten_J_colind[rowadr + j]
+          if Jj == 0.0 or dofj < dof_adr or dofj >= dof_adr + 6 or M_elemid[dofi, dofj] >= 0:
+            continue
+          val = Ji * Jj * deriv
+          A[dofi - dof_adr, dofj - dof_adr] += val
+          A[dofj - dof_adr, dofi - dof_adr] += val
+
+  block_out[worldid, freeid] = A
+
+
 @event_scope
-def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel: Optional[wp.array2d[float]] = None):
+def deriv_smooth_vel(
+  m: Model,
+  d: Data,
+  out: wp.array2d[float],
+  actuator_vel: Optional[wp.array2d[float]] = None,
+  free_block: Optional[wp.array2d[mat66]] = None,
+):
   """Analytical derivative of smooth forces w.r.t. velocities.
 
   Args:
@@ -1385,14 +1500,20 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel: Op
     out: M - dt * qDeriv (derivatives of smooth forces w.r.t velocities).
     actuator_vel: Optional (nworld, nactuator) output for the per-actuator force derivative w.r.t.
       actuator velocity used in out; written when actuation is enabled and nactuator > 0.
+    free_block: Optional (nworld, nfree) output: each standalone free body's 6x6 block of out
+      before the fluid derivatives, i.e. M - dt * (joint, actuator and tendon damping derivatives).
+      implicit_free_body completes it with the unsymmetrized fluid and gyroscopic derivatives.
   """
   Mi = m.M_fullm_i
   Mj = m.M_fullm_j
 
-  if not (m.opt.disableflags & (DisableBit.ACTUATION | DisableBit.DAMPER)):
+  # actuator and passive damping derivatives are independent, as in MuJoCo's mjd_smooth_vel
+  actuation = m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION)
+  vel = None
+  if actuation or not (m.opt.disableflags & DisableBit.DAMPER):
     # TODO(team): only clear elements not set by _qderiv_actuator_passive
     out.zero_()
-    if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
+    if actuation:
       vel = wp.empty((d.nworld, m.nactuator), dtype=float) if actuator_vel is None else actuator_vel
       wp.launch(
         _qderiv_actuator_passive_vel,
@@ -1460,7 +1581,8 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel: Op
     # TODO(team): directly utilize M for these settings
     wp.copy(out, d.M)
 
-  if m.ntendon and not (m.opt.disableflags & DisableBit.DAMPER):
+  tendon_damper = m.ntendon > 0 and not (m.opt.disableflags & DisableBit.DAMPER)
+  if tendon_damper:
     det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
     wp.launch(
       _qderiv_tendon_damping(m.max_ten_J_rownnz if det_atomics else 0, det_atomics),
@@ -1477,6 +1599,35 @@ def deriv_smooth_vel(m: Model, d: Data, out: wp.array2d[float], actuator_vel: Op
         d.ten_velocity,
       ],
       outputs=[out],
+    )
+  if free_block is not None:
+    wp.launch(
+      _free_body_block,
+      dim=(d.nworld, m.body_freeadr.size),
+      inputs=[
+        m.opt.timestep,
+        m.body_dofadr,
+        m.ten_J_rownnz,
+        m.ten_J_rowadr,
+        m.ten_J_colind,
+        m.tendon_damping,
+        m.tendon_dampingpoly,
+        m.M_rownnz,
+        m.M_rowadr,
+        m.M_colind,
+        m.body_freeadr,
+        m.M_elemid,
+        d.ten_J,
+        d.moment_rownnz,
+        d.moment_rowadr,
+        d.moment_colind,
+        d.actuator_moment,
+        d.ten_velocity,
+        out,
+        m.ntendon if tendon_damper else 0,
+        vel if vel is not None else wp.empty((d.nworld, 0), dtype=float),
+      ],
+      outputs=[free_block],
     )
   if m.has_fluid:
     wp.launch(
@@ -1544,7 +1695,8 @@ def crosstree_damping_mul(m: Model, d: Data, actuator_vel: wp.array2d[float], ve
 
   deriv_smooth_vel stores M - dt * qDeriv only on the kinematic-tree sparsity of M. Actuator and
   tendon damping between DOFs outside that sparsity (for example DOFs in different kinematic trees)
-  is dropped there. C holds exactly those dropped pairs and is applied without forming it.
+  is dropped there. C holds exactly those dropped pairs and is applied without forming it, except
+  the pairs inside one standalone free body, which deriv_smooth_vel's free_block already holds.
 
   Args:
     m: The model containing kinematic and dynamic information (device).
@@ -1560,6 +1712,8 @@ def crosstree_damping_mul(m: Model, d: Data, actuator_vel: wp.array2d[float], ve
       dim=(d.nworld, m.nactuator),
       inputs=[
         m.opt.timestep,
+        m.dof_bodyid,
+        m.body_is_free,
         m.M_elemid,
         d.moment_rownnz,
         d.moment_rowadr,
@@ -1576,11 +1730,13 @@ def crosstree_damping_mul(m: Model, d: Data, actuator_vel: wp.array2d[float], ve
       dim=(d.nworld, m.ntendon),
       inputs=[
         m.opt.timestep,
+        m.dof_bodyid,
         m.ten_J_rownnz,
         m.ten_J_rowadr,
         m.ten_J_colind,
         m.tendon_damping,
         m.tendon_dampingpoly,
+        m.body_is_free,
         m.M_elemid,
         d.ten_J,
         d.ten_velocity,

@@ -86,6 +86,23 @@ _TWO_TREE_XML = """
 </mujoco>
 """
 
+# The two-tree model with a FREE child, i.e. a standalone free body: its site/refsite actuators
+# damp it against the parent tree (as declared break points do in farm-sim). implicitfast solves
+# its rows with the local free-body block, which must keep the actuators' own damping. The child
+# starts without angular velocity, so the block's gyroscopic derivative is zero.
+_FREE_TWO_TREE_XML = _TWO_TREE_XML.replace(
+  """<joint type="slide" axis="1 0 0"/>
+      <joint type="slide" axis="0 1 0"/>
+      <joint type="slide" axis="0 0 1"/>
+      <joint type="ball"/>""",
+  "<freejoint/>",
+).replace(
+  """<key qpos=".1 -.2 .3 -.4 .01 -.02 .01 .995 .05 -.05 .07"
+         qvel=".5 -.3 .8 -.6 .2 -.1 .3 1.5 -2 .7"/>""",
+  """<key qpos=".1 -.2 .3 -.4 .01 -.02 .41 .995 .05 -.05 .07"
+         qvel=".5 -.3 .8 -.6 .2 -.1 .3 0 0 0"/>""",
+)
+
 # The two-tree model with a damped standalone free child, coupled to nothing: only the siblings'
 # tendon is outside M's sparsity. implicitfast solves the free body with its local block.
 _FREE_CHILD_XML = """
@@ -246,6 +263,21 @@ class ImplicitCrossTreeTest(parameterized.TestCase):
     native = _reference_qvel(mjm, m, d, pattern_only=True)
     mjw.implicit(m, d)
     np.testing.assert_allclose(d.qvel.numpy()[0], native, rtol=1e-4, atol=1e-5)
+
+  @parameterized.parameters(0, 1)
+  def test_free_child_matches_dense_reference(self, enabled):
+    """A standalone free child keeps its own actuator damping implicit in its local block.
+
+    Disabled, the step equals the dense solve restricted to M's sparsity, which includes the free
+    body's diagonal block; enabled with nv iterations, it also includes the cross-tree pairs.
+    """
+    mjm, _, m, d = test_data.fixture(xml=_FREE_TWO_TREE_XML, keyframe=0)
+    self.assertEqual(m.body_freeadr.size, 1)
+    mjw.forward(m, d)
+    reference = _reference_qvel(mjm, m, d, pattern_only=not enabled)
+    m.opt.implicit_crosstree_iterations = m.nv if enabled else 0
+    mjw.implicit(m, d)
+    np.testing.assert_allclose(d.qvel.numpy()[0], reference, rtol=1e-4, atol=1e-5)
 
   def test_disabled_is_the_stock_pipeline(self):
     """Disabled, implicitfast is bitwise the factor-solve of deriv_smooth_vel's matrix."""
