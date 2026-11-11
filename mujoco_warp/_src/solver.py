@@ -1653,16 +1653,54 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext):
 
 
 @cache_kernel
-def _solve_init_dof(warmstart: bool, sparse: bool):
+def _mark_constrained_trees(is_sparse: bool):
+  @wp.kernel(module="unique", enable_backward=False, grid_stride=True)
+  def kernel(
+    # Model:
+    nv: int,
+    dof_treeid: wp.array[int],
+    # Data in:
+    nefc_in: wp.array[int],
+    efc_J_rownnz_in: wp.array2d[int],
+    efc_J_rowadr_in: wp.array2d[int],
+    efc_J_colind_in: wp.array3d[int],
+    efc_J_in: wp.array3d[float],
+    # Out:
+    tree_constrained_out: wp.array2d[int],
+  ):
+    worldid, efcid = wp.tid()
+
+    if efcid >= nefc_in[worldid]:
+      return
+
+    if wp.static(is_sparse):
+      rowadr = efc_J_rowadr_in[worldid, efcid]
+      for i in range(efc_J_rownnz_in[worldid, efcid]):
+        tree_constrained_out[worldid, dof_treeid[efc_J_colind_in[worldid, 0, rowadr + i]]] = 1
+    else:
+      for dofid in range(nv):
+        if efc_J_in[worldid, efcid, dofid] != 0.0:
+          tree_constrained_out[worldid, dof_treeid[dofid]] = 1
+
+  return kernel
+
+
+@cache_kernel
+def _solve_init_dof(warmstart: bool, sparse: bool, free_tree_start: bool):
   WARMSTART = warmstart
   SPARSE = sparse
+  FREE_TREE_START = free_tree_start
 
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
   def kernel(
+    # Model:
+    dof_treeid: wp.array[int],
     # Data in:
     nefc_in: wp.array[int],
     qacc_warmstart_in: wp.array2d[float],
     qacc_smooth_in: wp.array2d[float],
+    # In:
+    tree_constrained_in: wp.array2d[int],
     # Data out:
     qacc_out: wp.array2d[float],
     qfrc_constraint_out: wp.array2d[float],
@@ -1670,10 +1708,14 @@ def _solve_init_dof(warmstart: bool, sparse: bool):
     worldid, dofid = wp.tid()
 
     if wp.static(WARMSTART):
+      qacc = qacc_smooth_in[worldid, dofid]
       if nefc_in[worldid] > 0:
-        qacc_out[worldid, dofid] = qacc_warmstart_in[worldid, dofid]
-      else:
-        qacc_out[worldid, dofid] = qacc_smooth_in[worldid, dofid]
+        qacc = qacc_warmstart_in[worldid, dofid]
+        if wp.static(FREE_TREE_START):
+          # no active row touches this tree: its constrained solution is qacc_smooth
+          if tree_constrained_in[worldid, dof_treeid[dofid]] == 0:
+            qacc = qacc_smooth_in[worldid, dofid]
+      qacc_out[worldid, dofid] = qacc
     else:
       qacc_out[worldid, dofid] = qacc_smooth_in[worldid, dofid]
 
@@ -4089,10 +4131,26 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     ctx.efm_con, ctx.flex_scratch = derivative.eff_mul_m_scratch(m, d)
 
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
+  # A kinematic tree that no active row touches has qacc_smooth as its constrained solution
+  # whenever M does not couple it to a constrained tree, so start such trees there instead of
+  # at the warmstart. Either start converges to the same solution. Compact solves keep the
+  # plain warmstart, and so does the discrete integrator: its effective metric can couple trees
+  # through tendon and actuator terms, so a row-free tree's solution need not be qacc_smooth.
+  free_tree_start = warmstart and not compact and m.ntree > 1 and m.opt.integrator != types.IntegratorType.DISCRETE
+  if free_tree_start:
+    tree_constrained = wp.zeros((d.nworld, m.ntree), dtype=int)
+    wp.launch(
+      _mark_constrained_trees(m.is_sparse),
+      dim=(d.nworld, d.njmax),
+      inputs=[m.nv, m.dof_treeid, d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J],
+      outputs=[tree_constrained],
+    )
+  else:
+    tree_constrained = wp.empty((d.nworld, 0), dtype=int)
   wp.launch(
-    _solve_init_dof(warmstart, m.is_sparse),
+    _solve_init_dof(warmstart, m.is_sparse, free_tree_start),
     dim=(d.nworld, m.nv),
-    inputs=[d.nefc, d.qacc_warmstart, d.qacc_smooth],
+    inputs=[m.dof_treeid, d.nefc, d.qacc_warmstart, d.qacc_smooth, tree_constrained],
     outputs=[d.qacc, d.qfrc_constraint],
   )
   if m.opt.integrator == types.IntegratorType.DISCRETE and (m.opt.enableflags & types.EnableBit.SLEEP):
