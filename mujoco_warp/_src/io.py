@@ -778,6 +778,19 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       body_is_free[b_free] = tree_dof6
   m.body_is_free = body_is_free
   m.body_freeadr = np.nonzero(m.body_is_free)[0]
+  # tendons whose static Jacobian sparsity touches each free body's dofs (discrete free gyro guard)
+  dof_freeid = np.full(mjm.nv, -1, dtype=int)
+  for freeid, bodyid in enumerate(m.body_freeadr):
+    dof_freeid[mjm.body_dofadr[bodyid] : mjm.body_dofadr[bodyid] + 6] = freeid
+  free_tendons = [[] for _ in m.body_freeadr]
+  for t in range(mjm.ntendon):
+    cols = mjm.ten_J_colind[mjm.ten_J_rowadr[t] : mjm.ten_J_rowadr[t] + mjm.ten_J_rownnz[t]]
+    for freeid in np.unique(dof_freeid[cols]):
+      if freeid >= 0:
+        free_tendons[freeid].append(t)
+  m.body_free_tennum = [len(tendons) for tendons in free_tendons]
+  m.body_free_tenadr = np.concatenate(([0], np.cumsum(m.body_free_tennum)[:-1])).astype(int) if free_tendons else []
+  m.body_free_tenid = [t for tendons in free_tendons for t in tendons]
   body_fluid_box = np.zeros(mjm.nbody, dtype=bool)
   for b in range(1, mjm.nbody):
     if not m.body_fluid_ellipsoid[b] and mjm.body_mass[b] >= types.MJ_MINVAL:
@@ -1380,6 +1393,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nbody_branches": len(m.body_branches),
       "nbranch_start": len(m.body_branch_start),
       "nbodyfree": sum(body_is_free),
+      "nbody_free_ten": len(m.body_free_tenid),
       "nbody_fluid_ellipsoid": len(m.body_fluid_ellipsoid_adr),
       "nbody_fluid_box": len(m.body_fluid_box_adr),
       "njnt_limited_slide_hinge": len(m.jnt_limited_slide_hinge_adr),

@@ -1590,6 +1590,11 @@ class Model:
     body_fluid_ellipsoid_adr: body ids with ellipsoid fluid  (nbody_fluid_ellipsoid,)
     body_fluid_box_adr: body ids with box fluid              (nbody_fluid_box,)
     body_freeadr: body ids of free bodies                    (nbodyfree,)
+    body_free_tenadr: start of each free body's tendons in    (nbodyfree,)
+                      body_free_tenid
+    body_free_tennum: number of tendons whose Jacobian        (nbodyfree,)
+                      sparsity touches the free body's dofs
+    body_free_tenid: tendon ids touching free bodies          (nbody_free_ten,)
     jnt_limited_slide_hinge_adr: limited/slide/hinge jntadr
     jnt_limited_ball_adr: limited/ball jntadr
     body_isdofancestor: precomputed mask of which DOFs affect each body
@@ -2129,6 +2134,9 @@ class Model:
   body_fluid_ellipsoid_adr: array("nbody_fluid_ellipsoid", int)
   body_fluid_box_adr: array("nbody_fluid_box", int)
   body_freeadr: array("nbodyfree", int)
+  body_free_tenadr: array("nbodyfree", int)
+  body_free_tennum: array("nbodyfree", int)
+  body_free_tenid: array("nbody_free_ten", int)
   jnt_limited_slide_hinge_adr: array("njnt_limited_slide_hinge", int)
   jnt_limited_ball_adr: array("njnt_limited_ball", int)
   body_isdofancestor: array("nbody", "nv_pad", int)
