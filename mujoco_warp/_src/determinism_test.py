@@ -290,6 +290,8 @@ _TREE_CASES = (
       "derivative._eff_add_tendon_qH_diag",
       "derivative._eff_mul_add_actuator",
       "derivative._eff_mul_add_tendon",
+      "derivative._eff_qH_add_actuator_offdiag",
+      "derivative._eff_qH_add_tendon_offdiag",
       "derivative._eff_tendon_shift",
       "solver._add_actuator_metric_dense",
       "solver._add_tendon_metric_dense",

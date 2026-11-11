@@ -86,9 +86,8 @@ def _create_solver_context(
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
-  alloc_solve_ld_scratch = (
-    alloc_mgrad and d.qLD.shape[1] > m.qLD_block_total and bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
-  )
+  has_sparse_factor = d.qLD.shape[1] > m.qLD_block_total or m.efm_qH_coupled
+  alloc_solve_ld_scratch = alloc_mgrad and has_sparse_factor and bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
 
   return SolverContext(
     Jaref=wp.empty((nworld, njmax), dtype=float),
@@ -3446,7 +3445,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       if m.nefmK > 0 or m.efm0_active or (m.opt.enableflags & types.EnableBit.SLEEP):
         derivative.eff_prec(m, d, ctx.Mgrad, ctx.grad, x_scratch=ctx.solve_ld_scratch)
       else:
-        smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, ctx.Mgrad, ctx.grad, x_scratch=ctx.solve_ld_scratch)
+        derivative.eff_solve_qH(m, d, ctx.Mgrad, ctx.grad, x_scratch=ctx.solve_ld_scratch)
     else:
       smooth.solve_m(m, d, ctx.Mgrad, ctx.grad, x_scratch=ctx.solve_ld_scratch)
   elif m.opt.solver == types.SolverType.NEWTON:

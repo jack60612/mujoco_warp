@@ -2226,6 +2226,99 @@ def _eff_add_fluid_qH(
   qH_out[worldid, madr] += efm_fluid_in[worldid, madr]
 
 
+@wp.kernel
+def _eff_qH_scatter_backbone(
+  # Model:
+  efm_qH_Madr: wp.array[int],
+  # Data in:
+  qH_in: wp.array2d[float],
+  # Data out:
+  efm_qH_out: wp.array2d[float],
+):
+  worldid, madr = wp.tid()
+  efm_qH_out[worldid, efm_qH_Madr[madr]] = qH_in[worldid, madr]
+
+
+@cache_kernel
+def _eff_qH_add_tendon_offdiag(max_ten_J_rownnz: int, deterministic: bool = False):
+  module_options = {"enable_backward": False}
+  if deterministic:
+    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+    module_options["deterministic_max_records"] = max_ten_J_rownnz
+
+  @wp.kernel(module="unique", module_options=module_options)
+  def kernel(
+    # Model:
+    ten_J_rownnz: wp.array[int],
+    ten_J_rowadr: wp.array[int],
+    ten_J_colind: wp.array[int],
+    efm_qH_rownnz: wp.array[int],
+    efm_qH_rowadr: wp.array[int],
+    efm_qH_colind: wp.array[int],
+    # Data in:
+    ten_J_in: wp.array2d[float],
+    efm_ts_in: wp.array2d[float],
+    # Data out:
+    efm_qH_out: wp.array2d[float],
+  ):
+    worldid, t, j = wp.tid()
+    ts = efm_ts_in[worldid, t]
+    rownnz = ten_J_rownnz[t]
+    if ts == 0.0 or j >= rownnz:
+      return
+    rowadr = ten_J_rowadr[t]
+    row = ten_J_colind[rowadr + j]
+    ts_v = ts * ten_J_in[worldid, rowadr + j]
+    # pairs (row, col < row) of the tendon's Jacobian; the backbone holds the diagonal
+    for k in range(rownnz):
+      col = ten_J_colind[rowadr + k]
+      if col < row:
+        adr = _find_csr_col(efm_qH_rowadr[row], efm_qH_rownnz[row], col, efm_qH_colind)
+        wp.atomic_add(efm_qH_out, worldid, adr, ts_v * ten_J_in[worldid, rowadr + k])
+
+  return kernel
+
+
+@cache_kernel
+def _eff_qH_add_actuator_offdiag(nv: int, deterministic: bool = False):
+  module_options = {"enable_backward": False}
+  if deterministic:
+    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+    module_options["deterministic_max_records"] = nv * (nv - 1) // 2
+
+  @wp.kernel(module="unique", module_options=module_options)
+  def kernel(
+    # Model:
+    efm_qH_rownnz: wp.array[int],
+    efm_qH_rowadr: wp.array[int],
+    efm_qH_colind: wp.array[int],
+    # Data in:
+    moment_rownnz_in: wp.array2d[int],
+    moment_rowadr_in: wp.array2d[int],
+    moment_colind_in: wp.array2d[int],
+    actuator_moment_in: wp.array2d[float],
+    efm_as_in: wp.array2d[float],
+    # Data out:
+    efm_qH_out: wp.array2d[float],
+  ):
+    worldid, a = wp.tid()
+    as_val = efm_as_in[worldid, a]
+    if as_val == 0.0:
+      return
+    rowadr = moment_rowadr_in[worldid, a]
+    rownnz = moment_rownnz_in[worldid, a]
+    for j in range(rownnz):
+      row = moment_colind_in[worldid, rowadr + j]
+      as_v = as_val * actuator_moment_in[worldid, rowadr + j]
+      for k in range(rownnz):
+        col = moment_colind_in[worldid, rowadr + k]
+        if col < row:
+          adr = _find_csr_col(efm_qH_rowadr[row], efm_qH_rownnz[row], col, efm_qH_colind)
+          wp.atomic_add(efm_qH_out, worldid, adr, as_v * actuator_moment_in[worldid, rowadr + k])
+
+  return kernel
+
+
 @cache_kernel
 def _eff_mul_fluid(check_skip: bool):
   @wp.kernel(module="unique", enable_backward=False, grid_stride=False)
@@ -3932,7 +4025,7 @@ def eff_shift(m: Model, d: Data):
 
 @event_scope
 def eff_actuation(m: Model, d: Data):
-  """Evaluates actuation-stage metric terms and factors the backbone qH."""
+  """Evaluates actuation-stage metric terms and factors the metric (efm_qH if coupled, else qH)."""
   if m.opt.integrator != IntegratorType.DISCRETE:
     return
 
@@ -4031,11 +4124,57 @@ def eff_actuation(m: Model, d: Data):
       outputs=[d.qH],
     )
 
+  if m.efm_qH_coupled:
+    # the metric with its tendon and actuator couplings (d.qH keeps the backbone, which the
+    # constraint regularization and the Newton Hessian read)
+    d.efm_qH.zero_()
+    wp.launch(_eff_qH_scatter_backbone, dim=(d.nworld, m.nC), inputs=[m.efm_qH_Madr, d.qH], outputs=[d.efm_qH])
+    wp.launch(
+      _eff_qH_add_tendon_offdiag(m.max_ten_J_rownnz if det_atomics else 0, det_atomics),
+      dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
+      inputs=[
+        m.ten_J_rownnz,
+        m.ten_J_rowadr,
+        m.ten_J_colind,
+        m.efm_qH_rownnz,
+        m.efm_qH_rowadr,
+        m.efm_qH_colind,
+        d.ten_J,
+        d.efm_ts,
+      ],
+      outputs=[d.efm_qH],
+    )
+    wp.launch(
+      _eff_qH_add_actuator_offdiag(m.nv if det_atomics else 0, det_atomics),
+      dim=(d.nworld, m.nactuator),
+      inputs=[
+        m.efm_qH_rownnz,
+        m.efm_qH_rowadr,
+        m.efm_qH_colind,
+        d.moment_rownnz,
+        d.moment_rowadr,
+        d.moment_colind,
+        d.actuator_moment,
+        d.efm_as,
+      ],
+      outputs=[d.efm_qH],
+    )
+    smooth._factor_i_sparse(m, d, d.efm_qH, d.efm_qHLD, d.qHDiagInv, coupled=True)
+    return
+
   # Factor qH into qHLD and qHDiagInv
   if m.M_tiles:
     smooth._factor_blocks(m, d, d.qH, d.qHLD, d.qHDiagInv)
   if d.qHLD.shape[1] > m.qLD_block_total:
     smooth._factor_i_sparse(m, d, d.qH, d.qHLD[:, m.qLD_block_total :], d.qHDiagInv)
+
+
+def eff_solve_qH(m: Model, d: Data, res: wp.array2d[float], vec: wp.array2d[float], x_scratch: Optional[wp.array] = None):
+  """Solves with the factored metric: efm_qH's factor when coupled, else the qH backbone's."""
+  if m.efm_qH_coupled:
+    smooth._solve_LD_sparse(m, d, d.efm_qHLD, d.qHDiagInv, res, vec, x_scratch=x_scratch, coupled=True)
+  else:
+    smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, vec, x_scratch=x_scratch)
 
 
 def eff_mul_m_scratch(m: Model, d: Data) -> tuple[Optional[tuple], Optional[tuple]]:
@@ -4587,7 +4726,7 @@ def eff_prec(
         inputs=[m.nv, m.efm_dofblk, vec],
         outputs=[res],
       )
-      smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res, x_scratch=x_scratch)
+      eff_solve_qH(m, d, res, res, x_scratch=x_scratch)
     wp.launch(
       _eff_prec_efm0_solve,
       dim=d.nworld,
@@ -4634,7 +4773,7 @@ def eff_prec(
     inputs=[m.nv, dofblk, vec],
     outputs=[res],
   )
-  smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res, x_scratch=x_scratch)
+  eff_solve_qH(m, d, res, res, x_scratch=x_scratch)
   wp.launch(
     _eff_block_solve,
     dim=(d.nworld, m.nefmdof),
@@ -4689,8 +4828,9 @@ def eff_solve(m: Model, d: Data, qacc: wp.array2d[float], qfrc: Optional[wp.arra
   has_flex_any = has_spring_or_damper and (
     m.nefmK > 0 or m.has_non_simple_flex or m.efm0_active or m.has_flex_passive or not m.flex_interp_assemblable
   )
-  if not has_flex_any and not has_efm_tendon and not has_efm_actuator:
-    smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, qacc, rhs)
+  # the factor is the exact metric without couplings, or with them when efm_qH holds them
+  if m.efm_qH_coupled or (not has_flex_any and not has_efm_tendon and not has_efm_actuator):
+    eff_solve_qH(m, d, qacc, rhs)
     if m.opt.enableflags & EnableBit.SLEEP:
       wp.launch(
         _zero_sleeping_dofs,

@@ -259,6 +259,202 @@ def _get_efm_data(mjm: mujoco.MjModel) -> mujoco.MjData | None:
   return d
 
 
+def _dof_chain(mjm: mujoco.MjModel, bodyid: int) -> list[int]:
+  """Dofs that move a body: its own and every ancestor's."""
+  while bodyid > 0 and mjm.body_dofnum[bodyid] == 0:
+    bodyid = mjm.body_parentid[bodyid]
+  if mjm.body_dofnum[bodyid] == 0:
+    return []
+  chain, dofid = [], mjm.body_dofadr[bodyid] + mjm.body_dofnum[bodyid] - 1
+  while dofid >= 0:
+    chain.append(int(dofid))
+    dofid = mjm.dof_parentid[dofid]
+  return chain
+
+
+def _efm_actuator_dofs(mjm: mujoco.MjModel, a: int) -> Optional[list[int]]:
+  """Dofs an actuator's moment can touch, None if they depend on the state (body transmission)."""
+  trntype, (id0, id1) = mjm.actuator_trntype[a], mjm.actuator_trnid[a]
+  if trntype in (mujoco.mjtTrn.mjTRN_JOINT, mujoco.mjtTrn.mjTRN_JOINTINPARENT):
+    jnt_dofnum = {mujoco.mjtJoint.mjJNT_FREE: 6, mujoco.mjtJoint.mjJNT_BALL: 3}.get(mjm.jnt_type[id0], 1)
+    return list(range(mjm.jnt_dofadr[id0], mjm.jnt_dofadr[id0] + jnt_dofnum))
+  if trntype == mujoco.mjtTrn.mjTRN_TENDON:
+    return list(mjm.ten_J_colind[mjm.ten_J_rowadr[id0] : mjm.ten_J_rowadr[id0] + mjm.ten_J_rownnz[id0]])
+  if trntype in (mujoco.mjtTrn.mjTRN_SITE, mujoco.mjtTrn.mjTRN_SLIDERCRANK):
+    dofs = _dof_chain(mjm, mjm.site_bodyid[id0])
+    if id1 >= 0:
+      dofs += _dof_chain(mjm, mjm.site_bodyid[id1])
+    return dofs
+  return None
+
+
+def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
+  """Elimination tree of the discrete integrator's metric with its tendon and actuator couplings.
+
+  The metric M + h*D + h^2*K couples every pair of dofs in a damped or stiff tendon's Jacobian and
+  in a metric actuator's moment. Under MuJoCo's reverse elimination (the last dof first), dof i's
+  factor row holds the dofs j < i it shares a coupling with, plus the fill of the dofs eliminated
+  before it; parent[i] is the largest of them. A factor whose rows hold every ancestor in this
+  tree has the prefix layout of M's own factor, so the tree factorization and back-substitution
+  apply unchanged.
+
+  Returns None (the backbone path) when the integrator is not discrete, flexes contribute metric
+  terms, an actuator's moment depends on the state (body transmission), or no tendon or actuator
+  couples two dofs.
+  """
+  if mjm.opt.integrator != mujoco.mjtIntegrator.mjINT_DISCRETE or mjm.nflex:
+    return None
+
+  groups = []
+  for t in range(mjm.ntendon):
+    has_metric = (
+      mjm.tendon_stiffness[t] != 0
+      or np.any(mjm.tendon_stiffnesspoly[t] != 0)
+      or mjm.tendon_damping[t] != 0
+      or np.any(mjm.tendon_dampingpoly[t] != 0)
+    )
+    if not has_metric:
+      has_metric = any(
+        mjm.actuator_trntype[a] == mujoco.mjtTrn.mjTRN_TENDON
+        and mjm.actuator_trnid[a, 0] == t
+        and (mjm.actuator_damping[a] != 0 or np.any(mjm.actuator_dampingpoly[a] != 0))
+        for a in range(mjm.nu)
+      )
+    if has_metric:
+      groups.append(mjm.ten_J_colind[mjm.ten_J_rowadr[t] : mjm.ten_J_rowadr[t] + mjm.ten_J_rownnz[t]])
+  metric_bias = (
+    mujoco.mjtBias.mjBIAS_AFFINE,
+    mujoco.mjtBias.mjBIAS_SO3,
+    mujoco.mjtBias.mjBIAS_DCMOTOR,
+    mujoco.mjtBias.mjBIAS_MUSCLE,
+  )
+  metric_gain = (
+    mujoco.mjtGain.mjGAIN_AFFINE,
+    mujoco.mjtGain.mjGAIN_SO3,
+    mujoco.mjtGain.mjGAIN_MUSCLE,
+    mujoco.mjtGain.mjGAIN_DCMOTOR,
+  )
+  for a in range(mjm.nu):
+    if mjm.actuator_biastype[a] in metric_bias or mjm.actuator_gaintype[a] in metric_gain:
+      dofs = _efm_actuator_dofs(mjm, a)
+      if dofs is None:
+        return None
+      groups.append(dofs)
+
+  groups = [np.unique(g) for g in groups if np.unique(g).size > 1]
+  if not groups:
+    return None
+
+  # lower[i]: dofs j < i coupled to i, by M's pattern or a shared tendon/actuator row
+  lower = [set() for _ in range(mjm.nv)]
+  for i in range(mjm.nv):
+    lower[i].update(int(j) for j in mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i] - 1])
+  for cols in groups:
+    for n in range(1, cols.size):
+      lower[cols[n]].update(int(j) for j in cols[:n])
+
+  # eliminating i connects its lower dofs, i.e. they join the lower set of its parent
+  parent = np.full(mjm.nv, -1, dtype=int)
+  for i in reversed(range(mjm.nv)):
+    if lower[i]:
+      parent[i] = max(lower[i])
+      lower[parent[i]].update(lower[i] - {parent[i]})
+  return parent
+
+
+def efm_qH_layout(mjm: mujoco.MjModel, parent: Optional[np.ndarray]) -> dict:
+  """Row layout and level-scheduled sparse L'*D*L updates of the coupled metric factor.
+
+  Row i holds every ancestor of i in the elimination tree `parent`, then i: the prefix layout of
+  M's factor, so the update lists follow put_model's qLD_* construction. Madr maps each element of
+  M's sparsity (and of qH, which shares it) to its address in the coupled layout.
+  """
+  if parent is None:
+    return {
+      "rownnz": np.zeros(mjm.nv, dtype=int),
+      "rowadr": np.zeros(mjm.nv, dtype=int),
+      "colind": np.zeros(0, dtype=int),
+      "Madr": np.zeros(mjm.nC, dtype=int),
+      "updates": (),
+      "all_updates": np.zeros((0, 3), dtype=int),
+      "level_offsets": [0],
+      "factor_elem": np.zeros((0, 4), dtype=int),
+      "factor_elem_offsets": [0],
+    }
+
+  depth = np.zeros(mjm.nv, dtype=int)
+  for i in range(mjm.nv):
+    depth[i] = depth[parent[i]] + 1 if parent[i] >= 0 else 0
+  rownnz = depth + 1
+  rowadr = np.concatenate(([0], np.cumsum(rownnz)[:-1]))
+  colind = np.zeros(rownnz.sum(), dtype=int)
+  for i in range(mjm.nv):
+    j, adr = i, rowadr[i] + rownnz[i] - 1
+    while j >= 0:
+      colind[adr] = j
+      j, adr = parent[j], adr - 1
+
+  Madr = np.zeros(mjm.nC, dtype=int)
+  for i in range(mjm.nv):
+    row = colind[rowadr[i] : rowadr[i] + rownnz[i]]
+    cols = mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]]
+    pos = np.searchsorted(row, cols)
+    assert np.array_equal(row[pos], cols), "M's sparsity must lie in the coupled metric's"
+    Madr[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]] = rowadr[i] + pos
+
+  # update (i, k, address of (k, i)) for every ancestor i of k, grouped by the depth of i
+  updates = {}
+  for k in range(mjm.nv):
+    i, Madr_ki = parent[k], rowadr[k] + rownnz[k] - 2
+    while i >= 0:
+      updates.setdefault(depth[i], []).append((i, k, Madr_ki))
+      i, Madr_ki = parent[i], Madr_ki - 1
+
+  all_updates, level_offsets, factor_elem, factor_elem_offsets = [], [0], [], [0]
+  for level in sorted(updates):
+    u = np.array(updates[level], dtype=int)
+    i, k, Madr_ki = u[:, 0], u[:, 1], u[:, 2]
+    n = rownnz[i]
+    j = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)
+    factor_elem.append(
+      np.stack(
+        (
+          np.repeat(rowadr[i], n) + j,
+          np.repeat(rowadr[k], n) + j,
+          np.repeat(Madr_ki, n),
+          np.repeat(rowadr[k] + rownnz[k] - 1, n),
+        ),
+        axis=1,
+      )
+    )
+    all_updates.append(u)
+    level_offsets.append(level_offsets[-1] + len(u))
+    factor_elem_offsets.append(factor_elem_offsets[-1] + n.sum())
+
+  return {
+    "rownnz": rownnz,
+    "rowadr": rowadr,
+    "colind": colind,
+    "Madr": Madr,
+    "updates": tuple(all_updates),
+    "all_updates": np.concatenate(all_updates) if all_updates else np.zeros((0, 3), dtype=int),
+    "level_offsets": level_offsets,
+    "factor_elem": np.concatenate(factor_elem) if factor_elem else np.zeros((0, 4), dtype=int),
+    "factor_elem_offsets": factor_elem_offsets,
+  }
+
+
+def efm_qH_nnz(mjm: mujoco.MjModel) -> int:
+  """Element count of the coupled metric factor, 0 without one (see efm_qH_parent)."""
+  parent = efm_qH_parent(mjm)
+  if parent is None:
+    return 0
+  depth = np.zeros(mjm.nv, dtype=int)
+  for i in range(mjm.nv):
+    depth[i] = depth[parent[i]] + 1 if parent[i] >= 0 else 0
+  return int((depth + 1).sum())
+
+
 def is_sparse(mjm: mujoco.MjModel) -> bool:
   if mjm.opt.jacobian == mujoco.mjtJacobian.mjJAC_AUTO:
     if mjm.nv > 32:
@@ -1206,6 +1402,23 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_level_offsets_host = tuple(level_offsets)
   m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
 
+  # Discrete integrator: layout of the metric factored with its tendon and actuator couplings
+  efm_parent = efm_qH_parent(mjm)
+  efm_lay = efm_qH_layout(mjm, efm_parent)
+  m.efm_qH_coupled = efm_parent is not None
+  m.efm_qH_rownnz = efm_lay["rownnz"]
+  m.efm_qH_rowadr = efm_lay["rowadr"]
+  m.efm_qH_colind = efm_lay["colind"]
+  m.efm_qH_Madr = efm_lay["Madr"]
+  m.efm_qH_updates = tuple(wp.array(u, dtype=wp.vec3i) for u in efm_lay["updates"])
+  m.efm_qH_all_updates = efm_lay["all_updates"]
+  m.efm_qH_level_offsets = efm_lay["level_offsets"]
+  m.efm_qH_factor_elem = efm_lay["factor_elem"]
+  m.efm_qH_factor_elem_offsets = efm_lay["factor_elem_offsets"]
+  m.efm_qH_level_offsets_host = tuple(int(x) for x in efm_lay["level_offsets"])
+  m.efm_qH_factor_elem_offsets_host = tuple(int(x) for x in efm_lay["factor_elem_offsets"])
+  m.efm_qH_block_adr = np.full(mjm.nv, types.Q_LD_BLOCK_SPARSE, dtype=int)
+
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
   # MuJoCo stores diagonal-only in the compact (M_rownnz, M_rowadr) layout
@@ -1432,6 +1645,10 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nqLD_all_updates": len(m.qLD_all_updates),
       "nqLD_level_offsets": len(m.qLD_level_offsets),
       "nqLD_factor_elem": len(m.qLD_factor_elem),
+      "nefm_qH": len(m.efm_qH_colind),
+      "nefm_qH_all_updates": len(m.efm_qH_all_updates),
+      "nefm_qH_level_offsets": len(m.efm_qH_level_offsets),
+      "nefm_qH_factor_elem": len(m.efm_qH_factor_elem),
       "nM_fullm": len(m.M_fullm_i),
       "nqD_fullm": len(m.qD_fullm_i),
       "nv_plus_1": len(m.M_mulm_rowadr),
@@ -2012,6 +2229,7 @@ def make_data(
   _lay = m_block_layout(mjm)
   qld_total = _lay["total"] + (mjm.nC if _lay["has_sparse"] else 0)
   sizes["qld_total"] = qld_total
+  sizes["nefm_qH"] = efm_qH_nnz(mjm)
 
   if njmax_nnz is None:
     if is_sparse(mjm):
@@ -2242,6 +2460,7 @@ def put_data(
   lay = m_block_layout(mjm)
   qld_total = lay["total"] + (mjm.nC if lay["has_sparse"] else 0)
   sizes["qld_total"] = qld_total
+  sizes["nefm_qH"] = efm_qH_nnz(mjm)
 
   if njmax_nnz is None:
     if is_sparse(mjm):

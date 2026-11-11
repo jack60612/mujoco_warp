@@ -1397,7 +1397,7 @@ def _qLD_multipliers_level(
   L_out[worldid, Madr_ki] = L_out[worldid, Madr_ki] / L_out[worldid, diag_k]
 
 
-def _factor_sparse_fused(m: Model, nworld: int) -> bool:
+def _factor_sparse_fused(m: Model, nworld: int, coupled: bool = False) -> bool:
   """Whether the fused kernel or per-level launches factor the sparse region faster.
 
   The fused kernel runs each world on one block, i.e. one SM, so its time is the world's element
@@ -1406,58 +1406,95 @@ def _factor_sparse_fused(m: Model, nworld: int) -> bool:
   with thousands of dofs) while most SMs would otherwise idle; see M_SPARSE_LEVEL_WIDTH_MIN.
   """
   device = wp.get_device()
-  nlevels = len(m.qLD_level_offsets_host) - 1
+  levels_host = m.efm_qH_level_offsets_host if coupled else m.qLD_level_offsets_host
+  elems_host = m.efm_qH_factor_elem_offsets_host if coupled else m.qLD_factor_elem_offsets_host
+  nlevels = len(levels_host) - 1
   if not device.is_cuda or nlevels == 0:
     return True
-  width = m.qLD_factor_elem_offsets_host[-1] / nlevels
+  width = elems_host[-1] / nlevels
   idle = 1.0 - 2.0 * nworld / device.sm_count
   return width * idle < M_SPARSE_LEVEL_WIDTH_MIN
 
 
-def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
+def _sparse_layout(m: Model, coupled: bool) -> tuple:
+  """Row and update arrays of M's sparse LDL region, or of the discrete coupled metric (efm_qH)."""
+  if coupled:
+    return (
+      m.efm_qH_rownnz,
+      m.efm_qH_rowadr,
+      m.efm_qH_block_adr,
+      m.efm_qH_updates,
+      m.efm_qH_all_updates,
+      m.efm_qH_level_offsets,
+      m.efm_qH_factor_elem,
+      m.efm_qH_factor_elem_offsets,
+      m.efm_qH_level_offsets_host,
+      m.efm_qH_factor_elem_offsets_host,
+    )
+  return (
+    m.M_rownnz,
+    m.M_rowadr,
+    m.qLD_block_adr,
+    m.qLD_updates,
+    m.qLD_all_updates,
+    m.qLD_level_offsets,
+    m.qLD_factor_elem,
+    m.qLD_factor_elem_offsets,
+    m.qLD_level_offsets_host,
+    m.qLD_factor_elem_offsets_host,
+  )
+
+
+def _factor_i_sparse(
+  m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float], coupled: bool = False
+):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd.
 
   The fused kernel or one launch per level for the element updates and one for the multipliers;
   both apply the element updates M(i,j) -= M(k,j) * M(k,i) / M(k,k) level by level. Deterministic
   atomics take v3.17's per-level launches, which read a copy of the previous level: the fused
   kernel reads its own atomics, and element launches would reserve scatter records per element.
+  `coupled` factors the discrete coupled metric's layout (efm_qH_*) instead of M's.
   """
+  rownnz, rowadr, _, updates, all_updates, level_offsets, factor_elem, factor_elem_offsets, levels, elems = _sparse_layout(
+    m, coupled
+  )
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = _factor_sparse_fused(m, d.nworld)
+  fused = _factor_sparse_fused(m, d.nworld, coupled)
   if not det_atomics:
-    kernel = _factor_i_sparse_fused(m.nv, len(m.qLD_updates)) if fused else _qLD_acc_level
+    kernel = _factor_i_sparse_fused(m.nv, len(updates)) if fused else _qLD_acc_level
     det_atomics = _deterministic_launch(kernel)
 
   if det_atomics:
     wp.copy(L, M)
     L_in = wp.empty_like(L)
-    for qLD_updates in reversed(m.qLD_updates):
+    for qLD_updates in reversed(updates):
       wp.copy(L_in, L)
       wp.launch(
         _qLD_acc(m.nv, True),
         dim=(d.nworld, qLD_updates.size),
-        inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L_in],
+        inputs=[rownnz, rowadr, qLD_updates, L_in],
         outputs=[L],
       )
       wp.launch(
         _qLD_scale,
         dim=(d.nworld, qLD_updates.size),
-        inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L_in],
+        inputs=[rownnz, rowadr, qLD_updates, L_in],
         outputs=[L],
       )
-    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
+    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[rownnz, rowadr, L], outputs=[D])
   elif fused:
     dim_block = m.block_dim.factor_i_sparse_fused if wp.get_device().is_cuda else 1
     wp.launch(
       kernel,
       dim=(d.nworld, dim_block),
       inputs=[
-        m.M_rownnz,
-        m.M_rowadr,
-        m.qLD_all_updates,
-        m.qLD_level_offsets,
-        m.qLD_factor_elem,
-        m.qLD_factor_elem_offsets,
+        rownnz,
+        rowadr,
+        all_updates,
+        level_offsets,
+        factor_elem,
+        factor_elem_offsets,
         M,
       ],
       outputs=[L, D],
@@ -1465,21 +1502,20 @@ def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[floa
     )
   else:
     wp.copy(L, M)
-    levels, elems = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host
     for level in reversed(range(len(levels) - 1)):
       wp.launch(
         _qLD_acc_level,
         dim=(d.nworld, elems[level + 1] - elems[level]),
-        inputs=[m.qLD_factor_elem, elems[level]],
+        inputs=[factor_elem, elems[level]],
         outputs=[L],
       )
       wp.launch(
         _qLD_multipliers_level,
         dim=(d.nworld, levels[level + 1] - levels[level]),
-        inputs=[m.M_rownnz, m.M_rowadr, m.qLD_all_updates, levels[level]],
+        inputs=[rownnz, rowadr, all_updates, levels[level]],
         outputs=[L],
       )
-    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
+    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[rownnz, rowadr, L], outputs=[D])
 
 
 @cache_kernel
@@ -3855,17 +3891,20 @@ def _solve_LD_sparse(
   x: wp.array2d[float],
   y: wp.array2d[float],
   x_scratch: Optional[wp.array] = None,
+  coupled: bool = False,
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y.
 
   Deterministic atomics take the per-level launches, as the fused kernel reads its own atomics.
+  `coupled` solves with the discrete coupled metric's layout (efm_qH_*) instead of M's.
   """
+  _, _, block_adr, updates, all_updates, level_offsets, _, _, _, _ = _sparse_layout(m, coupled)
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = None if det_atomics else _solve_LD_sparse_fused(m.nv, len(m.qLD_updates))
+  fused = None if det_atomics else _solve_LD_sparse_fused(m.nv, len(updates))
   if fused is None or _deterministic_launch(fused):
     x_in = x_scratch if x_scratch is not None else wp.empty_like(x)
-    wp.launch(_solve_LD_sparse_copy, dim=(d.nworld, m.nv), inputs=[m.qLD_block_adr, y], outputs=[x])
-    for qLD_updates in reversed(m.qLD_updates):
+    wp.launch(_solve_LD_sparse_copy, dim=(d.nworld, m.nv), inputs=[block_adr, y], outputs=[x])
+    for qLD_updates in reversed(updates):
       wp.copy(x_in, x)
       wp.launch(
         _solve_LD_sparse_level(True, True),
@@ -3873,8 +3912,8 @@ def _solve_LD_sparse(
         inputs=[L, qLD_updates, x_in],
         outputs=[x],
       )
-    wp.launch(_solve_LD_sparse_diag, dim=(d.nworld, m.nv), inputs=[m.qLD_block_adr, D, x], outputs=[x])
-    for qLD_updates in m.qLD_updates:
+    wp.launch(_solve_LD_sparse_diag, dim=(d.nworld, m.nv), inputs=[block_adr, D, x], outputs=[x])
+    for qLD_updates in updates:
       wp.copy(x_in, x)
       wp.launch(
         _solve_LD_sparse_level(False, True),
@@ -3893,7 +3932,7 @@ def _solve_LD_sparse(
   wp.launch(
     fused,
     dim=(d.nworld, dim_block),
-    inputs=[m.qLD_block_adr, L, D, m.qLD_all_updates, m.qLD_level_offsets, y],
+    inputs=[block_adr, L, D, all_updates, level_offsets, y],
     outputs=[x],
     block_dim=dim_block,
   )
