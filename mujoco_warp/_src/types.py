@@ -1026,11 +1026,14 @@ class Option:
                                    and tendon damping couplings outside the kinematic-tree
                                    sparsity of M (e.g. between trees) to the implicitfast
                                    velocity solve; 0 (default) keeps the native tree-sparse solve
-    skip_unconstrained_trees: CG with warmstart (non-discrete integrators): kinematic trees without
-                              constraint rows (MuJoCo's unconstrained islands) take one
-                              iterative-refinement step from qacc_smooth at the solver start and
-                              are then skipped by the iterations (gradient, M^-1 solve,
-                              M @ search); False (default) iterates every dof
+    skip_unconstrained_trees: CG with warmstart: kinematic trees without constraint rows
+                              (MuJoCo's unconstrained islands) take one iterative-refinement
+                              step from qacc_smooth at the solver start and are then skipped by
+                              the iterations (gradient, M^-1 solve, M @ search); under the
+                              discrete integrator, trees that the metric couples (Model.
+                              tree_coupledid) are skipped only together, and only where the
+                              metric is solved directly (no flex or body-transmission metric
+                              terms); False (default) iterates every dof
     warn_overflow: overflow warning bitmask (OverflowType)
     deterministic: determinism bitmask (DeterminismType)
   """
@@ -1705,6 +1708,9 @@ class Model:
                               then the number of segments
     qLD_solve_target_long: first segment of each up-pass, then down-pass level with more than
                            M_SPARSE_SEGMENT_SERIAL_MAX indices
+    tree_coupledid: smallest id of the trees the acceleration metric couples to each tree
+                    (with the discrete metric's tendon and actuator couplings; every tree 0
+                    when those are not known statically) (ntree,)
     efm_qH_coupled: discrete integrator factors the metric with its tendon and actuator
                     couplings (efm_qH_* layout) instead of the qH backbone
     efm_qH_rownnz: coupled metric factor row lengths (every elimination-tree ancestor) (nv,)
@@ -2278,6 +2284,7 @@ class Model:
   qLD_solve_target_adr: array("nqLD_solve_target_adr", int)
   qLD_solve_target_offsets: array("nqLD_solve_target_offsets", int)
   qLD_solve_target_long: array("nqLD_solve_target_long", int)
+  tree_coupledid: array("ntree", int)
   efm_qH_coupled: bool
   efm_qH_rownnz: array("nv", int)
   efm_qH_rowadr: array("nv", int)

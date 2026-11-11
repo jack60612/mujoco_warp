@@ -428,6 +428,36 @@ def _efm_coupling_groups(mjm: mujoco.MjModel) -> Optional[list[np.ndarray]]:
   return [g for g in groups if g.size > 1]
 
 
+def tree_coupledid(mjm: mujoco.MjModel) -> np.ndarray:
+  """Per kinematic tree, the smallest id of the trees its acceleration metric couples it to.
+
+  The metric is M, under the discrete integrator M + h*D + h^2*K with its tendon and actuator
+  couplings. A set of coupled trees that no active constraint row touches decouples from the
+  constrained problem, so its constrained solution is qacc_smooth. Every tree gets id 0 (one set)
+  when the discrete metric's couplings are not known statically (see _efm_coupling_groups).
+  """
+  groups = [mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]] for i in range(mjm.nv)]
+  if mjm.opt.integrator == mujoco.mjtIntegrator.mjINT_DISCRETE:
+    efm_groups = _efm_coupling_groups(mjm)
+    if efm_groups is None:
+      return np.zeros(mjm.ntree, dtype=int)
+    groups += efm_groups
+
+  root = np.arange(mjm.ntree)
+
+  def find(t):
+    while root[t] != t:
+      t = root[t]
+    return t
+
+  for cols in groups:
+    trees = {find(int(mjm.dof_treeid[c])) for c in cols}
+    low = min(trees, default=0)
+    for t in trees:
+      root[t] = low
+  return np.array([find(t) for t in range(mjm.ntree)], dtype=int)
+
+
 def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
   """Elimination tree of the discrete integrator's metric with its tendon and actuator couplings.
 
@@ -1558,6 +1588,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_solve_target_adr = targets["solve_target_adr"]
   m.qLD_solve_target_offsets = targets["solve_target_offsets"]
   m.qLD_solve_target_long = targets["solve_target_long"]
+
+  # trees that the solver starts together (row-free sets start at qacc_smooth)
+  m.tree_coupledid = tree_coupledid(mjm)
 
   # Discrete integrator: layout of the metric factored with its tendon and actuator couplings
   efm_parent = efm_qH_parent(mjm)

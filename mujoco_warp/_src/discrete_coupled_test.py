@@ -28,6 +28,7 @@ from mujoco_warp import test_data
 from mujoco_warp._src import derivative
 from mujoco_warp._src import io
 from mujoco_warp._src import smooth
+from mujoco_warp._src import solver
 from mujoco_warp._src import types
 from mujoco_warp._src.types import DeterminismType
 
@@ -164,6 +165,34 @@ def _assembled_metric(m, d) -> np.ndarray:
     for adr in range(rowadr[i], rowadr[i] + rownnz[i]):
       dense[:, i, colind[adr]] = dense[:, colind[adr], i] = efm_qH[:, adr]
   return dense
+
+
+def _arm_xml() -> str:
+  """The branch and fruit plus a hinge `arm` and a hinge `link` joined by a stiff fixed tendon.
+
+  Only the arm carries a row (dof friction): {arm, link} is the constrained set of trees, while the
+  branch and both fruit (coupled to each other by the stem tendons) carry no row.
+  """
+  robot = """
+    <body name="arm" pos="2 0 1">
+      <joint name="arm" type="hinge" axis="0 1 0" frictionloss=".05" damping=".1"/>
+      <geom fromto="0 0 0 .3 0 0" mass=".4"/>
+    </body>
+    <body name="link" pos="3 0 1">
+      <joint name="link" type="hinge" axis="0 1 0"/>
+      <geom fromto="0 0 0 .2 0 0" mass=".2"/>
+    </body>
+    """
+  return (
+    _xml(False)
+    .replace("  </worldbody>", robot + "  </worldbody>")
+    .replace(
+      "  </tendon>",
+      '    <fixed stiffness="50" damping="1"><joint joint="arm" coef="1"/><joint joint="link" coef="-1"/></fixed>\n  </tendon>',
+    )
+    .replace(f'qpos="{_TREE_QPOS}  {_FRUIT_QPOS}"', f'qpos="{_TREE_QPOS}  {_FRUIT_QPOS}  .3 -.2"')
+    .replace(f'qvel="{_TREE_QVEL}  {_FRUIT_QVEL}"', f'qvel="{_TREE_QVEL}  {_FRUIT_QVEL}  1.5 -.5"')
+  )
 
 
 class DiscreteCoupledFactorTest(parameterized.TestCase):
@@ -339,6 +368,93 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     )
     self.assertIsNone(io.efm_qH_parent(uncoupled))
     self.assertFalse(mjw.put_model(uncoupled).efm_qH_coupled)
+
+  @parameterized.product(
+    solver_=(mujoco.mjtSolver.mjSOL_CG, mujoco.mjtSolver.mjSOL_NEWTON),
+    coupled=(True, False),
+  )
+  def test_row_free_coupled_trees_start_at_qacc_smooth(self, solver_, coupled):
+    """Trees the metric couples start together, at qacc_smooth when no active row touches them."""
+    # the branch and both fruit carry no rows; {arm, link} is the constrained set (see _arm_xml)
+    xml = _arm_xml()
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjm.opt.solver = solver_
+    plant = [0, 1, 2]  # branch, fruit_a, fruit_b
+    arm, link = mjm.ntree - 2, mjm.ntree - 1
+    coupledid = io.tree_coupledid(mjm)
+    np.testing.assert_array_equal(coupledid, [0, 0, 0, arm, arm])
+    implicitfast = mujoco.MjModel.from_xml_string(xml.replace('integrator="discrete"', 'integrator="implicitfast"'))
+    np.testing.assert_array_equal(io.tree_coupledid(implicitfast), np.arange(mjm.ntree))
+
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_resetDataKeyframe(mjm, mjd, 0)
+    mujoco.mj_forward(mjm, mjd)
+    mjd.qacc_warmstart[:] = 1.0  # far from the solution in every tree
+    free = np.isin(mjm.dof_treeid, plant)
+    rowset = np.isin(mjm.dof_treeid, [arm, link])
+
+    # no iterations: the start itself
+    mjm.opt.iterations = 0
+    m = mjw.put_model(mjm)
+    m.efm_qH_coupled = coupled and m.efm_qH_coupled
+    d = mjw.put_data(mjm, mjd)
+    mjw.forward(m, d)
+    self.assertEqual(int(d.nefc.numpy()[0]), 1)
+    qacc, qacc_smooth = d.qacc.numpy()[0], d.qacc_smooth.numpy()[0]
+    np.testing.assert_array_equal(qacc[free], qacc_smooth[free])
+    np.testing.assert_array_equal(qacc[rowset], 1.0)
+
+    # converged, the solve matches MuJoCo
+    mjm.opt.iterations = 100
+    mjm.opt.ls_iterations = 50
+    m = mjw.put_model(mjm)
+    m.efm_qH_coupled = coupled and m.efm_qH_coupled
+    d = mjw.put_data(mjm, mjd)
+    mjw.forward(m, d)
+    mujoco.mj_forward(mjm, mjd)
+    scale = np.max(np.abs(mjd.qacc))
+    np.testing.assert_allclose(d.qacc.numpy()[0], mjd.qacc, rtol=1e-3, atol=1e-4 * scale)
+
+  @parameterized.parameters(True, False)
+  def test_skip_unconstrained_trees_iterates_coupled_set(self, coupled):
+    """CG skips the row-free branch and fruit set but iterates {arm, link} together, as skip off."""
+    mjm = mujoco.MjModel.from_xml_string(_arm_xml())
+    mjm.opt.solver = mujoco.mjtSolver.mjSOL_CG
+    mjm.opt.iterations = 100
+    mjm.opt.ls_iterations = 50
+    mjd = mujoco.MjData(mjm)
+    mujoco.mj_resetDataKeyframe(mjm, mjd, 0)
+    mujoco.mj_forward(mjm, mjd)
+    mjd.qacc_warmstart[:] = 1.0  # far from the solution in every tree
+    set_tree_mask = solver._set_tree_mask
+
+    qacc, masks = {}, []
+    for skip in (False, True):
+
+      def record(m, d, ctx, tree_constrained):
+        set_tree_mask(m, d, ctx, tree_constrained)
+        masks.append(ctx.tree_active.numpy().copy())
+
+      m = mjw.put_model(mjm)
+      m.efm_qH_coupled = coupled and m.efm_qH_coupled
+      m.opt.skip_unconstrained_trees = skip
+      d = mjw.put_data(mjm, mjd)
+      with mock.patch.object(solver, "_set_tree_mask", record):
+        mjw.forward(m, d)
+      qacc[skip] = d.qacc.numpy()[0]
+      self.assertEqual(int(d.nefc.numpy()[0]), 1)
+
+    # with the coupled factor only the skip run restricted the iterations: the coupled set
+    # {arm, link} is active as a whole (link has no row of its own), the branch and fruit set is
+    # skipped. The PCG path preconditions the metric only, so it ignores the option.
+    self.assertEqual(len(masks), 1 if coupled else 0)
+    if coupled:
+      np.testing.assert_array_equal(masks[0], [[0, 0, 0, 1, 1]])
+    mujoco.mj_forward(mjm, mjd)
+    scale = np.max(np.abs(mjd.qacc))
+    np.testing.assert_allclose(qacc[False], mjd.qacc, rtol=1e-3, atol=1e-4 * scale)
+    np.testing.assert_allclose(qacc[True], mjd.qacc, rtol=1e-3, atol=1e-4 * scale)
+    np.testing.assert_allclose(qacc[True], qacc[False], rtol=1e-3, atol=1e-4 * scale)
 
 
 class DiscreteCoupledRolloutTest(parameterized.TestCase):

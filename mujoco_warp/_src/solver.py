@@ -1707,13 +1707,31 @@ def _refine_unconstrained_trees(
   ctx_Mgrad_out[worldid, dofid] = 0.0
 
 
+@wp.kernel
+def _expand_constrained_trees(
+  # Model:
+  tree_coupledid: wp.array[int],
+  # In:
+  tree_constrained_in: wp.array2d[int],
+  # Out:
+  tree_constrained_out: wp.array2d[int],
+):
+  worldid, treeid = wp.tid()
+  # Called with the same array for both: a set of metric-coupled trees is flagged on its smallest
+  # tree (_mark_constrained_trees) that no thread of the set writes, so every tree of a constrained
+  # set becomes constrained without a race.
+  tree_constrained_out[worldid, treeid] = tree_constrained_in[worldid, tree_coupledid[treeid]]
+
+
 def _set_tree_mask(m: types.Model, d: types.Data, ctx: SolverContext, tree_constrained: wp.array):
   """Restricts the CG iterations to trees with rows (`ctx.tree_active`, `ctx.sparse_active`)."""
   sparse_active = wp.zeros((d.nworld,), dtype=int)
+  # the coupled discrete metric's factor holds every dof in its sparse region
+  coupled = m.opt.integrator == types.IntegratorType.DISCRETE and m.efm_qH_coupled
   wp.launch(
     _mark_sparse_active,
     dim=(d.nworld, m.ntree),
-    inputs=[m.tree_dofadr, m.tree_dofnum, m.qLD_block_adr, tree_constrained],
+    inputs=[m.tree_dofadr, m.tree_dofnum, m.efm_qH_block_adr if coupled else m.qLD_block_adr, tree_constrained],
     outputs=[sparse_active],
   )
   ctx.tree_active = tree_constrained
@@ -1727,6 +1745,7 @@ def _mark_constrained_trees(is_sparse: bool):
     # Model:
     nv: int,
     dof_treeid: wp.array[int],
+    tree_coupledid: wp.array[int],
     # Data in:
     nefc_in: wp.array[int],
     efc_J_rownnz_in: wp.array2d[int],
@@ -1744,11 +1763,11 @@ def _mark_constrained_trees(is_sparse: bool):
     if wp.static(is_sparse):
       rowadr = efc_J_rowadr_in[worldid, efcid]
       for i in range(efc_J_rownnz_in[worldid, efcid]):
-        tree_constrained_out[worldid, dof_treeid[efc_J_colind_in[worldid, 0, rowadr + i]]] = 1
+        tree_constrained_out[worldid, tree_coupledid[dof_treeid[efc_J_colind_in[worldid, 0, rowadr + i]]]] = 1
     else:
       for dofid in range(nv):
         if efc_J_in[worldid, efcid, dofid] != 0.0:
-          tree_constrained_out[worldid, dof_treeid[dofid]] = 1
+          tree_constrained_out[worldid, tree_coupledid[dof_treeid[dofid]]] = 1
 
   return kernel
 
@@ -1763,6 +1782,7 @@ def _solve_init_dof(warmstart: bool, sparse: bool, free_tree_start: bool):
   def kernel(
     # Model:
     dof_treeid: wp.array[int],
+    tree_coupledid: wp.array[int],
     # Data in:
     nefc_in: wp.array[int],
     qacc_warmstart_in: wp.array2d[float],
@@ -1780,8 +1800,9 @@ def _solve_init_dof(warmstart: bool, sparse: bool, free_tree_start: bool):
       if nefc_in[worldid] > 0:
         qacc = qacc_warmstart_in[worldid, dofid]
         if wp.static(FREE_TREE_START):
-          # no active row touches this tree: its constrained solution is qacc_smooth
-          if tree_constrained_in[worldid, dof_treeid[dofid]] == 0:
+          # no active row touches this tree or a tree its metric couples it to: its constrained
+          # solution is qacc_smooth
+          if tree_constrained_in[worldid, tree_coupledid[dof_treeid[dofid]]] == 0:
             qacc = qacc_smooth_in[worldid, dofid]
       qacc_out[worldid, dofid] = qacc
     else:
@@ -3595,7 +3616,9 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       if m.nefmK > 0 or m.efm0_active or (m.opt.enableflags & types.EnableBit.SLEEP):
         derivative.eff_prec(m, d, ctx.Mgrad, ctx.grad)
       else:
-        derivative.eff_solve_qH(m, d, ctx.Mgrad, ctx.grad, done=ctx.done)
+        derivative.eff_solve_qH(
+          m, d, ctx.Mgrad, ctx.grad, done=ctx.done, tree_active=ctx.tree_active, sparse_active=ctx.sparse_active
+        )
     else:
       smooth.solve_m(m, d, ctx.Mgrad, ctx.grad, done=ctx.done, tree_active=ctx.tree_active, sparse_active=ctx.sparse_active)
   elif m.opt.solver == types.SolverType.NEWTON:
@@ -4303,18 +4326,19 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     ctx.efm_con, ctx.flex_scratch = derivative.eff_mul_m_scratch(m, d)
 
   warmstart = not (m.opt.disableflags & types.DisableBit.WARMSTART)
-  # A kinematic tree that no active row touches has qacc_smooth as its constrained solution
-  # whenever M does not couple it to a constrained tree, so start such trees there instead of
-  # at the warmstart. Either start converges to the same solution. Compact solves keep the
-  # plain warmstart, and so does the discrete integrator: its effective metric can couple trees
-  # through tendon and actuator terms, so a row-free tree's solution need not be qacc_smooth.
-  free_tree_start = warmstart and not compact and m.ntree > 1 and m.opt.integrator != types.IntegratorType.DISCRETE
+  # A set of kinematic trees that the acceleration metric couples (tree_coupledid; under the
+  # discrete integrator, M + h*D + h^2*K with its tendon and actuator couplings) and that no active
+  # row touches has qacc_smooth as its constrained solution, so start such trees there instead of
+  # at the warmstart. Either start converges to the same solution, but CG would otherwise
+  # re-converge the stale warmstart of these trees through the line search it shares with the
+  # constrained trees. Compact solves keep the plain warmstart.
+  free_tree_start = warmstart and not compact and m.ntree > 1
   if free_tree_start:
     tree_constrained = wp.zeros((d.nworld, m.ntree), dtype=int)
     wp.launch(
       _mark_constrained_trees(m.is_sparse),
       dim=(d.nworld, d.njmax),
-      inputs=[m.nv, m.dof_treeid, d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J],
+      inputs=[m.nv, m.dof_treeid, m.tree_coupledid, d.nefc, d.efc.J_rownnz, d.efc.J_rowadr, d.efc.J_colind, d.efc.J],
       outputs=[tree_constrained],
     )
   else:
@@ -4322,7 +4346,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse, free_tree_start),
     dim=(d.nworld, m.nv),
-    inputs=[m.dof_treeid, d.nefc, d.qacc_warmstart, d.qacc_smooth, tree_constrained],
+    inputs=[m.dof_treeid, m.tree_coupledid, d.nefc, d.qacc_warmstart, d.qacc_smooth, tree_constrained],
     outputs=[d.qacc, d.qfrc_constraint],
   )
   if m.opt.integrator == types.IntegratorType.DISCRETE and (m.opt.enableflags & types.EnableBit.SLEEP):
@@ -4336,11 +4360,25 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   #  context
   init_context(m, d, ctx, grad=False, compact=compact)
   _update_gradient(m, d, ctx, compact=compact)
-  if m.opt.skip_unconstrained_trees and free_tree_start and m.opt.solver == types.SolverType.CG:
+  discrete = m.opt.integrator == types.IntegratorType.DISCRETE
+  # The refinement below is exact only where the M^-1 solve inverts the metric: not for the discrete
+  # metric's flex or body-transmission terms, which the solve only preconditions.
+  skip_trees = m.opt.skip_unconstrained_trees and free_tree_start and m.opt.solver == types.SolverType.CG
+  skip_trees = skip_trees and (not discrete or derivative.eff_solve_direct(m))
+  if skip_trees:
     # Trees without rows (MuJoCo's unconstrained islands) start at qacc_smooth, their solution.
     # Their init gradient is the float32 solve's residual M @ qacc_smooth - qfrc_smooth: take one
     # iterative-refinement step there and give the integrators their exact force qfrc_smooth,
     # then restrict the iterations (gradient, M^-1 solve, M @ search) to the constrained trees.
+    # Under the discrete integrator a set of trees that the metric couples is constrained or not as
+    # one: tree_coupledid flagged it on its smallest tree, and every tree of the set takes the flag.
+    if discrete:
+      wp.launch(
+        _expand_constrained_trees,
+        dim=(d.nworld, m.ntree),
+        inputs=[m.tree_coupledid, tree_constrained],
+        outputs=[tree_constrained],
+      )
     wp.launch(
       _refine_unconstrained_trees,
       dim=(d.nworld, m.nv),
