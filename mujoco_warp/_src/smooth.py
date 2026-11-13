@@ -3535,6 +3535,23 @@ def _deterministic_records_per_thread(kernel, device, block_dim: int) -> int:
   return max(max(counts), int(options.get("deterministic_max_records", 0) or 0))
 
 
+def _deterministic_forward_records_per_thread(kernel, device, block_dim: int) -> int:
+  """Smallest per-thread record reservation over the forward scatter targets of `kernel`.
+
+  Warp sizes each target's pool as launch threads x max(target records, deterministic_max_records);
+  0 if the launch is not deterministic or has no forward scatter targets.
+  """
+  options = kernel.module.options
+  if options.get("deterministic", wp.config.deterministic) == wp.DeterministicMode.NOT_GUARANTEED:
+    return 0
+  meta = kernel.module.load(device, block_dim).get_kernel_hooks(kernel).det_launch_meta
+  if meta is None:
+    return 0
+  floor = int(options.get("deterministic_max_records", 0) or 0)
+  counts = [max(int(count), floor) for target, count in meta.scatter_records_per_thread.items() if target.use_forward]
+  return min(counts, default=0)
+
+
 def deterministic_rhs_per_launch(records_per_thread: int, threads_per_rhs: int, nrhs: int) -> int:
   """Right-hand sides per launch of an atomic batched kernel.
 

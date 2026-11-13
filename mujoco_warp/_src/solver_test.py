@@ -15,6 +15,9 @@
 
 """Tests for solver functions."""
 
+from contextlib import nullcontext
+from unittest import mock
+
 import mujoco
 import numpy as np
 import warp as wp
@@ -28,6 +31,7 @@ from mujoco_warp import test_data
 from mujoco_warp._src import island
 from mujoco_warp._src import solver
 from mujoco_warp._src import types
+from mujoco_warp._src import warp_util
 
 # tolerance for difference between MuJoCo and MJWarp solver calculations - mostly
 # due to float precision
@@ -1637,6 +1641,88 @@ class CompactSolverTest(absltest.TestCase):
       1e-5,
       f"qfrc_constraint should be zeroed, but got max abs: {np.max(np.abs(qfrc_constraint_post))}",
     )
+
+
+class DeterministicJTDAJTest(absltest.TestCase):
+  """Sparse JTDAJ Hessian launches sized to Warp's deterministic scatter record pool."""
+
+  def setUp(self):
+    super().setUp()
+    if not wp.is_cuda_available():
+      self.skipTest("CUDA is unavailable")
+
+  def test_groups_cover_record_pool(self):
+    """Deterministic slots never exceed the default and keep room for every emitted record."""
+    with wp.ScopedDevice("cuda:0"):
+      for njmax, entries, records in ((233, 666, 666), (4096, 666, 666), (233, 21, 1), (64, 2080, 3)):
+        default = solver._jtdaj_groups_per_world(1, njmax)
+        self.assertEqual(solver._jtdaj_groups_per_world(1, njmax, entries, 0), default)
+        slots = solver._jtdaj_groups_per_world(1, njmax, entries, records)
+        self.assertLessEqual(slots, default)
+        if slots < default:
+          self.assertGreaterEqual(slots * solver._JTDAJ_THREADS_PER_GROUP * records, njmax * entries)
+      # 233 rows of at most 666 entries fit 8 warps of 666-record threads instead of 233.
+      self.assertEqual(solver._jtdaj_groups_per_world(1, 233, 666, 666), min(8, solver._jtdaj_groups_per_world(1, 233)))
+
+  def test_run_to_run_solve_matches_and_shrinks_captured_buffers(self):
+    """RUN_TO_RUN sparse Newton solves match the default sizing with smaller captured buffers."""
+    bodies = "".join(
+      f'<body pos="{(i % 4) * 0.25 - 0.4:.3f} {(i // 4) * 0.25 - 0.3:.3f} 0.020">'
+      f'<freejoint/><geom type="box" size="0.04 0.05 0.03" mass="0.5" condim="{(3, 4, 6)[i % 3]}"/></body>'
+      for i in range(12)
+    )
+    xml = f"""
+    <mujoco>
+      <option cone="elliptic" solver="Newton" jacobian="sparse" iterations="20" ls_iterations="20" integrator="implicitfast"/>
+      <worldbody>
+        <geom name="floor" type="plane" size="5 5 .1" friction="1 0.01 0.001" condim="1"/>
+        {bodies}
+      </worldbody>
+    </mujoco>
+    """
+    mjm, mjd, m, _ = test_data.fixture(xml=xml)
+    self.assertTrue(m.is_sparse)
+    mjd.qvel[0::6] = 1.5
+    mujoco.mj_forward(mjm, mjd)
+    self.assertGreater(mjd.nefc, 0)
+
+    launches = []
+    real_launch = wp.launch
+
+    def recording_launch(kernel, dim, *args, **kwargs):
+      if kernel.key.startswith("_JTDACJ_sparse"):
+        launches.append(dim[1])
+      return real_launch(kernel, dim, *args, **kwargs)
+
+    def solve(default_sizing: bool):
+      d = mjw.put_data(mjm, mjd)
+      launches.clear()
+      with mock.patch.object(solver, "_jtdaj_records_per_thread", return_value=0) if default_sizing else nullcontext():
+        mjw.solve(m, d)  # eager: Warp raises on deterministic record overflow
+        qacc = d.qacc.numpy().copy()
+        before = wp.get_mempool_used_mem_current()
+        with wp.ScopedCapture() as capture:
+          mjw.solve(m, d)
+        retained = wp.get_mempool_used_mem_current() - before
+        del capture
+      return qacc, retained, launches[0]
+
+    with (
+      wp.ScopedDevice("cuda:0"),
+      mock.patch.object(wp.config, "deterministic", wp.DeterministicMode.RUN_TO_RUN),
+      # Newton's per-thread bound for MJWarp's generated kernels: every entry of a full-width row.
+      mock.patch.object(wp.config, "deterministic_max_records", m.nv * (m.nv + 1) // 2),
+      mock.patch.object(warp_util, "_KERNEL_CACHE", {}),
+      mock.patch.object(wp, "launch", recording_launch),
+    ):
+      qacc_default, retained_default, slots_default = solve(default_sizing=True)
+      qacc, retained, slots = solve(default_sizing=False)
+
+    self.assertLess(slots, slots_default)
+    # Binned deterministic sums do not depend on the record order; other modules keep float atomics.
+    np.testing.assert_allclose(qacc, qacc_default, rtol=1e-4, atol=1e-4)
+    _assert_eq(qacc[0], mjd.qacc, "qacc")
+    self.assertLess(retained, retained_default)
 
 
 if __name__ == "__main__":
