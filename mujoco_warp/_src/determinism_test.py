@@ -300,9 +300,12 @@ _TREE_CASES = (
     # per element and factored and solved with the sparse tree launches
     owned=("derivative._eff_qH_assemble", "smooth._qLD_acc_level_owned", "smooth._solve_LD_sparse_fused_owned"),
   ),
+  # The discrete CG warm start (previous constraint force) leaves CG to stop on its relative-
+  # improvement test, whose stop iteration depends on summation order; converge it so NONE and
+  # ATOMICS agree.
   dict(
     testcase_name="discrete_cg",
-    overrides={"opt.integrator": "DISCRETE", "opt.solver": "CG"},
+    overrides={"opt.integrator": "DISCRETE", "opt.solver": "CG", "opt.tolerance": "1e-12", "opt.iterations": 200},
     covers=(),
     owned=("derivative._eff_qH_assemble", "smooth._qLD_acc_level_owned", "smooth._solve_LD_sparse_fused_owned"),
   ),
