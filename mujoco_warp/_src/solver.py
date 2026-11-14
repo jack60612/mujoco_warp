@@ -140,7 +140,7 @@ def _add_qfrc_smooth_eff(
   qfrc_smooth_eff_out[worldid, dofid] = qfrc_smooth_in[worldid, dofid] + efm_c_in[worldid, dofid] + efm_ca_in[worldid, dofid]
 
 
-@wp.kernel
+@wp.kernel(module="unique", enable_backward=False)
 def _inertia_scale(
   # Model:
   nv: int,
@@ -151,12 +151,25 @@ def _inertia_scale(
   # Out:
   inertia_scale_out: wp.array[float],
 ):
-  """Inverse trace of the inertia matrix, which scales the termination criteria."""
-  worldid = wp.tid()
+  """Inverse trace of the inertia matrix, which scales the termination criteria.
+
+  One block per world loads the diagonal block_dim entries at a time and one thread adds them in
+  dof order, so the trace is the serial sum for every block size.
+  """
+  worldid, tid = wp.tid()
+  BLOCK_DIM = wp.block_dim()
   trace = float(0.0)
-  for i in range(nv):
-    trace += M_in[worldid, M_rowadr[i] + M_rownnz[i] - 1]
-  inertia_scale_out[worldid] = 1.0 / wp.max(types.MJ_MINVAL, trace)
+  for start in range(0, nv, BLOCK_DIM):
+    dofid = start + tid
+    diag = float(0.0)
+    if dofid < nv:
+      diag = M_in[worldid, M_rowadr[dofid] + M_rownnz[dofid] - 1]
+    diag_tile = wp.tile(diag, preserve_type=True)
+    if tid == 0:
+      for i in range(wp.min(BLOCK_DIM, nv - start)):
+        trace += diag_tile[i]
+  if tid == 0:
+    inertia_scale_out[worldid] = 1.0 / wp.max(types.MJ_MINVAL, trace)
 
 
 @wp.func
@@ -4099,7 +4112,13 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
   if isinstance(ctx, SolverContext):
     mf = m if ctx.compact_m_full is None else ctx.compact_m_full
     df = d if ctx.compact_d_full is None else ctx.compact_d_full
-    wp.launch(_inertia_scale, dim=d.nworld, inputs=[mf.nv, mf.M_rownnz, mf.M_rowadr, df.M], outputs=[ctx.inertia_scale])
+    wp.launch_tiled(
+      _inertia_scale,
+      dim=d.nworld,
+      inputs=[mf.nv, mf.M_rownnz, mf.M_rowadr, df.M],
+      outputs=[ctx.inertia_scale],
+      block_dim=m.block_dim.inertia_scale,
+    )
 
   # initialize some efc arrays
   wp.launch(
@@ -5672,7 +5691,13 @@ def noslip(m: types.Model, d: types.Data):
 
   sleep = bool(m.opt.enableflags & types.EnableBit.SLEEP)
 
-  wp.launch(_inertia_scale, dim=d.nworld, inputs=[m.nv, m.M_rownnz, m.M_rowadr, d.M], outputs=[inertia_scale])
+  wp.launch_tiled(
+    _inertia_scale,
+    dim=d.nworld,
+    inputs=[m.nv, m.M_rownnz, m.M_rowadr, d.M],
+    outputs=[inertia_scale],
+    block_dim=m.block_dim.inertia_scale,
+  )
   wp.launch(
     _noslip_factor_m(sleep),
     dim=d.nworld,

@@ -89,6 +89,8 @@ class BlockDim:
     small_cholesky: scalar small-block Cholesky block dimension (smooth)
     factor_i_sparse_fused: factor I sparse fused block dimension (smooth)
     solve_LD_sparse_fused: solve LD sparse fused block dimension (smooth)
+    spatial_tendon_wrap: spatial tendon wrap-point block dimension (smooth)
+    inertia_scale: inverse inertia trace block dimension (solver)
     update_gradient_cholesky: update gradient Cholesky block dimension (solver)
     update_gradient_cholesky_blocked: update gradient Cholesky blocked block dimension (solver)
     update_gradient_JTDAJ_sparse: update gradient JTDAJ sparse block dimension (solver)
@@ -124,7 +126,9 @@ class BlockDim:
   small_cholesky: int = 64
   factor_i_sparse_fused: int = 1024
   solve_LD_sparse_fused: int = 512
+  spatial_tendon_wrap: int = 64
   # solver
+  inertia_scale: int = 256
   update_gradient_cholesky: int = 64
   update_gradient_cholesky_blocked: int = 32
   update_gradient_JTDAJ_sparse: int = 128

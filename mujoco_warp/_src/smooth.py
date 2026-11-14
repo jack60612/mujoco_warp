@@ -5293,10 +5293,9 @@ def _spatial_geom_tendon(max_ten_J_rownnz: int, deterministic: bool = False):
   return kernel
 
 
-@wp.kernel
-def _spatial_tendon_wrap(
+@wp.func
+def _spatial_tendon_wrap_points(
   # Model:
-  ntendon: int,
   tendon_adr: wp.array[int],
   tendon_num: wp.array[int],
   wrap_type: wp.array[int],
@@ -5305,39 +5304,37 @@ def _spatial_tendon_wrap(
   site_xpos_in: wp.array2d[wp.vec3],
   # In:
   wrap_geom_xpos_in: wp.array2d[wp.spatial_vector],
+  worldid: int,
+  tendonid: int,
+  wrapcount: int,
+  wrapgeomid: int,
+  write: bool,
   # Data out:
-  ten_wrapadr_out: wp.array2d[int],
-  ten_wrapnum_out: wp.array2d[int],
   wrap_obj_out: wp.array2d[wp.vec2i],
   wrap_xpos_out: wp.array2d[wp.spatial_vector],
-):
-  worldid = wp.tid()
+) -> int:
+  """Wrap points of one spatial tendon, from wrap point `wrapcount` and wrap geom `wrapgeomid` on.
 
-  wrapcount = int(0)
-  wrapgeomid = int(0)
-  for i in range(ntendon):
-    adr = tendon_adr[i]
-    ten_wrapadr_out[worldid, i] = wrapcount
-    wrapnum = int(0)
-    tendonnum = tendon_num[i]
+  Writes the points only if `write`. Returns the number of wrap points.
+  """
+  adr = tendon_adr[tendonid]
+  tendonnum = tendon_num[tendonid]
+  wrapnum = int(0)
+  ngeom = int(0)
 
-    # process fixed tendon
-    if wrap_type[adr] == WrapType.JOINT:
-      continue
+  j = int(0)
+  while j < tendonnum - 1:
+    # get 1st and 2nd object
+    type0 = wrap_type[adr + j + 0]
+    type1 = wrap_type[adr + j + 1]
+    id0 = wrap_objid[adr + j + 0]
+    id1 = wrap_objid[adr + j + 1]
 
-    # process spatial tendon
-    j = int(0)
-    while j < tendonnum - 1:
-      # get 1st and 2nd object
-      type0 = wrap_type[adr + j + 0]
-      type1 = wrap_type[adr + j + 1]
-      id0 = wrap_objid[adr + j + 0]
-      id1 = wrap_objid[adr + j + 1]
-
-      # pulley
-      pulley0 = type0 == WrapType.PULLEY
-      if pulley0 or type1 == WrapType.PULLEY:
-        if pulley0:
+    # pulley
+    pulley0 = type0 == WrapType.PULLEY
+    if pulley0 or type1 == WrapType.PULLEY:
+      if pulley0:
+        if write:
           row = wrapcount // 2
           col = wrapcount % 2
           wrap_xpos_out[worldid, row][3 * col + 0] = 0.0
@@ -5346,25 +5343,26 @@ def _spatial_tendon_wrap(
 
           wrap_obj_out[worldid, row][col] = -2
 
-          wrapnum += 1
-          wrapcount += 1
+        wrapnum += 1
+        wrapcount += 1
 
-        # move to next
-        j += 1
-        continue
+      # move to next
+      j += 1
+      continue
 
-      # init sequence; assume it starts with site
-      wpnt_site0 = site_xpos_in[worldid, id0]
+    # init sequence; assume it starts with site
+    wpnt_site0 = site_xpos_in[worldid, id0]
 
-      # second object is geom: process site-geom-site
-      if type1 == WrapType.SPHERE or type1 == WrapType.CYLINDER:
-        wrap_geom_xpos = wrap_geom_xpos_in[worldid, wrapgeomid]
-        wpnt_geom0 = wp.spatial_top(wrap_geom_xpos)
-        wrapgeomid += 1
+    # second object is geom: process site-geom-site
+    if type1 == WrapType.SPHERE or type1 == WrapType.CYLINDER:
+      wrap_geom_xpos = wrap_geom_xpos_in[worldid, wrapgeomid + ngeom]
+      wpnt_geom0 = wp.spatial_top(wrap_geom_xpos)
+      ngeom += 1
 
-        wrapid = id1
-        id1 = wrap_objid[adr + j + 2]
-        if wp.norm_l2(wpnt_geom0) < MJ_MAXVAL:
+      wrapid = id1
+      id1 = wrap_objid[adr + j + 2]
+      if wp.norm_l2(wpnt_geom0) < MJ_MAXVAL:
+        if write:
           wpnt_geom1 = wp.spatial_bottom(wrap_geom_xpos)
           wpnt_site1 = site_xpos_in[worldid, id1]
 
@@ -5398,11 +5396,12 @@ def _spatial_tendon_wrap(
           wrap_obj_out[worldid, row1][col1] = wrapid
           wrap_obj_out[worldid, row2][col2] = wrapid
 
-          wrapnum += 3
-          wrapcount += 3
-          j += 2
+        wrapnum += 3
+        wrapcount += 3
+        j += 2
 
-        else:
+      else:
+        if write:
           row0 = (wrapcount + 0) // 2
           col0 = (wrapcount + 0) % 2
 
@@ -5412,11 +5411,12 @@ def _spatial_tendon_wrap(
 
           wrap_obj_out[worldid, row0][col0] = -1
 
-          wrapnum += 1
-          wrapcount += 1
-          j += 2
+        wrapnum += 1
+        wrapcount += 1
+        j += 2
 
-      else:
+    else:
+      if write:
         row0 = (wrapcount + 0) // 2
         col0 = (wrapcount + 0) % 2
 
@@ -5426,17 +5426,18 @@ def _spatial_tendon_wrap(
 
         wrap_obj_out[worldid, row0][col0] = -1
 
-        wrapnum += 1
-        wrapcount += 1
-        j += 1
+      wrapnum += 1
+      wrapcount += 1
+      j += 1
 
-      # assign last site before pulley or tendon end
-      if adr + j + 1 < wrap_type.shape[0]:
-        last_before_pulley = wrap_type[adr + j + 1] == WrapType.PULLEY
-      else:
-        last_before_pulley = False
+    # assign last site before pulley or tendon end
+    if adr + j + 1 < wrap_type.shape[0]:
+      last_before_pulley = wrap_type[adr + j + 1] == WrapType.PULLEY
+    else:
+      last_before_pulley = False
 
-      if j == tendonnum - 1 or last_before_pulley:
+    if j == tendonnum - 1 or last_before_pulley:
+      if write:
         row0 = (wrapcount + 0) // 2
         col0 = (wrapcount + 0) % 2
 
@@ -5446,10 +5447,126 @@ def _spatial_tendon_wrap(
         wrap_xpos_out[worldid, row0][3 * col0 + 2] = wpnt_site1[2]
 
         wrap_obj_out[worldid, row0][col0] = -1
-        wrapnum += 1
-        wrapcount += 1
+      wrapnum += 1
+      wrapcount += 1
 
-    ten_wrapnum_out[worldid, i] = wrapnum
+  return wrapnum
+
+
+@wp.func
+def _spatial_tendon_wrap_ngeom(
+  # Model:
+  tendon_adr: wp.array[int],
+  tendon_num: wp.array[int],
+  wrap_type: wp.array[int],
+  # In:
+  tendonid: int,
+) -> int:
+  """Wrap geoms of one spatial tendon.
+
+  Takes `_spatial_tendon_wrap_points`'s walk, whose steps do not depend on whether a geom wraps.
+  """
+  adr = tendon_adr[tendonid]
+  tendonnum = tendon_num[tendonid]
+  ngeom = int(0)
+  j = int(0)
+  while j < tendonnum - 1:
+    type0 = wrap_type[adr + j + 0]
+    type1 = wrap_type[adr + j + 1]
+    if type0 == WrapType.PULLEY or type1 == WrapType.PULLEY:
+      j += 1
+    elif type1 == WrapType.SPHERE or type1 == WrapType.CYLINDER:
+      ngeom += 1
+      j += 2
+    else:
+      j += 1
+  return ngeom
+
+
+@wp.kernel(module="unique", enable_backward=False)
+def _spatial_tendon_wrap(
+  # Model:
+  ntendon: int,
+  tendon_adr: wp.array[int],
+  tendon_num: wp.array[int],
+  wrap_type: wp.array[int],
+  wrap_objid: wp.array[int],
+  # Data in:
+  site_xpos_in: wp.array2d[wp.vec3],
+  # In:
+  wrap_geom_xpos_in: wp.array2d[wp.spatial_vector],
+  # Data out:
+  ten_wrapadr_out: wp.array2d[int],
+  ten_wrapnum_out: wp.array2d[int],
+  wrap_obj_out: wp.array2d[wp.vec2i],
+  wrap_xpos_out: wp.array2d[wp.spatial_vector],
+):
+  """Wrap points of every tendon, one block per world and one thread per tendon.
+
+  A tendon's first wrap geom and first wrap point are the counts of the tendons before it. Each
+  block scans its tendons' wrap geom counts (fixed by the model), then their wrap point counts
+  (which depend on whether each geom wraps), then writes the points. Every value written is the
+  one a serial pass over the tendons writes.
+  """
+  worldid, tid = wp.tid()
+  BLOCK_DIM = wp.block_dim()
+
+  wrapcount = int(0)
+  wrapgeomid = int(0)
+  for start in range(0, ntendon, BLOCK_DIM):
+    tendonid = start + tid
+
+    # fixed tendons have no wrap points
+    spatial = False
+    ngeom = int(0)
+    if tendonid < ntendon:
+      spatial = wrap_type[tendon_adr[tendonid]] != WrapType.JOINT
+      if spatial:
+        ngeom = _spatial_tendon_wrap_ngeom(tendon_adr, tendon_num, wrap_type, tendonid)
+    ngeom_tile = wp.tile(ngeom, preserve_type=True)
+    tendon_wrapgeomid = wrapgeomid + wp.untile(wp.tile_scan_exclusive(ngeom_tile))
+    wrapgeomid += wp.tile_sum(ngeom_tile)[0]
+
+    wrapnum = int(0)
+    if spatial:
+      wrapnum = _spatial_tendon_wrap_points(
+        tendon_adr,
+        tendon_num,
+        wrap_type,
+        wrap_objid,
+        site_xpos_in,
+        wrap_geom_xpos_in,
+        worldid,
+        tendonid,
+        0,
+        tendon_wrapgeomid,
+        False,
+        wrap_obj_out,
+        wrap_xpos_out,
+      )
+    wrapnum_tile = wp.tile(wrapnum, preserve_type=True)
+    tendon_wrapcount = wrapcount + wp.untile(wp.tile_scan_exclusive(wrapnum_tile))
+    wrapcount += wp.tile_sum(wrapnum_tile)[0]
+
+    if tendonid < ntendon:
+      ten_wrapadr_out[worldid, tendonid] = tendon_wrapcount
+      if spatial:
+        _spatial_tendon_wrap_points(
+          tendon_adr,
+          tendon_num,
+          wrap_type,
+          wrap_objid,
+          site_xpos_in,
+          wrap_geom_xpos_in,
+          worldid,
+          tendonid,
+          tendon_wrapcount,
+          tendon_wrapgeomid,
+          True,
+          wrap_obj_out,
+          wrap_xpos_out,
+        )
+        ten_wrapnum_out[worldid, tendonid] = wrapnum
 
 
 @event_scope
@@ -5551,9 +5668,10 @@ def tendon(m: Model, d: Data, wrap_geom_xpos=None):
   )
 
   if spatial_site or spatial_geom:
-    wp.launch(
+    wp.launch_tiled(
       _spatial_tendon_wrap,
       dim=d.nworld,
       inputs=[m.ntendon, m.tendon_adr, m.tendon_num, m.wrap_type, m.wrap_objid, d.site_xpos, wrap_geom_xpos],
       outputs=[d.ten_wrapadr, d.ten_wrapnum, d.wrap_obj, d.wrap_xpos],
+      block_dim=m.block_dim.spatial_tendon_wrap,
     )

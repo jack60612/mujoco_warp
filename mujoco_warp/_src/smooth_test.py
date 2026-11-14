@@ -1254,6 +1254,78 @@ class SmoothTest(parameterized.TestCase):
       self.assertFalse(np.allclose(d.ten_J.numpy()[0], d.ten_J.numpy()[1]))
       self.assertFalse(np.allclose(d.wrap_xpos.numpy()[0], d.wrap_xpos.numpy()[1]))
 
+  def test_tendon_wrap_many_tendons(self):
+    """Wrap points of more tendons than one block of threads match MuJoCo.
+
+    The tendons mix fixed, site, geom and pulley tendons; the result does not depend on block size.
+    """
+    ntendon = 150
+    sites, bodies, tendons = [], [], []
+    for i in range(ntendon):
+      x = 0.3 * i
+      sites.append(
+        f'<site name="w{i}" pos="{x} 0.4 0"/><site name="s{i}" pos="{x} 0.4 1.2"/>'
+        f'<geom name="sph{i}" type="sphere" size="0.08" pos="{x} 0.2 0.5" contype="0" conaffinity="0"/>'
+        f'<geom name="cyl{i}" type="cylinder" size="0.06 0.1" pos="{x} 0.2 1.4" contype="0" conaffinity="0"/>'
+      )
+      bodies.append(
+        f'<body pos="{x} 0 1"><joint name="j{i}" axis="0 1 0"/><joint type="slide" axis="1 0 0"/>'
+        f'<geom size="0.05"/><site name="a{i}" pos="0 0 -0.2"/><site name="b{i}" pos="0 0 0.2"/></body>'
+      )
+      tendons.append(
+        [
+          f'<spatial><site site="w{i}"/><site site="a{i}"/><site site="b{i}"/></spatial>',
+          f'<spatial><site site="w{i}"/><geom geom="sph{i}" sidesite="s{i}"/><site site="a{i}"/></spatial>',
+          f'<spatial><pulley divisor="2"/><site site="w{i}"/><geom geom="cyl{i}"/><site site="b{i}"/>'
+          f'<pulley divisor="2"/><site site="s{i}"/><geom geom="sph{i}"/><site site="a{i}"/></spatial>',
+          f'<fixed><joint joint="j{i}" coef="1"/></fixed>',
+          f'<spatial><site site="w{i}"/><geom geom="sph{i}"/><site site="a{i}"/><geom geom="cyl{i}"/><site site="s{i}"/></spatial>',
+        ][i % 5]
+      )
+    xml = f"<mujoco><worldbody>{''.join(sites)}{''.join(bodies)}</worldbody><tendon>{''.join(tendons)}</tendon></mujoco>"
+    nworld = 3
+    mjm, mjd, m, d = test_data.fixture(xml=xml, nworld=nworld)
+    qpos = np.random.default_rng(0).uniform(-1.0, 1.0, (nworld, mjm.nq))
+    d.qpos.assign(qpos)
+    mjw.kinematics(m, d)
+    mjw.com_pos(m, d)
+
+    spatial = mjm.wrap_type[mjm.tendon_adr] != mujoco.mjtWrap.mjWRAP_JOINT
+    outputs = {}
+    for block_dim in (1, 32, 64, 256):
+      m.block_dim.spatial_tendon_wrap = block_dim
+      d.wrap_obj.fill_(-3)
+      d.ten_wrapnum.fill_(-3)
+      d.ten_wrapadr.fill_(-3)
+      mjw.tendon(m, d)
+      outputs[block_dim] = [arr.numpy() for arr in (d.ten_wrapadr, d.ten_wrapnum, d.wrap_obj, d.wrap_xpos)]
+    for block_dim, arrays in outputs.items():
+      for name, arr, ref in zip(("ten_wrapadr", "ten_wrapnum", "wrap_obj", "wrap_xpos"), arrays, outputs[1]):
+        np.testing.assert_array_equal(arr.view(np.uint8), ref.view(np.uint8), err_msg=f"{name} (block_dim {block_dim})")
+
+    ten_wrapadr, ten_wrapnum, wrap_obj, wrap_xpos = outputs[1]
+    self.assertTrue((ten_wrapnum[:, ~spatial] == -3).all())  # fixed tendons keep ten_wrapnum
+    nwrapped = [0, 0]
+    for w in range(nworld):
+      mjd.qpos[:] = qpos[w]
+      mujoco.mj_kinematics(mjm, mjd)
+      mujoco.mj_comPos(mjm, mjd)
+      mujoco.mj_tendon(mjm, mjd)
+      np.testing.assert_array_equal(ten_wrapadr[w], mjd.ten_wrapadr, err_msg=f"ten_wrapadr (world {w})")
+      np.testing.assert_array_equal(ten_wrapnum[w, spatial], mjd.ten_wrapnum[spatial], err_msg=f"ten_wrapnum (world {w})")
+      nwrap = mjd.ten_wrapadr[-1] + mjd.ten_wrapnum[-1]
+      mj_wrap_obj = mjd.wrap_obj.reshape(-1)[:nwrap]
+      np.testing.assert_array_equal(wrap_obj[w].reshape(-1)[:nwrap], mj_wrap_obj, err_msg=f"wrap_obj (world {w})")
+      _assert_eq(wrap_xpos[w].reshape(-1, 3)[:nwrap], mjd.wrap_xpos.reshape(-1, 3)[:nwrap], f"wrap_xpos (world {w})")
+      # geoms both wrap and miss, so the wrap point offsets depend on the configuration
+      geom = mj_wrap_obj >= 0
+      nwrapped[0] += geom.sum() // 2
+      nwrapped[1] += (mjm.wrap_type == mujoco.mjtWrap.mjWRAP_SPHERE).sum() + (
+        mjm.wrap_type == mujoco.mjtWrap.mjWRAP_CYLINDER
+      ).sum()
+    self.assertGreater(nwrapped[0], 0)
+    self.assertLess(nwrapped[0], nwrapped[1])
+
   @parameterized.parameters(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE)
   def test_factor_solve_i(self, jacobian):
     mjm, mjd, m, d = test_data.fixture(

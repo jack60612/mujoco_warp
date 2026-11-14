@@ -49,7 +49,13 @@ def _assert_eq(a, b, name, tol=_TOLERANCE * 20):
 
 def _set_inertia_scale(m, d, ctx):
   """Set the inverse trace of M, as init_context does, for tests which skip it."""
-  wp.launch(solver._inertia_scale, dim=d.nworld, inputs=[m.nv, m.M_rownnz, m.M_rowadr, d.M], outputs=[ctx.inertia_scale])
+  wp.launch_tiled(
+    solver._inertia_scale,
+    dim=d.nworld,
+    inputs=[m.nv, m.M_rownnz, m.M_rowadr, d.M],
+    outputs=[ctx.inertia_scale],
+    block_dim=m.block_dim.inertia_scale,
+  )
 
 
 def _noslip_model(mjm, noslip_iterations):
@@ -715,6 +721,26 @@ class SolverTest(parameterized.TestCase):
     mgrad = ctx.Mgrad.numpy()
     np.testing.assert_array_equal(mgrad[0].view(np.uint32), expected[0].view(np.uint32))
     np.testing.assert_array_equal(mgrad[1, : m.nv], np.full(m.nv, 7.0, dtype=np.float32))
+
+  @parameterized.parameters(1, 32, 256)
+  def test_inertia_scale_is_the_serial_trace(self, block_dim):
+    """The block-parallel inverse trace of M adds the diagonal in dof order, bitwise."""
+    _, _, m, d = test_data.fixture("humanoid/humanoid.xml", nworld=3, qpos_noise=0.5)
+    mjw.fwd_position(m, d)
+    M = d.M.numpy()
+    diag = m.M_rowadr.numpy() + m.M_rownnz.numpy() - 1
+    expected = np.empty(d.nworld, dtype=np.float32)
+    for w in range(d.nworld):
+      trace = np.float32(0.0)
+      for i in range(m.nv):
+        trace = np.float32(trace + M[w, diag[i]])
+      expected[w] = np.float32(1.0) / np.maximum(np.float32(types.MJ_MINVAL), trace)
+
+    out = wp.zeros(d.nworld, dtype=float)
+    wp.launch_tiled(
+      solver._inertia_scale, dim=d.nworld, inputs=[m.nv, m.M_rownnz, m.M_rowadr, d.M], outputs=[out], block_dim=block_dim
+    )
+    np.testing.assert_array_equal(out.numpy().view(np.uint32), expected.view(np.uint32))
 
   def test_linesearch_accepts_sub_float32_improvement(self):
     """Line search should not lose small improvements on large absolute costs."""
