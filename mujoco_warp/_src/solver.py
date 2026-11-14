@@ -3140,6 +3140,8 @@ def _cholesky_factorize_solve(
 # ---------------------------------------------------------------------------
 _JTDAJ_THREADS_PER_GROUP = 32
 _JTDAJ_OVERSUBSCRIBE_WAVES = 6
+# Warp's default launch block size; the incremental kernel's records are read for this module build.
+_JTDAJ_INCREMENTAL_BLOCK_DIM = 256
 
 
 @cache_kernel
@@ -3409,11 +3411,54 @@ def _JTDACJ_sparse(
   return kernel
 
 
-def _jtdaj_groups_per_world(nworld: int, njmax: int, kernel: wp.Kernel) -> int:
+def _jtdaj_groups_per_world(
+  nworld: int, njmax: int, kernel: wp.Kernel, row_entries: int = 0, records_per_thread: int = 0
+) -> int:
+  """Constraint-row groups per world (32-lane warps) for the sparse JTDAJ Hessian kernels.
+
+  Args:
+    nworld: Number of worlds.
+    njmax: Maximum constraint rows (groups) per world.
+    kernel: The kernel to launch (occupancy query).
+    row_entries: Upper bound on upper-triangular Hessian entries one row contributes.
+    records_per_thread: Deterministic scatter records Warp reserves per launched thread for a
+      kernel that inherits Warp's global deterministic mode (0 otherwise).
+  """
   # njmax is capacity and often mostly empty, so cap slots at a few resident waves.
   block_size, min_grid_size = wp.get_suggested_block_size(kernel)
   device_warps = max(1, block_size * min_grid_size // _JTDAJ_THREADS_PER_GROUP)
-  return max(1, min(njmax, _JTDAJ_OVERSUBSCRIBE_WAVES * device_warps // nworld))
+  slots = max(1, min(njmax, _JTDAJ_OVERSUBSCRIBE_WAVES * device_warps // nworld))
+  if records_per_thread > 0 and row_entries > 0:
+    # A deterministic launch keeps one scatter record per Hessian atomic in a pool of
+    # launch threads x records_per_thread entries (per launch, retained by captured graphs).
+    # The rows of a world emit at most njmax * row_entries records, so more slots than that
+    # pool needs only enlarge the buffers that Warp allocates and sorts.
+    pool_slots = -(-njmax * row_entries // (_JTDAJ_THREADS_PER_GROUP * records_per_thread))
+    slots = max(1, min(slots, pool_slots))
+  return slots
+
+
+def _jtdaj_inherited_records_per_thread(kernel: wp.Kernel, block_dim: int) -> int:
+  """Per-thread forward scatter records of a JTDAJ kernel made deterministic by Warp's config.
+
+  Callers that drive determinism through ``wp.config.deterministic`` and a global
+  ``deterministic_max_records`` (e.g. Newton's RUN_TO_RUN) build these kernels without
+  ``opt.deterministic``, so the kernels inherit a full-row per-thread bound. Returns the smallest
+  per-thread reservation over the kernel's forward scatter targets; 0 when the kernel is not
+  deterministic or the device is not CUDA.
+  """
+  device = wp.get_device()
+  if not device.is_cuda:
+    return 0
+  options = kernel.module.options
+  if options.get("deterministic", wp.config.deterministic) == wp.DeterministicMode.NOT_GUARANTEED:
+    return 0
+  meta = kernel.module.load(device, block_dim).get_kernel_hooks(kernel).det_launch_meta
+  if meta is None:
+    return 0
+  floor = int(options.get("deterministic_max_records", 0) or 0)
+  counts = [max(int(count), floor) for target, count in meta.scatter_records_per_thread.items() if target.use_forward]
+  return min(counts, default=0)
 
 
 def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
@@ -3470,11 +3515,19 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       threads_per_group = 1 if elliptic and wp.get_device().is_cpu else _JTDAJ_THREADS_PER_GROUP
       block_dim = threads_per_group if elliptic else mj.block_dim.update_gradient_JTDAJ_sparse
       jtdaj_kernel = _JTDACJ_sparse(sc, m.opt.cone, max_condim, block_dim)
-      groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax, jtdaj_kernel)
       if bool(m.opt.deterministic & types.DeterminismType.ATOMICS):
+        groups_per_world = _jtdaj_groups_per_world(d.nworld, d.njmax, jtdaj_kernel)
         entries_per_lane = ceil((mj.nv * (mj.nv + 1) // 2) / threads_per_group)
         max_records = ceil(d.njmax / groups_per_world) * entries_per_lane
         jtdaj_kernel = _JTDACJ_sparse(sc, m.opt.cone, max_condim, block_dim, max_records, True)
+      else:
+        groups_per_world = _jtdaj_groups_per_world(
+          d.nworld,
+          d.njmax,
+          jtdaj_kernel,
+          mj.nv * (mj.nv + 1) // 2,
+          _jtdaj_inherited_records_per_thread(jtdaj_kernel, block_dim),
+        )
       jtdaj_inputs = [
         m.opt.impratio_invsqrt,
         d.contact.friction,
@@ -3675,11 +3728,19 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
     mj = ctx.compact_m_full if sc else m
     dj = ctx.compact_d_full if sc else d
     inc_kernel = _update_gradient_h_incremental_sparse(sc)
-    slots = _jtdaj_groups_per_world(d.nworld, ctx.quad_changed_ids.shape[1], inc_kernel)
     if det_atomics:
+      slots = _jtdaj_groups_per_world(d.nworld, ctx.quad_changed_ids.shape[1], inc_kernel)
       entries_per_lane = ceil((mj.nv * (mj.nv + 1) // 2) / _JTDAJ_THREADS_PER_GROUP)
       max_records = ceil(ctx.quad_changed_ids.shape[1] / slots) * entries_per_lane
       inc_kernel = _update_gradient_h_incremental_sparse(sc, max_records, True)
+    else:
+      slots = _jtdaj_groups_per_world(
+        d.nworld,
+        ctx.quad_changed_ids.shape[1],
+        inc_kernel,
+        mj.nv * (mj.nv + 1) // 2,
+        _jtdaj_inherited_records_per_thread(inc_kernel, _JTDAJ_INCREMENTAL_BLOCK_DIM),
+      )
     wp.launch(
       inc_kernel,
       dim=(d.nworld, slots, _JTDAJ_THREADS_PER_GROUP),
@@ -3696,6 +3757,7 @@ def _update_gradient_incremental(m: types.Model, d: types.Data, ctx: SolverConte
         slots,
       ],
       outputs=[ctx.h],
+      block_dim=_JTDAJ_INCREMENTAL_BLOCK_DIM,
     )
   else:
     tri_dim = m.nv * (m.nv + 1) // 2
