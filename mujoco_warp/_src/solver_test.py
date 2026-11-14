@@ -703,7 +703,11 @@ class SolverTest(parameterized.TestCase):
 
   @parameterized.parameters("humanoid/humanoid.xml", "pendula.xml")
   def test_update_gradient_CG_skips_done_worlds(self, path):
-    """The CG preconditioner solve leaves the Mgrad of done worlds, whose grad is not updated."""
+    """The CG preconditioner solve leaves the Mgrad of done worlds, whose grad is not updated.
+
+    The other world's Mgrad is solved again: bitwise on the CPU, to rounding on the GPU, where the
+    fused sparse back-substitution's colliding atomic adds round in launch order.
+    """
     _, _, m, d = test_data.fixture(
       path, nworld=2, qpos_noise=0.2, overrides={"opt.solver": SolverType.CG, "opt.jacobian": mujoco.mjtJacobian.mjJAC_SPARSE}
     )
@@ -718,9 +722,12 @@ class SolverTest(parameterized.TestCase):
     ctx.done.assign(np.array([False, True]))
     ctx.Mgrad.fill_(7.0)
     solver._update_gradient(m, d, ctx)
-    mgrad = ctx.Mgrad.numpy()
-    np.testing.assert_array_equal(mgrad[0].view(np.uint32), expected[0].view(np.uint32))
-    np.testing.assert_array_equal(mgrad[1, : m.nv], np.full(m.nv, 7.0, dtype=np.float32))
+    mgrad = ctx.Mgrad.numpy()[:, : m.nv]
+    if wp.get_device().is_cuda:
+      np.testing.assert_allclose(mgrad[0], expected[0, : m.nv], rtol=1e-4, atol=1e-5 * np.abs(expected[0, : m.nv]).max())
+    else:
+      np.testing.assert_array_equal(mgrad[0].view(np.uint32), expected[0, : m.nv].view(np.uint32))
+    np.testing.assert_array_equal(mgrad[1], np.full(m.nv, 7.0, dtype=np.float32))
 
   @parameterized.parameters(1, 32, 256)
   def test_inertia_scale_is_the_serial_trace(self, block_dim):

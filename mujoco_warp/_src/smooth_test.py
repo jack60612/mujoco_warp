@@ -1503,7 +1503,11 @@ class SmoothTest(parameterized.TestCase):
 
   @parameterized.parameters(1, 32, 512)
   def test_solve_m_done(self, block_dim):
-    """Done worlds keep their rows of x; the other worlds get the unmasked solution, bitwise."""
+    """Done worlds keep their rows of x; the other worlds get the unmasked solution.
+
+    Bitwise on the CPU. On the GPU the fused back-substitution's colliding atomic adds within a
+    level round in launch order, so any two solves (masked or not) agree to rounding only.
+    """
     nworld = 5
     mjm, mjd, m, d = test_data.fixture(xml=_mixed_blocks_xml(), nworld=nworld, qpos_noise=0.5)
     self.assertTrue(any(tile.elemid.size == 0 for tile in m.M_tiles))
@@ -1524,7 +1528,10 @@ class SmoothTest(parameterized.TestCase):
     x = wp.full((nworld, m.nv), 7.0, dtype=float)
     mjw.solve_m(m, d, x, y, done=wp.array(done, dtype=bool))
     x, expected = x.numpy(), expected.numpy()
-    np.testing.assert_array_equal(x[~done].view(np.uint32), expected[~done].view(np.uint32))
+    if wp.get_device().is_cuda:
+      np.testing.assert_allclose(x[~done], expected[~done], rtol=1e-4, atol=1e-5 * np.abs(expected).max())
+    else:
+      np.testing.assert_array_equal(x[~done].view(np.uint32), expected[~done].view(np.uint32))
     np.testing.assert_array_equal(x[done], np.full((done.sum(), m.nv), 7.0, dtype=np.float32))
 
   def test_factor_solve_lu(self):
