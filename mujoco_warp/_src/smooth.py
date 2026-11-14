@@ -4056,7 +4056,7 @@ def solve_m(m: Model, d: Data, x: wp.array2d[float], y: wp.array2d[float], x_scr
 
 
 @cache_kernel
-def _solve_LD_sparse_fused_batched(nv: int, nlevels: int):
+def _solve_LD_sparse_fused_batched(nv: int, nlevels: int, masked: bool = False):
   """`_solve_LD_sparse_fused` with one thread block per (world, right-hand side)."""
 
   @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -4068,6 +4068,7 @@ def _solve_LD_sparse_fused_batched(nv: int, nlevels: int):
     # Model:
     qLD_block_adr: wp.array[int],
     # In:
+    world_mask: wp.array[bool],
     L: wp.array2d[float],
     D: wp.array2d[float],
     all_updates: wp.array[wp.vec3i],
@@ -4077,6 +4078,9 @@ def _solve_LD_sparse_fused_batched(nv: int, nlevels: int):
     x_out: wp.array3d[float],
   ):
     worldid, rhsid, tid = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
     NV = wp.static(nv)
     NLEVELS = wp.static(nlevels)
     BLOCK_DIM = wp.block_dim()
@@ -4118,12 +4122,13 @@ def _solve_LD_sparse_fused_batched(nv: int, nlevels: int):
 
 
 @cache_kernel
-def _small_cholesky_solve_block_batched(block_size: int):
+def _small_cholesky_solve_block_batched(block_size: int, masked: bool = False):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
     qLD_block_adr: wp.array[int],
     # In:
+    world_mask: wp.array[bool],
     block_dof: wp.array[int],
     D_in: wp.array2d[float],
     L_in: wp.array2d[float],
@@ -4132,6 +4137,9 @@ def _small_cholesky_solve_block_batched(block_size: int):
     x_out: wp.array3d[float],
   ):
     worldid, rhsid, blk = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
     start = block_dof[blk]
     size = wp.static(block_size)
     factor_adr = qLD_block_adr[start]
@@ -4158,7 +4166,7 @@ def _small_cholesky_solve_block_batched(block_size: int):
 
 
 @cache_kernel
-def _tile_cholesky_solve_block_batched(tile: TileSet):
+def _tile_cholesky_solve_block_batched(tile: TileSet, masked: bool = False):
   block_size = tile.size
   block_area = block_size * block_size
 
@@ -4167,6 +4175,7 @@ def _tile_cholesky_solve_block_batched(tile: TileSet):
     # Model:
     qLD_block_adr: wp.array[int],
     # In:
+    world_mask: wp.array[bool],
     block_dof: wp.array[int],
     L_in: wp.array2d[float],
     y: wp.array3d[float],
@@ -4174,6 +4183,9 @@ def _tile_cholesky_solve_block_batched(tile: TileSet):
     x: wp.array3d[float],
   ):
     worldid, rhsid, blk = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
     start = block_dof[blk]
 
     L = wp.tile_reshape(
@@ -4186,36 +4198,52 @@ def _tile_cholesky_solve_block_batched(tile: TileSet):
   return kernel
 
 
-@wp.kernel
-def _solve_LD_sparse_copy_batched(
-  # Model:
-  qLD_block_adr: wp.array[int],
-  # In:
-  y_in: wp.array3d[float],
-  # Out:
-  x_out: wp.array3d[float],
-):
-  worldid, rhsid, dofid = wp.tid()
-  if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
-    x_out[worldid, rhsid, dofid] = y_in[worldid, rhsid, dofid]
+@cache_kernel
+def _solve_LD_sparse_copy_batched(masked: bool = False):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    world_mask: wp.array[bool],
+    y_in: wp.array3d[float],
+    # Out:
+    x_out: wp.array3d[float],
+  ):
+    worldid, rhsid, dofid = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
+    if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+      x_out[worldid, rhsid, dofid] = y_in[worldid, rhsid, dofid]
 
-
-@wp.kernel
-def _solve_LD_sparse_diag_batched(
-  # Model:
-  qLD_block_adr: wp.array[int],
-  # In:
-  D_in: wp.array2d[float],
-  # Out:
-  x_out: wp.array3d[float],
-):
-  worldid, rhsid, dofid = wp.tid()
-  if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
-    x_out[worldid, rhsid, dofid] *= D_in[worldid, dofid]
+  return kernel
 
 
 @cache_kernel
-def _solve_LD_sparse_level_batched(up: bool, deterministic: bool = False):
+def _solve_LD_sparse_diag_batched(masked: bool = False):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    # In:
+    world_mask: wp.array[bool],
+    D_in: wp.array2d[float],
+    # Out:
+    x_out: wp.array3d[float],
+  ):
+    worldid, rhsid, dofid = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
+    if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+      x_out[worldid, rhsid, dofid] *= D_in[worldid, dofid]
+
+  return kernel
+
+
+@cache_kernel
+def _solve_LD_sparse_level_batched(up: bool, masked: bool = False, deterministic: bool = False):
   """`_solve_LD_sparse_level` over (world, right-hand side, update).
 
   Only launched deterministically. The record bound is set explicitly (one per thread), so that a
@@ -4229,6 +4257,7 @@ def _solve_LD_sparse_level_batched(up: bool, deterministic: bool = False):
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
     # In:
+    world_mask: wp.array[bool],
     L_in: wp.array2d[float],
     qLD_updates_: wp.array[wp.vec3i],
     x_in: wp.array3d[float],
@@ -4236,6 +4265,9 @@ def _solve_LD_sparse_level_batched(up: bool, deterministic: bool = False):
     x_out: wp.array3d[float],
   ):
     worldid, rhsid, nodeid = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
     update = qLD_updates_[nodeid]
     i, k, Madr_ki = update[0], update[1], update[2]
     if wp.static(up):
@@ -4253,7 +4285,12 @@ _DETERMINISTIC_RECORD_BUDGET = 1 << 24
 
 
 def solve_m_batched(
-  m: Model, d: Data, x: wp.array3d[float], y: wp.array3d[float], x_scratch: Optional[wp.array3d[float]] = None
+  m: Model,
+  d: Data,
+  x: wp.array3d[float],
+  y: wp.array3d[float],
+  x_scratch: Optional[wp.array3d[float]] = None,
+  world_mask: Optional[wp.array] = None,
 ):
   """Computes x[w, r] = inv(M[w]) * y[w, r] for every right-hand side r of every world w.
 
@@ -4268,23 +4305,26 @@ def solve_m_batched(
     x: Output solutions, shape (nworld, nrhs, nv).
     y: Input right-hand sides, shape (nworld, nrhs, nv).
     x_scratch: Preallocated scratch shaped like x for deterministic sparse backsubstitution.
+    world_mask: Optional per-world bool mask. Worlds whose entry is False are skipped and their x
+      is left unspecified.
   """
   nrhs = y.shape[1]
+  masked = world_mask is not None
   for tile in m.M_tiles:
     if tile.elemid.size == 0:
       wp.launch(
-        _small_cholesky_solve_block_batched(tile.size),
+        _small_cholesky_solve_block_batched(tile.size, masked),
         dim=(d.nworld, nrhs, tile.adr.size),
-        inputs=[m.qLD_block_adr, tile.adr, d.qLDiagInv, d.qLD, y],
+        inputs=[m.qLD_block_adr, world_mask, tile.adr, d.qLDiagInv, d.qLD, y],
         outputs=[x],
         block_dim=m.block_dim.small_cholesky,
       )
     else:
       block_dim = m.block_dim.cholesky_solve if tile.size <= 40 else 32
       wp.launch_tiled(
-        _tile_cholesky_solve_block_batched(tile),
+        _tile_cholesky_solve_block_batched(tile, masked),
         dim=(d.nworld, nrhs, tile.adr.size),
-        inputs=[m.qLD_block_adr, tile.adr, d.qLD, y],
+        inputs=[m.qLD_block_adr, world_mask, tile.adr, d.qLD, y],
         outputs=[x],
         block_dim=block_dim,
       )
@@ -4293,13 +4333,13 @@ def solve_m_batched(
 
   L = d.qLD[:, m.qLD_block_total :]
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = None if det_atomics else _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates))
+  fused = None if det_atomics else _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), masked)
   if fused is not None and not _deterministic_launch(fused):
     dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
     wp.launch(
       fused,
       dim=(d.nworld, nrhs, dim_block),
-      inputs=[m.qLD_block_adr, L, d.qLDiagInv, m.qLD_all_updates, m.qLD_level_offsets, y],
+      inputs=[m.qLD_block_adr, world_mask, L, d.qLDiagInv, m.qLD_all_updates, m.qLD_level_offsets, y],
       outputs=[x],
       block_dim=dim_block,
     )
@@ -4316,22 +4356,29 @@ def solve_m_batched(
     stop = min(start + batch, nrhs)
     xs, ys, xs_in = (x, y, x_in) if batch == nrhs else (x[:, start:stop], y[:, start:stop], x_in[:, start:stop])
     n = stop - start
-    wp.launch(_solve_LD_sparse_copy_batched, dim=(d.nworld, n, m.nv), inputs=[m.qLD_block_adr, ys], outputs=[xs])
+    wp.launch(
+      _solve_LD_sparse_copy_batched(masked), dim=(d.nworld, n, m.nv), inputs=[m.qLD_block_adr, world_mask, ys], outputs=[xs]
+    )
     for qLD_updates in reversed(m.qLD_updates):
       wp.copy(xs_in, xs)
       wp.launch(
-        _solve_LD_sparse_level_batched(True, True),
+        _solve_LD_sparse_level_batched(True, masked, True),
         dim=(d.nworld, n, qLD_updates.size),
-        inputs=[L, qLD_updates, xs_in],
+        inputs=[world_mask, L, qLD_updates, xs_in],
         outputs=[xs],
       )
-    wp.launch(_solve_LD_sparse_diag_batched, dim=(d.nworld, n, m.nv), inputs=[m.qLD_block_adr, d.qLDiagInv], outputs=[xs])
+    wp.launch(
+      _solve_LD_sparse_diag_batched(masked),
+      dim=(d.nworld, n, m.nv),
+      inputs=[m.qLD_block_adr, world_mask, d.qLDiagInv],
+      outputs=[xs],
+    )
     for qLD_updates in m.qLD_updates:
       wp.copy(xs_in, xs)
       wp.launch(
-        _solve_LD_sparse_level_batched(False, True),
+        _solve_LD_sparse_level_batched(False, masked, True),
         dim=(d.nworld, n, qLD_updates.size),
-        inputs=[L, qLD_updates, xs_in],
+        inputs=[world_mask, L, qLD_updates, xs_in],
         outputs=[xs],
       )
 

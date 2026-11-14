@@ -168,3 +168,48 @@ def test_const0_batched_deterministic(device, source, budget):
     # summation order differs from the default path (determinism_test's NONE vs ATOMICS tolerance)
     np.testing.assert_allclose(runs[0][name], expected[name], rtol=1e-3, atol=1e-3, err_msg=name)
     assert runs[0][name].tobytes() == runs[1][name].tobytes(), name
+
+
+@pytest.mark.parametrize("path", ["cpu", "cuda_deterministic", "cuda_fused"])
+@pytest.mark.parametrize("rhs_chunk", [1, None])
+def test_const0_world_mask(path, rhs_chunk):
+  """A masked refresh matches the unmasked one in selected worlds and leaves the rest untouched.
+
+  Selected worlds compare bitwise wherever the unmasked solve is itself reproducible (CPU and
+  deterministic atomics); the fused GPU solve's colliding atomics reorder from run to run.
+  """
+  device = "cpu" if path == "cpu" else "cuda:0"
+  if device.startswith("cuda") and not wp.is_cuda_available():
+    pytest.skip("CUDA is unavailable")
+  mjm = mujoco.MjModel.from_xml_string(_layout_coverage_xml())
+  names = ("tendon_length0", "dof_invweight0", "body_invweight0", "tendon_invweight0", "actuator_acc0")
+  nworld = 3
+  with wp.ScopedDevice(device):
+    m = mjwarp.put_model(mjm, batch_sizes={name: nworld for name in ("dof_armature", *names)})
+    if path == "cuda_deterministic":
+      m.opt.deterministic = types.DeterminismType.ATOMICS
+    d = mjwarp.make_data(mjm, nworld=nworld)
+    workspace = mjwarp.Const0Workspace(m, d, rhs_chunk=rhs_chunk)
+    # Give every world its own inertia, so the worlds' constants differ.
+    armature = m.dof_armature.numpy()
+    m.dof_armature.assign(armature + 0.05 * np.arange(1, nworld + 1, dtype=np.float32)[:, None])
+    mjwarp.set_const_0(m, d, workspace=workspace)
+    expected = {name: getattr(m, name).numpy().copy() for name in names}
+    stale = {name: np.full_like(value, -7.0) for name, value in expected.items()}
+    for name in names:
+      getattr(m, name).assign(stale[name])
+
+    selected = np.array([True, False, True])
+    world_mask = wp.array(selected, dtype=bool)
+    mjwarp.set_const_0(m, d, workspace=workspace, world_mask=world_mask)
+    for name in names:
+      actual = getattr(m, name).numpy()
+      if path == "cuda_fused":
+        # the fused solve's colliding atomics reorder run to run (determinism_test's NONE tolerance)
+        np.testing.assert_allclose(actual[selected], expected[name][selected], rtol=1e-3, atol=1e-3, err_msg=name)
+      else:
+        assert actual[selected].tobytes() == expected[name][selected].tobytes(), name
+      assert actual[~selected].tobytes() == stale[name][~selected].tobytes(), name
+
+    with pytest.raises(ValueError, match="one entry per world"):
+      mjwarp.set_const_0(m, d, workspace=workspace, world_mask=wp.ones(nworld + 1, dtype=bool))
