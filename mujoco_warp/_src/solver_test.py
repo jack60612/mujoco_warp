@@ -695,6 +695,27 @@ class SolverTest(parameterized.TestCase):
     ctx_Mgrad = ctx.Mgrad.numpy()[0, : mjm.nv]
     _assert_eq(ctx_Mgrad, mj_Mgrad[0], name="Mgrad")
 
+  @parameterized.parameters("humanoid/humanoid.xml", "pendula.xml")
+  def test_update_gradient_CG_skips_done_worlds(self, path):
+    """The CG preconditioner solve leaves the Mgrad of done worlds, whose grad is not updated."""
+    _, _, m, d = test_data.fixture(
+      path, nworld=2, qpos_noise=0.2, overrides={"opt.solver": SolverType.CG, "opt.jacobian": mujoco.mjtJacobian.mjJAC_SPARSE}
+    )
+    mjw.fwd_position(m, d)
+    mjw.fwd_velocity(m, d)
+    mjw.fwd_actuation(m, d)
+    mjw.fwd_acceleration(m, d)
+    ctx = solver._create_solver_context(m, d)
+    solver.init_context(m, d, ctx, grad=True)
+    expected = ctx.Mgrad.numpy()
+
+    ctx.done.assign(np.array([False, True]))
+    ctx.Mgrad.fill_(7.0)
+    solver._update_gradient(m, d, ctx)
+    mgrad = ctx.Mgrad.numpy()
+    np.testing.assert_array_equal(mgrad[0].view(np.uint32), expected[0].view(np.uint32))
+    np.testing.assert_array_equal(mgrad[1, : m.nv], np.full(m.nv, 7.0, dtype=np.float32))
+
   def test_linesearch_accepts_sub_float32_improvement(self):
     """Line search should not lose small improvements on large absolute costs."""
     _, _, m, d = test_data.fixture(

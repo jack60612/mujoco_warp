@@ -39,6 +39,26 @@ def _assert_eq(a, b, name):
   np.testing.assert_allclose(a, b, err_msg=err_msg, atol=tol, rtol=tol)
 
 
+def _mixed_blocks_xml():
+  """Three hinge chains, one per factor path of factor_m/solve_m into one qLD.
+
+  A 70-dof chain (one block > M_BLOCK_DENSE_MAX -> sparse LDL), a 6-dof chain (scalar Cholesky) and
+  a 7-dof chain (tile Cholesky). Coupled blocks, not free joints: a free joint on a sphere has
+  diagonal M and would take the compact path, which stores no factor.
+  """
+
+  def _hinge_chain(k, axis):
+    return (
+      "".join(
+        f'<body pos="0 0 .05"><joint type="hinge" axis="{axis}"/><geom type="capsule" size=".02 .025"/>' for _ in range(k)
+      )
+      + "</body>" * k
+    )
+
+  small = "".join(f'<body pos="{i} 0 1">{_hinge_chain(k, "0 1 0")}</body>' for i, k in enumerate((6, 7)))
+  return f"<mujoco><worldbody><body pos='0 0 2'>{_hinge_chain(70, '1 0 0')}</body>{small}</worldbody></mujoco>"
+
+
 class SmoothTest(parameterized.TestCase):
   def test_mocap_kinematics(self):
     """Tests that mocap bodies and child bodies are correctly updated after mocap_pos changes.
@@ -1392,28 +1412,8 @@ class SmoothTest(parameterized.TestCase):
 
   def test_factor_solve_mixed_blocks(self):
     """Per-block factor/solve: sparse LDL, scalar, and tile blocks all share one qLD."""
+    mjm, mjd, m, d = test_data.fixture(xml=_mixed_blocks_xml())
 
-    # A 70-dof hinge chain (one block > M_BLOCK_DENSE_MAX -> sparse LDL), a 6-dof hinge chain
-    # (scalar Cholesky), and a 7-dof hinge chain (tile Cholesky): factor_m/solve_m must run all
-    # three passes into one qLD. (Coupled blocks, not free joints: a free joint on a sphere has
-    # diagonal M and would take the compact path, which stores no factor.)
-    def _hinge_chain(k):
-      return (
-        "".join(
-          '<body pos="0 0 .05"><joint type="hinge" axis="0 1 0"/><geom type="capsule" size=".02 .025"/>' for _ in range(k)
-        )
-        + "</body>" * k
-      )
-
-    n = 70
-    chain = (
-      "".join('<body pos="0 0 .05"><joint type="hinge" axis="1 0 0"/><geom type="capsule" size=".02 .025"/>' for _ in range(n))
-      + "</body>" * n
-    )
-    small = "".join(f'<body pos="{i} 0 1">{_hinge_chain(k)}</body>' for i, k in enumerate((6, 7)))
-    xml = f"<mujoco><worldbody><body pos='0 0 2'>{chain}</body>{small}</worldbody></mujoco>"
-
-    mjm, mjd, m, d = test_data.fixture(xml=xml)
     # genuinely mixed: all three factor paths active in one model
     self.assertTrue(any(tile.elemid.size == 0 for tile in m.M_tiles))
     self.assertTrue(any(tile.elemid.size > 0 for tile in m.M_tiles))
@@ -1428,6 +1428,32 @@ class SmoothTest(parameterized.TestCase):
     res = wp.zeros((1, mjm.nv), dtype=float)
     mjw.solve_m(m, d, res, d.qfrc_smooth)
     _assert_eq(res.numpy()[0], ref[0], "M \\ qfrc_smooth (mixed blocks)")
+
+  @parameterized.parameters(1, 32, 512)
+  def test_solve_m_done(self, block_dim):
+    """Done worlds keep their rows of x; the other worlds get the unmasked solution, bitwise."""
+    nworld = 5
+    mjm, mjd, m, d = test_data.fixture(xml=_mixed_blocks_xml(), nworld=nworld, qpos_noise=0.5)
+    self.assertTrue(any(tile.elemid.size == 0 for tile in m.M_tiles))
+    self.assertTrue(any(tile.elemid.size > 0 for tile in m.M_tiles))
+    self.assertGreater(d.qLD.shape[1], m.qLD_block_total)
+    m.block_dim.solve_LD_sparse_fused = block_dim
+
+    mjw.kinematics(m, d)
+    mjw.com_pos(m, d)
+    mjw.crb(m, d)
+    mjw.factor_m(m, d)
+    y = wp.array(np.random.default_rng(0).standard_normal((nworld, m.nv)), dtype=float)
+    expected = wp.zeros((nworld, m.nv), dtype=float)
+    mjw.solve_m(m, d, expected, y)
+    self.assertFalse(np.allclose(expected.numpy()[0], expected.numpy()[1]))
+
+    done = np.array([False, True, False, True, True])
+    x = wp.full((nworld, m.nv), 7.0, dtype=float)
+    mjw.solve_m(m, d, x, y, done=wp.array(done, dtype=bool))
+    x, expected = x.numpy(), expected.numpy()
+    np.testing.assert_array_equal(x[~done].view(np.uint32), expected[~done].view(np.uint32))
+    np.testing.assert_array_equal(x[done], np.full((done.sum(), m.nv), 7.0, dtype=np.float32))
 
   def test_factor_solve_lu(self):
     """Tests factor_solve_lu with a sparse matrix representing a tree."""
