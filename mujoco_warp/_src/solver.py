@@ -86,6 +86,8 @@ def _create_solver_context(
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
+  # implicitfast CG starts from the previous constraint force (see _solve)
+  alloc_qacc_start = alloc_mgrad and m.opt.integrator == types.IntegratorType.IMPLICITFAST
   alloc_solve_ld_scratch = (
     alloc_mgrad and d.qLD.shape[1] > m.qLD_block_total and bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
   )
@@ -117,6 +119,7 @@ def _create_solver_context(
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     solve_ld_scratch=wp.empty((nworld, nv_pad), dtype=float) if alloc_solve_ld_scratch else None,
     inertia_scale=wp.empty((nworld,), dtype=float),
+    qacc_start=wp.empty((nworld, nv_pad), dtype=float) if alloc_qacc_start else wp.empty((nworld, 0), dtype=float),
   )
 
 
@@ -1683,6 +1686,17 @@ def _mark_constrained_trees(is_sparse: bool):
           tree_constrained_out[worldid, dof_treeid[dofid]] = 1
 
   return kernel
+
+
+@wp.kernel
+def _add_qacc_smooth(
+  # Data in:
+  qacc_smooth_in: wp.array2d[float],
+  # Out:
+  qacc_start_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  qacc_start_out[worldid, dofid] += qacc_smooth_in[worldid, dofid]
 
 
 @cache_kernel
@@ -4209,10 +4223,21 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     )
   else:
     tree_constrained = wp.empty((d.nworld, 0), dtype=int)
+  qacc_start = d.qacc_warmstart
+  if warmstart and not compact and ctx.qacc_start.shape[1]:
+    # implicitfast CG: start at qacc_smooth + M^-1 qfrc_constraint, with qfrc_constraint from the
+    # previous solve, instead of at the previous qacc. The constraint force changes slowly between
+    # steps while qacc follows the commanded motion, so this start lowers the iteration count of
+    # the slowest world (the batched CG loop runs until every world converges). It must be formed
+    # before _solve_init_dof overwrites qfrc_constraint. Either start converges to the same
+    # solution.
+    qacc_start = ctx.qacc_start
+    smooth.solve_m(m, d, qacc_start, d.qfrc_constraint, x_scratch=ctx.solve_ld_scratch)
+    wp.launch(_add_qacc_smooth, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth], outputs=[qacc_start])
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse, free_tree_start),
     dim=(d.nworld, m.nv),
-    inputs=[m.dof_treeid, d.nefc, d.qacc_warmstart, d.qacc_smooth, tree_constrained],
+    inputs=[m.dof_treeid, d.nefc, qacc_start, d.qacc_smooth, tree_constrained],
     outputs=[d.qacc, d.qfrc_constraint],
   )
   if m.opt.integrator == types.IntegratorType.DISCRETE and (m.opt.enableflags & types.EnableBit.SLEEP):
