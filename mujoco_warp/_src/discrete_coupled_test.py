@@ -255,11 +255,16 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     m = mjw.put_model(mjm)
     m.efm_qH_coupled = coupled and m.efm_qH_coupled
     d = mjw.put_data(mjm, mjd)
+    qfrc_constraint = wp.array(mjd.qfrc_constraint[None], dtype=float)  # the previous solve's force
     mjw.forward(m, d)
     self.assertEqual(int(d.nefc.numpy()[0]), 1)
     qacc, qacc_smooth = d.qacc.numpy()[0], d.qacc_smooth.numpy()[0]
     np.testing.assert_array_equal(qacc[free], qacc_smooth[free])
-    np.testing.assert_array_equal(qacc[rowset], 1.0)
+    # the constrained set starts from the previous constraint force, not the qacc warmstart
+    ac = wp.empty((1, mjm.nv), dtype=float)
+    derivative.eff_solve_qH(m, d, ac, qfrc_constraint)
+    np.testing.assert_allclose(qacc[rowset], qacc_smooth[rowset] + ac.numpy()[0][rowset], rtol=1e-5, atol=1e-5)
+    self.assertFalse(np.allclose(qacc[rowset], 1.0))
 
     # converged, the solve matches MuJoCo
     mjm.opt.iterations = 100

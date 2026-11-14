@@ -87,7 +87,10 @@ def _create_solver_context(
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
   has_sparse_factor = d.qLD.shape[1] > m.qLD_block_total or m.efm_qH_coupled
-  alloc_solve_ld_scratch = alloc_mgrad and has_sparse_factor and bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
+  # the CG preconditioner and the discrete warm start (any solver) both solve with the sparse factor
+  alloc_qacc_start = m.opt.integrator == types.IntegratorType.DISCRETE
+  uses_factor_solve = alloc_mgrad or alloc_qacc_start
+  alloc_solve_ld_scratch = uses_factor_solve and has_sparse_factor and bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
 
   return SolverContext(
     Jaref=wp.empty((nworld, njmax), dtype=float),
@@ -116,6 +119,7 @@ def _create_solver_context(
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     solve_ld_scratch=wp.empty((nworld, nv_pad), dtype=float) if alloc_solve_ld_scratch else None,
     inertia_scale=wp.empty((nworld,), dtype=float),
+    qacc_start=wp.empty((nworld, nv_pad), dtype=float) if alloc_qacc_start else wp.empty((nworld, 0), dtype=float),
   )
 
 
@@ -1683,6 +1687,17 @@ def _mark_constrained_trees(is_sparse: bool):
           tree_constrained_out[worldid, tree_coupledid[dof_treeid[dofid]]] = 1
 
   return kernel
+
+
+@wp.kernel
+def _add_qacc_smooth(
+  # Data in:
+  qacc_smooth_in: wp.array2d[float],
+  # Out:
+  qacc_start_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  qacc_start_out[worldid, dofid] += qacc_smooth_in[worldid, dofid]
 
 
 @cache_kernel
@@ -4150,10 +4165,23 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     )
   else:
     tree_constrained = wp.empty((d.nworld, 0), dtype=int)
+  qacc_start = d.qacc_warmstart
+  if warmstart and not compact and m.opt.integrator == types.IntegratorType.DISCRETE:
+    # The discrete integrator puts damping and stiffness in the metric M_hat = M + h*D + h^2*K.
+    # A light DOF whose damping dominates its inertia (h*c/I >> 1) has an acceleration near -v/h
+    # that changes completely every step, so the previous qacc is a stale start for it, and CG
+    # stops on its relative-improvement test long before it corrects that DOF (the lag acts as
+    # explicit damping and grows). The constraint force changes slowly, so warm start it instead:
+    # qacc0 = qacc_smooth + M_hat^-1 qfrc_constraint, with qfrc_constraint from the previous solve.
+    # The metric factor (exact when it holds the couplings, else the backbone that preconditions CG)
+    # applies M_hat^-1; DOFs no row acts on start at their exact solution.
+    qacc_start = ctx.qacc_start
+    derivative.eff_solve_qH(m, d, qacc_start, d.qfrc_constraint, x_scratch=ctx.solve_ld_scratch)
+    wp.launch(_add_qacc_smooth, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth], outputs=[qacc_start])
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse, free_tree_start),
     dim=(d.nworld, m.nv),
-    inputs=[m.dof_treeid, m.tree_coupledid, d.nefc, d.qacc_warmstart, d.qacc_smooth, tree_constrained],
+    inputs=[m.dof_treeid, m.tree_coupledid, d.nefc, qacc_start, d.qacc_smooth, tree_constrained],
     outputs=[d.qacc, d.qfrc_constraint],
   )
   if m.opt.integrator == types.IntegratorType.DISCRETE and (m.opt.enableflags & types.EnableBit.SLEEP):

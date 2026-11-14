@@ -2153,6 +2153,54 @@ class SolverTest(parameterized.TestCase):
     mjw.forward(m, d)
     _assert_eq(d.qacc.numpy()[0], mjd.qacc, "qacc")
 
+  @parameterized.parameters(mujoco.mjtSolver.mjSOL_CG, mujoco.mjtSolver.mjSOL_NEWTON)
+  def test_discrete_warmstart_from_constraint_force(self, solver_):
+    """Discrete solves start at qacc_smooth + M_hat^-1 qfrc_constraint, not at the previous qacc.
+
+    A light FREE body hangs from a CONNECT at its COM; a site damper (h*c/I ~ 1e5) is the only
+    thing acting on its twist. After the twist velocity changes, the previous qacc is far from the
+    new solution, but the previous constraint force (the CONNECT holding gravity) is not.
+    """
+    xml = """
+    <mujoco>
+      <option integrator="discrete" timestep="0.002"/>
+      <worldbody>
+        <site name="anchor" pos="0 0 1"/>
+        <body name="collar" pos="0 0 1">
+          <freejoint/>
+          <geom type="capsule" size=".003 .01" mass="2e-4" contype="0" conaffinity="0"/>
+          <site name="child"/>
+        </body>
+      </worldbody>
+      <equality><connect body1="collar" body2="world" anchor="0 0 0"/></equality>
+      <actuator>
+        <general site="child" refsite="anchor" gear="0 0 0 0 0 1" biastype="affine" biasprm="0 -0.2 -0.025"/>
+      </actuator>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjm.opt.solver = solver_
+    mjd = mujoco.MjData(mjm)
+    for _ in range(50):
+      mujoco.mj_step(mjm, mjd)
+    self.assertGreater(np.abs(mjd.qfrc_constraint[:3]).max(), 1e-3)  # the CONNECT holds the weight
+    mjd.qvel[5] = 1.0  # twist: the damper now dominates the solution
+
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    mjw.forward(m, d)  # converged; also builds qacc_smooth and the metric factor of this step
+    converged = d.qacc.numpy()[0].copy()
+    self.assertGreater(abs(converged[5] - mjd.qacc_warmstart[5]), 100.0)  # the qacc warmstart is far off
+
+    # Solve the same step again without iterations from the previous step's constraint force: the
+    # start must already be the solution (the twist exactly; the CONNECT to rounding).
+    d.qfrc_constraint.assign(mjd.qfrc_constraint[None].astype(np.float32))
+    m.opt.iterations = 0
+    mjw.solve(m, d)
+    start = d.qacc.numpy()[0]
+    np.testing.assert_allclose(start[3:], converged[3:], rtol=1e-4, atol=1e-3)
+    np.testing.assert_allclose(start[:3], converged[:3], atol=1e-2)
+
 
 _FRICTION_CHAIN_XML = """
 <mujoco>

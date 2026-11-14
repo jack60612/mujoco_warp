@@ -2757,6 +2757,8 @@ class SolverContext:
   quad_changed_ids: wp.array2d[int]
   quad_changed_count: wp.array[int]
   inertia_scale: wp.array[float]
+  # discrete warm start qacc_smooth + M_hat^-1 qfrc_constraint, padded like Mgrad (solve scratch)
+  qacc_start: wp.array2d[float]
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None
   compact_d_full: Optional["Data"] = None
