@@ -152,10 +152,11 @@ def compute_interp_cell_quat(
 
 
 @cache_kernel
-def mul_m_kernel(check_skip: bool):
+def mul_m_kernel(check_skip: bool, tree_masked: bool = False):
   @wp.kernel(module="unique", grid_stride=False)
   def _mul_m(
     # Model:
+    dof_treeid: wp.array[int],
     M_mulm_rowadr: wp.array[int],
     M_mulm_col: wp.array[int],
     M_mulm_madr: wp.array[int],
@@ -164,6 +165,7 @@ def mul_m_kernel(check_skip: bool):
     # In:
     vec: wp.array2d[float],
     skip: wp.array[bool],
+    tree_active_in: wp.array2d[int],
     # Out:
     res: wp.array2d[float],
   ):
@@ -172,6 +174,12 @@ def mul_m_kernel(check_skip: bool):
 
     if wp.static(check_skip):
       if skip[worldid]:
+        return
+
+    # M is block diagonal over kinematic trees: an inactive tree's row gathers only zero entries
+    if wp.static(tree_masked):
+      if tree_active_in[worldid, dof_treeid[dofid]] == 0:
+        res[worldid, dofid] = 0.0
         return
 
     # Gather all contributions (diagonal + off-diagonal).
@@ -223,6 +231,7 @@ def mul_m(
   vec: wp.array2d[float],
   skip: Optional[wp.array] = None,
   M: Optional[wp.array] = None,
+  tree_active: Optional[wp.array] = None,
 ):
   """Multiply vectors by inertia matrix; optionally skip per world.
 
@@ -233,9 +242,12 @@ def mul_m(
     vec: Input vector to multiply by M.
     skip: Per-world bitmask to skip computing output.
     M: Input matrix: M @ vec.
+    tree_active: Optional per-(world, tree) flags (nworld, ntree); dofs of inactive trees get 0
+      (`vec` must be zero there; sparse M only).
   """
   check_skip = skip is not None
   skip = skip or wp.empty(0, dtype=bool)
+  tree_masked = tree_active is not None
 
   if M is None:
     M = d.M
@@ -250,9 +262,18 @@ def mul_m(
     )
   else:
     wp.launch(
-      mul_m_kernel(check_skip),
+      mul_m_kernel(check_skip, tree_masked),
       dim=(d.nworld, m.nv),
-      inputs=[m.M_mulm_rowadr, m.M_mulm_col, m.M_mulm_madr, M, vec, skip],
+      inputs=[
+        m.dof_treeid,
+        m.M_mulm_rowadr,
+        m.M_mulm_col,
+        m.M_mulm_madr,
+        M,
+        vec,
+        skip,
+        tree_active if tree_masked else wp.empty((0, 0), dtype=int),
+      ],
       outputs=[res],
     )
 

@@ -3785,11 +3785,12 @@ def _solve_LD_sparse_level(up: bool, deterministic: bool = False):
 
 
 @cache_kernel
-def _solve_LD_sparse_fused(nv: int, nlevels: int, masked: bool = False):
+def _solve_LD_sparse_fused(nv: int, nlevels: int, masked: bool = False, tree_masked: bool = False):
   """Fused sparse backsubstitution: UP + diag + DOWN in one kernel.
 
   With `masked`, the block of a world whose `done_in` flag is set returns at once and leaves its
-  `x_out` row unchanged.
+  `x_out` row unchanged. With `tree_masked`, a world whose `sparse_active_in` flag is 0 (no sparse
+  tree carries an active constraint row) writes zeros to its sparse-block dofs and returns.
   """
 
   @wp.func_native(snippet="WP_TILE_SYNC();")
@@ -3807,6 +3808,7 @@ def _solve_LD_sparse_fused(nv: int, nlevels: int, masked: bool = False):
     level_offsets: wp.array[int],
     y: wp.array2d[float],
     done_in: wp.array[bool],
+    sparse_active_in: wp.array[int],
     # Out:
     x_out: wp.array2d[float],
   ):
@@ -3818,6 +3820,13 @@ def _solve_LD_sparse_fused(nv: int, nlevels: int, masked: bool = False):
     # every thread of the block has the same worldid, so the block returns as a whole
     if wp.static(masked):
       if done_in[worldid]:
+        return
+
+    if wp.static(tree_masked):
+      if sparse_active_in[worldid] == 0:
+        for dofid in range(tid, NV, BLOCK_DIM):
+          if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+            x_out[worldid, dofid] = 0.0
         return
 
     # Copy y to x_out for sparse-block dofs only.
@@ -3866,6 +3875,7 @@ def _solve_LD_sparse(
   y: wp.array2d[float],
   x_scratch: Optional[wp.array] = None,
   done: Optional[wp.array] = None,
+  sparse_active: Optional[wp.array] = None,
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y.
 
@@ -3874,7 +3884,8 @@ def _solve_LD_sparse(
   solve every world.
   """
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = None if det_atomics else _solve_LD_sparse_fused(m.nv, len(m.qLD_updates), done is not None)
+  tree_masked = sparse_active is not None
+  fused = None if det_atomics else _solve_LD_sparse_fused(m.nv, len(m.qLD_updates), done is not None, tree_masked)
   if fused is None or _deterministic_launch(fused):
     x_in = x_scratch if x_scratch is not None else wp.empty_like(x)
     wp.launch(_solve_LD_sparse_copy, dim=(d.nworld, m.nv), inputs=[m.qLD_block_adr, y], outputs=[x])
@@ -3906,7 +3917,16 @@ def _solve_LD_sparse(
   wp.launch(
     fused,
     dim=(d.nworld, dim_block),
-    inputs=[m.qLD_block_adr, L, D, m.qLD_all_updates, m.qLD_level_offsets, y, done],
+    inputs=[
+      m.qLD_block_adr,
+      L,
+      D,
+      m.qLD_all_updates,
+      m.qLD_level_offsets,
+      y,
+      done,
+      sparse_active if tree_masked else wp.empty(0, dtype=int),
+    ],
     outputs=[x],
     block_dim=dim_block,
   )
@@ -3939,10 +3959,11 @@ def _small_cholesky_solve(
 
 
 @cache_kernel
-def _small_cholesky_solve_block(block_size: int, masked: bool = False):
+def _small_cholesky_solve_block(block_size: int, masked: bool = False, tree_masked: bool = False):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
+    dof_treeid: wp.array[int],
     qLD_block_adr: wp.array[int],
     # In:
     block_dof: wp.array[int],
@@ -3950,6 +3971,7 @@ def _small_cholesky_solve_block(block_size: int, masked: bool = False):
     L_in: wp.array2d[float],
     y_in: wp.array2d[float],
     done_in: wp.array[bool],
+    tree_active_in: wp.array2d[int],
     # Out:
     x_out: wp.array2d[float],
   ):
@@ -3959,6 +3981,11 @@ def _small_cholesky_solve_block(block_size: int, masked: bool = False):
         return
     start = block_dof[blk]
     size = wp.static(block_size)
+    if wp.static(tree_masked):
+      if tree_active_in[worldid, dof_treeid[start]] == 0:
+        for i in range(wp.static(block_size)):
+          x_out[worldid, start + i] = 0.0
+        return
     factor_adr = qLD_block_adr[start]
     if factor_adr == Q_LD_BLOCK_COMPACT:
       for i in range(wp.static(block_size)):
@@ -3970,7 +3997,7 @@ def _small_cholesky_solve_block(block_size: int, masked: bool = False):
 
 
 @cache_kernel
-def _tile_cholesky_solve_block(tile: TileSet, masked: bool = False):
+def _tile_cholesky_solve_block(tile: TileSet, masked: bool = False, tree_masked: bool = False):
   # One diagonal block per (world, block) thread group; no densify, so a 2D grid suffices.
   block_size = tile.size
   block_area = block_size * block_size
@@ -3978,12 +4005,14 @@ def _tile_cholesky_solve_block(tile: TileSet, masked: bool = False):
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
+    dof_treeid: wp.array[int],
     qLD_block_adr: wp.array[int],
     # In:
     block_dof: wp.array[int],
     L_in: wp.array2d[float],
     y: wp.array2d[float],
     done_in: wp.array[bool],
+    tree_active_in: wp.array2d[int],
     # Out:
     x: wp.array2d[float],
   ):
@@ -3993,6 +4022,10 @@ def _tile_cholesky_solve_block(tile: TileSet, masked: bool = False):
       if done_in[worldid]:
         return
     start = block_dof[blk]
+    if wp.static(tree_masked):
+      if tree_active_in[worldid, dof_treeid[start]] == 0:
+        wp.tile_store(x[worldid], wp.tile_zeros(shape=(block_size,), dtype=float), offset=(start,))
+        return
 
     L = wp.tile_reshape(
       wp.tile_load(L_in[worldid], shape=(block_area,), offset=(qLD_block_adr[start],)), (block_size, block_size)
@@ -4012,14 +4045,17 @@ def _solve_blocks(
   x: wp.array2d[float],
   y: wp.array2d[float],
   done: Optional[wp.array] = None,
+  tree_active: Optional[wp.array] = None,
 ):
   masked = done is not None
+  tree_masked = tree_active is not None
+  tree_active = tree_active if tree_masked else wp.empty((0, 0), dtype=int)
   for tile in m.M_tiles:
     if tile.elemid.size == 0:
       wp.launch(
-        _small_cholesky_solve_block(tile.size, masked),
+        _small_cholesky_solve_block(tile.size, masked, tree_masked),
         dim=(d.nworld, tile.adr.size),
-        inputs=[m.qLD_block_adr, tile.adr, D, L, y, done],
+        inputs=[m.dof_treeid, m.qLD_block_adr, tile.adr, D, L, y, done, tree_active],
         outputs=[x],
         block_dim=m.block_dim.small_cholesky,
       )
@@ -4028,9 +4064,9 @@ def _solve_blocks(
       # for better occupancy while moderate blocks still want a couple warps (16/27->64, 60->32).
       block_dim = m.block_dim.cholesky_solve if tile.size <= 40 else 32
       wp.launch_tiled(
-        _tile_cholesky_solve_block(tile, masked),
+        _tile_cholesky_solve_block(tile, masked, tree_masked),
         dim=(d.nworld, tile.adr.size),
-        inputs=[m.qLD_block_adr, tile.adr, L, y, done],
+        inputs=[m.dof_treeid, m.qLD_block_adr, tile.adr, L, y, done, tree_active],
         outputs=[x],
         block_dim=block_dim,
       )
@@ -4045,6 +4081,8 @@ def solve_LD(
   y: wp.array2d[float],
   x_scratch: Optional[wp.array] = None,
   done: Optional[wp.array] = None,
+  tree_active: Optional[wp.array] = None,
+  sparse_active: Optional[wp.array] = None,
 ):
   """Computes backsubstitution for the inertia factorization.
 
@@ -4061,11 +4099,16 @@ def solve_LD(
     x_scratch: Preallocated scratch array for deterministic sparse backsubstitution.
     done: Optional per-world flags (nworld,). The block and fused sparse kernels skip done worlds
       and leave their rows of x unchanged (the deterministic per-level sparse path solves them).
+    tree_active: Optional per-(world, tree) flags (nworld, ntree): blocks of inactive trees write
+      zeros instead of solving (their right-hand side is zero).
+    sparse_active: Optional per-world flags (nworld,), with `tree_active`: worlds without an active
+      sparse-LDL tree write zeros to the sparse region instead of the fused back-substitution (the
+      deterministic per-level path solves it).
   """
   if m.M_tiles:
-    _solve_blocks(m, d, L, D, x, y, done=done)
+    _solve_blocks(m, d, L, D, x, y, done=done, tree_active=tree_active)
   if L.shape[1] > m.qLD_block_total:
-    _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch, done=done)
+    _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch, done=done, sparse_active=sparse_active)
 
 
 @event_scope
@@ -4076,6 +4119,8 @@ def solve_m(
   y: wp.array2d[float],
   x_scratch: Optional[wp.array] = None,
   done: Optional[wp.array] = None,
+  tree_active: Optional[wp.array] = None,
+  sparse_active: Optional[wp.array] = None,
 ):
   """Computes backsubstitution: x = qLD * y.
 
@@ -4086,8 +4131,10 @@ def solve_m(
     y: Input right-hand side array.
     x_scratch: Preallocated scratch array for deterministic sparse backsubstitution.
     done: Optional per-world flags (nworld,); see `solve_LD`.
+    tree_active: Optional per-(world, tree) flags; see `solve_LD`.
+    sparse_active: Optional per-world sparse-region flags; see `solve_LD`.
   """
-  solve_LD(m, d, d.qLD, d.qLDiagInv, x, y, x_scratch=x_scratch, done=done)
+  solve_LD(m, d, d.qLD, d.qLDiagInv, x, y, x_scratch=x_scratch, done=done, tree_active=tree_active, sparse_active=sparse_active)
 
 
 @cache_kernel
