@@ -3453,7 +3453,10 @@ def _jtdaj_inherited_records_per_thread(kernel: wp.Kernel, block_dim: int) -> in
   options = kernel.module.options
   if options.get("deterministic", wp.config.deterministic) == wp.DeterministicMode.NOT_GUARANTEED:
     return 0
-  meta = kernel.module.load(device, block_dim).get_kernel_hooks(kernel).det_launch_meta
+  hooks = kernel.module.load(device, block_dim).get_kernel_hooks(kernel)
+  # Warp 1.17 snapshots the metadata of each loaded module variant on its launch hooks; Warp 1.15
+  # has no snapshot and launches with the metadata that loading builds on the kernel's adjoint.
+  meta = hooks.det_launch_meta if hasattr(hooks, "det_launch_meta") else getattr(kernel.adj, "det_meta", None)
   if meta is None:
     return 0
   floor = int(options.get("deterministic_max_records", 0) or 0)
