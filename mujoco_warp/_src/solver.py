@@ -29,6 +29,7 @@ from mujoco_warp._src.block_cholesky import create_blocked_cholesky_augmented_fa
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_factorize_solve_func
 from mujoco_warp._src.block_cholesky import create_blocked_cholesky_solve_newton_func
 from mujoco_warp._src.block_cholesky import solve_search_sums
+from mujoco_warp._src.types import Q_LD_BLOCK_SPARSE
 from mujoco_warp._src.types import InverseContext
 from mujoco_warp._src.types import OverflowType
 from mujoco_warp._src.types import SolverContext
@@ -1621,7 +1622,7 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext):
   skip = ctx.search_unchanged if _use_incremental(m) else ctx.done
 
   # mv = M @ search (common to both parallel and iterative)
-  _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip)
+  _mul_m_compact_aware(m, d, ctx, ctx.mv, ctx.search, skip, tree_active=ctx.tree_active)
 
   # Fuse jv computation in-kernel for small nv (iterative only, dense only)
   # Sparse mode requires pre-computed jv since in-kernel uses dense indexing
@@ -1659,6 +1660,64 @@ def _linesearch(m: types.Model, d: types.Data, ctx: SolverContext):
     )
 
   _linesearch_iterative(m, d, ctx, fuse_jv)
+
+
+@wp.kernel
+def _mark_sparse_active(
+  # Model:
+  tree_dofadr: wp.array[int],
+  tree_dofnum: wp.array[int],
+  qLD_block_adr: wp.array[int],
+  # In:
+  tree_active_in: wp.array2d[int],
+  # Out:
+  sparse_active_out: wp.array[int],
+):
+  worldid, treeid = wp.tid()
+  if tree_dofnum[treeid] == 0 or tree_active_in[worldid, treeid] == 0:
+    return
+  if qLD_block_adr[tree_dofadr[treeid]] == Q_LD_BLOCK_SPARSE:
+    sparse_active_out[worldid] = 1
+
+
+@wp.kernel
+def _refine_unconstrained_trees(
+  # Model:
+  dof_treeid: wp.array[int],
+  # Data in:
+  qacc_in: wp.array2d[float],
+  qfrc_smooth_in: wp.array2d[float],
+  # In:
+  tree_constrained_in: wp.array2d[int],
+  ctx_Mgrad_in: wp.array2d[float],
+  # Data out:
+  qacc_out: wp.array2d[float],
+  efc_Ma_out: wp.array2d[float],
+  # Out:
+  ctx_grad_out: wp.array2d[float],
+  ctx_Mgrad_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  if tree_constrained_in[worldid, dof_treeid[dofid]] != 0:
+    return
+  # qacc_smooth + M^-1 (qfrc_smooth - M @ qacc_smooth): the init gradient is the solve's residual
+  qacc_out[worldid, dofid] = qacc_in[worldid, dofid] - ctx_Mgrad_in[worldid, dofid]
+  efc_Ma_out[worldid, dofid] = qfrc_smooth_in[worldid, dofid]
+  ctx_grad_out[worldid, dofid] = 0.0
+  ctx_Mgrad_out[worldid, dofid] = 0.0
+
+
+def _set_tree_mask(m: types.Model, d: types.Data, ctx: SolverContext, tree_constrained: wp.array):
+  """Restricts the CG iterations to trees with rows (`ctx.tree_active`, `ctx.sparse_active`)."""
+  sparse_active = wp.zeros((d.nworld,), dtype=int)
+  wp.launch(
+    _mark_sparse_active,
+    dim=(d.nworld, m.ntree),
+    inputs=[m.tree_dofadr, m.tree_dofnum, m.qLD_block_adr, tree_constrained],
+    outputs=[sparse_active],
+  )
+  ctx.tree_active = tree_constrained
+  ctx.sparse_active = sparse_active
 
 
 @cache_kernel
@@ -2386,38 +2445,50 @@ def _update_gradient_grad(stable_fast: bool, deterministic: bool = False):
   return kernel
 
 
-@wp.kernel(module="unique")
-def _update_gradient_grad_tiled(
-  # Model:
-  nv: int,
-  # Data in:
-  qfrc_smooth_in: wp.array2d[float],
-  qfrc_constraint_in: wp.array2d[float],
-  efc_Ma_in: wp.array2d[float],
-  # In:
-  ctx_done_in: wp.array[bool],
-  # Out:
-  ctx_grad_out: wp.array2d[float],
-  ctx_grad_dot_out: wp.array[float],
-):
-  worldid, tid = wp.tid()
+@cache_kernel
+def _update_gradient_grad_tiled(tree_masked: bool = False):
+  @wp.kernel(module="unique")
+  def kernel(
+    # Model:
+    nv: int,
+    dof_treeid: wp.array[int],
+    # Data in:
+    qfrc_smooth_in: wp.array2d[float],
+    qfrc_constraint_in: wp.array2d[float],
+    efc_Ma_in: wp.array2d[float],
+    # In:
+    ctx_done_in: wp.array[bool],
+    tree_active_in: wp.array2d[int],
+    # Out:
+    ctx_grad_out: wp.array2d[float],
+    ctx_grad_dot_out: wp.array[float],
+  ):
+    worldid, tid = wp.tid()
 
-  if ctx_done_in[worldid]:
-    return
+    if ctx_done_in[worldid]:
+      return
 
-  local_grad_dot = float(0.0)
-  BLOCK_DIM = wp.block_dim()
+    local_grad_dot = float(0.0)
+    BLOCK_DIM = wp.block_dim()
 
-  for dofid in range(tid, nv, BLOCK_DIM):
-    grad = efc_Ma_in[worldid, dofid] - qfrc_smooth_in[worldid, dofid] - qfrc_constraint_in[worldid, dofid]
-    ctx_grad_out[worldid, dofid] = grad
-    local_grad_dot += grad * grad
+    for dofid in range(tid, nv, BLOCK_DIM):
+      grad = float(0.0)
+      active = True
+      if wp.static(tree_masked):
+        # an unconstrained tree was solved at the start (Option.skip_unconstrained_trees)
+        active = tree_active_in[worldid, dof_treeid[dofid]] != 0
+      if active:
+        grad = efc_Ma_in[worldid, dofid] - qfrc_smooth_in[worldid, dofid] - qfrc_constraint_in[worldid, dofid]
+      ctx_grad_out[worldid, dofid] = grad
+      local_grad_dot += grad * grad
 
-  grad_dot_tile = wp.tile(local_grad_dot, preserve_type=True)
-  grad_dot_sum = wp.tile_reduce(wp.add, grad_dot_tile)
+    grad_dot_tile = wp.tile(local_grad_dot, preserve_type=True)
+    grad_dot_sum = wp.tile_reduce(wp.add, grad_dot_tile)
 
-  if tid == 0:
-    ctx_grad_dot_out[worldid] = grad_dot_sum[0]
+    if tid == 0:
+      ctx_grad_dot_out[worldid] = grad_dot_sum[0]
+
+  return kernel
 
 
 # sparse Newton Hessian init: lanes per (world, row), row-start alignment (floats per 32 B sector)
@@ -3486,10 +3557,19 @@ def _jtdaj_inherited_records_per_thread(kernel: wp.Kernel, block_dim: int) -> in
 def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = False):
   # grad = Ma - qfrc_smooth - qfrc_constraint
   if m.opt.solver == types.SolverType.CG:
+    tree_masked = ctx.tree_active is not None
     wp.launch_tiled(
-      _update_gradient_grad_tiled,
+      _update_gradient_grad_tiled(tree_masked),
       dim=d.nworld,
-      inputs=[m.nv, d.qfrc_smooth, d.qfrc_constraint, d.efc.Ma, ctx.done],
+      inputs=[
+        m.nv,
+        m.dof_treeid,
+        d.qfrc_smooth,
+        d.qfrc_constraint,
+        d.efc.Ma,
+        ctx.done,
+        ctx.tree_active if tree_masked else wp.empty((0, 0), dtype=int),
+      ],
       outputs=[ctx.grad, ctx.grad_dot],
       block_dim=m.block_dim.update_gradient_grad,
     )
@@ -3517,7 +3597,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       else:
         smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, ctx.Mgrad, ctx.grad, done=ctx.done)
     else:
-      smooth.solve_m(m, d, ctx.Mgrad, ctx.grad, done=ctx.done)
+      smooth.solve_m(m, d, ctx.Mgrad, ctx.grad, done=ctx.done, tree_active=ctx.tree_active, sparse_active=ctx.sparse_active)
   elif m.opt.solver == types.SolverType.NEWTON:
     # h = M + (efc_J.T * efc_D * active) @ efc_J
     sc = _sparse_compact(ctx)
@@ -4256,6 +4336,18 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   #  context
   init_context(m, d, ctx, grad=False, compact=compact)
   _update_gradient(m, d, ctx, compact=compact)
+  if m.opt.skip_unconstrained_trees and free_tree_start and m.opt.solver == types.SolverType.CG:
+    # Trees without rows (MuJoCo's unconstrained islands) start at qacc_smooth, their solution.
+    # Their init gradient is the float32 solve's residual M @ qacc_smooth - qfrc_smooth: take one
+    # iterative-refinement step there and give the integrators their exact force qfrc_smooth,
+    # then restrict the iterations (gradient, M^-1 solve, M @ search) to the constrained trees.
+    wp.launch(
+      _refine_unconstrained_trees,
+      dim=(d.nworld, m.nv),
+      inputs=[m.dof_treeid, d.qacc, d.qfrc_smooth, tree_constrained, ctx.Mgrad],
+      outputs=[d.qacc, d.efc.Ma, ctx.grad, ctx.Mgrad],
+    )
+    _set_tree_mask(m, d, ctx, tree_constrained)
 
   if _use_incremental(m):
     # A new solve computes a new search direction: invalidate the mv/jv reuse
@@ -4382,8 +4474,19 @@ def _sparse_compact(ctx: SolverContext | InverseContext) -> bool:
   return ctx.compact_d_full is not None and ctx.compact_m_full.is_sparse
 
 
-def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | InverseContext, res, vec, skip):
-  """M @ vec: full-coordinate sparse walk under compact, support.mul_m natively."""
+def _mul_m_compact_aware(
+  m: types.Model,
+  d: types.Data,
+  ctx: SolverContext | InverseContext,
+  res,
+  vec,
+  skip,
+  tree_active: wp.array | None = None,
+):
+  """M @ vec: full-coordinate sparse walk under compact, support.mul_m natively.
+
+  `tree_active` (native solves only) zeroes the rows of inactive trees, where `vec` is zero.
+  """
   if m.opt.integrator == types.IntegratorType.DISCRETE:
     derivative.eff_mul_m(m, d, res, vec, skip=skip, efm_con=ctx.efm_con, flex_scratch=ctx.flex_scratch)
     return
@@ -4406,7 +4509,7 @@ def _mul_m_compact_aware(m: types.Model, d: types.Data, ctx: SolverContext | Inv
       outputs=[res],
     )
   else:
-    support.mul_m(m, d, res, vec, skip=skip)
+    support.mul_m(m, d, res, vec, skip=skip, tree_active=tree_active)
 
 
 @wp.kernel

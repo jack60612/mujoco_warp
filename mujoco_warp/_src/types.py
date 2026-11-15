@@ -1026,6 +1026,11 @@ class Option:
                                    and tendon damping couplings outside the kinematic-tree
                                    sparsity of M (e.g. between trees) to the implicitfast
                                    velocity solve; 0 (default) keeps the native tree-sparse solve
+    skip_unconstrained_trees: CG with warmstart (non-discrete integrators): kinematic trees without
+                              constraint rows (MuJoCo's unconstrained islands) take one
+                              iterative-refinement step from qacc_smooth at the solver start and
+                              are then skipped by the iterations (gradient, M^-1 solve,
+                              M @ search); False (default) iterates every dof
     warn_overflow: overflow warning bitmask (OverflowType)
     deterministic: determinism bitmask (DeterminismType)
   """
@@ -1061,6 +1066,7 @@ class Option:
   run_rne_postconstraint: bool
   contact_sensor_maxmatch: int
   implicit_crosstree_iterations: int
+  skip_unconstrained_trees: bool
   warn_overflow: int
   deterministic: int
 
@@ -2763,6 +2769,11 @@ class SolverContext:
   # inside wp.capture_while where memory cannot be allocated (None otherwise)
   efm_con: Optional[tuple] = None
   flex_scratch: Optional[tuple] = None
+  # Option.skip_unconstrained_trees (None when off): per-(world, tree) constraint-row flags and
+  # per-world flags for whether any sparse-LDL tree has rows; the per-iteration gradient, M^-1
+  # solve and M @ search skip trees without rows
+  tree_active: Optional[wp.array] = None
+  sparse_active: Optional[wp.array] = None
 
 
 @dataclasses.dataclass

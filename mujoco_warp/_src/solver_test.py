@@ -1300,7 +1300,8 @@ class SolverTest(parameterized.TestCase):
     """Ensure CG tiled kernels with custom block_dim do not share solver.py's module."""
     shared_module = solver._solve_init_efc.module
     self.assertNotEqual(solver._solve_init_search_cg_tiled.module, shared_module)
-    self.assertNotEqual(solver._update_gradient_grad_tiled.module, shared_module)
+    for tree_masked in (False, True):
+      self.assertNotEqual(solver._update_gradient_grad_tiled(tree_masked).module, shared_module)
     self.assertNotEqual(solver._solve_search_update_cg_tiled.module, shared_module)
 
   @parameterized.parameters(False, True)
@@ -2213,6 +2214,127 @@ class SolverTest(parameterized.TestCase):
     d = mjw.put_data(mjm, mjd)
     mjw.forward(m, d)
     _assert_eq(d.qacc.numpy()[0], mjd.qacc, "qacc")
+
+
+def _hinge_chain(name: str, n: int, pos: str, axis: str) -> str:
+  bodies = "".join(
+    f'<body name="{name}{i}" pos="{pos if i == 0 else "0 0 -0.05"}"><joint type="hinge" axis="{axis}" damping="0.5" '
+    'stiffness="50" armature="0.001"/><geom type="capsule" size="0.01 0.025" pos="0 0 -0.025" mass="0.2"/>'
+    for i in range(n)
+  )
+  return bodies + "</body>" * n
+
+
+# Trees: a 70-hinge chain (sparse LDL block) that reaches the floor only when hanging straight,
+# a 10-hinge chain (tile block) and a free sphere, both airborne, and a free sphere on the floor.
+_SKIP_TREES_XML = f"""
+<mujoco>
+  <option solver="CG" iterations="100" ls_iterations="50" integrator="implicitfast" jacobian="sparse" timestep="0.001"/>
+  <worldbody>
+    <geom type="plane" size="10 10 .1"/>
+    {_hinge_chain("a", 70, "0 0 3.45", "1 0 0")}
+    {_hinge_chain("b", 10, "1 0 2", "0 1 0")}
+    <body pos="2 0 1"><freejoint/><geom size=".05" mass=".2"/></body>
+    <body pos="3 0 .049"><freejoint/><geom size=".05" mass=".2"/></body>
+  </worldbody>
+</mujoco>
+"""
+
+
+class SkipUnconstrainedTreesTest(parameterized.TestCase):
+  """opt.skip_unconstrained_trees: CG iterates only kinematic trees with constraint rows."""
+
+  def _setup(self, skip: bool, nworld: int = 4):
+    mjm = mujoco.MjModel.from_xml_string(_SKIP_TREES_XML)
+    mjd = mujoco.MjData(mjm)
+    m = mjw.put_model(mjm)
+    m.opt.skip_unconstrained_trees = skip
+    d = mjw.put_data(mjm, mjd, nworld=nworld, nconmax=64, njmax=512)
+    qpos = d.qpos.numpy()
+    qpos[:, 0] = [1.2 if w % 2 == 0 else 0.0 for w in range(nworld)]  # even worlds: long chain clear of the floor
+    qpos[:, 70] = 0.5  # swing the short chain
+    d.qpos.assign(qpos)
+    return mjm, m, d
+
+  def _reference(self, mjm, hinge0: float):
+    mjd = mujoco.MjData(mjm)
+    mjd.qpos[0] = hinge0
+    mjd.qpos[70] = 0.5
+    mujoco.mj_forward(mjm, mjd)
+    return mjd
+
+  def test_default_off(self):
+    m = mjw.put_model(mujoco.MjModel.from_xml_string(_SKIP_TREES_XML))
+    self.assertFalse(m.opt.skip_unconstrained_trees)
+
+  def test_forward_matches_mujoco(self):
+    """Unconstrained trees are as close to float64 MuJoCo C as stock CG; constrained trees agree."""
+    mjm = mujoco.MjModel.from_xml_string(_SKIP_TREES_XML)
+    refs = [self._reference(mjm, 1.2), self._reference(mjm, 0.0)]
+    treeid = mjm.dof_treeid
+    self.assertEqual(refs[0].tree_island[0], -1)  # clear chain: an unconstrained island in MuJoCo C
+    self.assertGreaterEqual(refs[1].tree_island[0], 0)
+    self.assertGreaterEqual(refs[0].tree_island[3], 0)  # sphere on the floor
+
+    out = {}
+    for skip in (False, True):
+      _, m, d = self._setup(skip)
+      mjw.forward(m, d)
+      out[skip] = {k: v.numpy() for k, v in (("qacc", d.qacc), ("Ma", d.efc.Ma), ("niter", d.solver_niter))}
+      out[skip]["qfrc_smooth"] = d.qfrc_smooth.numpy()
+
+    on, off = out[True], out[False]
+    np.testing.assert_array_less(on["niter"], off["niter"] + 1)
+    for w in range(4):
+      ref = refs[w % 2]
+      free = ref.tree_island[treeid] < 0
+      # Unconstrained trees: exact force for the integrators, refined acceleration.
+      np.testing.assert_array_equal(on["Ma"][w, free], on["qfrc_smooth"][w, free])
+      for tree in np.unique(treeid[free]):
+        sel = treeid == tree
+        scale = np.abs(ref.qacc[sel]).max()
+        err_on = np.abs(on["qacc"][w, sel] - ref.qacc[sel]).max() / scale
+        err_off = np.abs(off["qacc"][w, sel] - ref.qacc[sel]).max() / scale
+        self.assertLessEqual(err_on, err_off * 1.01 + 1e-6, f"world {w} tree {tree}")
+      # Constrained trees: the same CG solve.
+      sel = ~free
+      scale = np.abs(ref.qacc[sel]).max()
+      err_on = np.abs(on["qacc"][w, sel] - ref.qacc[sel]).max() / scale
+      err_off = np.abs(off["qacc"][w, sel] - ref.qacc[sel]).max() / scale
+      self.assertLess(err_on, max(2.0 * err_off, 1e-3), f"world {w} constrained")
+
+  def test_trajectory_matches_mujoco(self):
+    """After 100 implicitfast steps the clear chain is as close to MuJoCo C as the stock CG."""
+    mjm = mujoco.MjModel.from_xml_string(_SKIP_TREES_XML)
+    ref = self._reference(mjm, 1.2)
+    for _ in range(100):
+      mujoco.mj_step(mjm, ref)
+    self.assertEqual(ref.tree_island[0], -1)
+    qadr = mjm.jnt_qposadr[mjm.dof_jntid[mjm.dof_treeid == 0]]
+    err = {}
+    for skip in (False, True):
+      _, m, d = self._setup(skip, nworld=1)
+      for _ in range(100):
+        mjw.step(m, d)
+      err[skip] = np.abs(d.qpos.numpy()[0, qadr] - ref.qpos[qadr]).max()
+    self.assertLessEqual(err[True], err[False])
+
+  def test_graph_capture(self):
+    """The masked solve captures into a CUDA graph and replays like eager steps."""
+    if not wp.get_device().is_cuda:
+      self.skipTest("CUDA graph capture needs a CUDA device")
+    _, m, d = self._setup(True)
+    _, m_eager, d_eager = self._setup(True)
+    mjw.step(m, d)  # compile outside capture
+    mjw.step(m_eager, d_eager)
+    with wp.ScopedCapture() as capture:
+      mjw.step(m, d)
+    mjw.step(m_eager, d_eager)
+    for _ in range(5):
+      wp.capture_launch(capture.graph)
+      mjw.step(m_eager, d_eager)
+    np.testing.assert_allclose(d.qpos.numpy(), d_eager.qpos.numpy(), rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(d.efc.Ma.numpy(), d_eager.efc.Ma.numpy(), rtol=1e-5, atol=1e-5)
 
 
 _FRICTION_CHAIN_XML = """
