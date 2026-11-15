@@ -2819,11 +2819,15 @@ def _elliptic_hessian_entry_from_projections(
 
 
 @cache_kernel
-def _update_gradient_JTCJ_dense(nblocks_perblock: int, deterministic: bool = False):
+def _update_gradient_JTCJ_dense(deterministic: bool = False):
+  # Deterministic launches use one block: each thread owns one Hessian element and adds the
+  # contacts in contact order without atomics. Recorded atomics would reserve elements x contacts
+  # scatter records per launch, which captured graphs retain.
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nblocks_perblock
+    # the deterministic variant has no atomics
+    module_options["deterministic_max_records"] = 0
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -2924,7 +2928,10 @@ def _update_gradient_JTCJ_dense(nblocks_perblock: int, deterministic: bool = Fal
         tangent_dot,
       )
 
-      wp.atomic_add(ctx_h_out, worldid, dof1id, dof2id, h)
+      if wp.static(deterministic):
+        ctx_h_out[worldid, dof1id, dof2id] = ctx_h_out[worldid, dof1id, dof2id] + h
+      else:
+        wp.atomic_add(ctx_h_out, worldid, dof1id, dof2id, h)
 
   return kernel
 
@@ -3658,7 +3665,12 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       # of SMs on the GPU. We can now query the SM count:
       # https://github.com/NVIDIA/warp/commit/f3814e7e5459e5fd13032cf0fddb3daddd510f30
 
-      if wp.get_device().is_cuda:
+      if det_atomics or not wp.get_device().is_cuda:
+        # deterministic: one thread per Hessian element, the element's only writer
+        # TODO(team): support non-CUDA parallelism
+        dim_block = 1
+        nblocks_perblock = d.naconmax
+      else:
         sm_count = wp.get_device().sm_count
 
         # Here we assume one block has 256 threads. We use a factor of 6, which
@@ -3667,14 +3679,9 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         # simultaneously run on the SM. TODO: This factor can be tuned further.
         dim_block = ceil((sm_count * 6 * 256) / m.dof_tri_row.size)
         nblocks_perblock = int((d.naconmax + dim_block - 1) / dim_block)
-      else:
-        # fall back for CPU
-        # TODO(team): support non-CUDA parallelism
-        dim_block = 1
-        nblocks_perblock = d.naconmax
 
       wp.launch(
-        _update_gradient_JTCJ_dense(nblocks_perblock if det_atomics else 0, det_atomics),
+        _update_gradient_JTCJ_dense(det_atomics),
         dim=(dim_block, m.dof_tri_row.size),
         inputs=[
           m.opt.impratio_invsqrt,

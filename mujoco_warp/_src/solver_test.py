@@ -1303,8 +1303,12 @@ class SolverTest(parameterized.TestCase):
     self.assertNotEqual(solver._update_gradient_grad_tiled.module, shared_module)
     self.assertNotEqual(solver._solve_search_update_cg_tiled.module, shared_module)
 
-  def test_elliptic_dense_hessian(self):
-    """Structured dense cone contraction matches the reference Hessian."""
+  @parameterized.parameters(False, True)
+  def test_elliptic_dense_hessian(self, single_block):
+    """Structured dense cone contraction matches the reference Hessian.
+
+    `single_block` is the deterministic layout: one thread per Hessian element sums all contacts.
+    """
     condims = (3, 4, 6)
     bodies = "".join(
       f'<body pos="{i * 0.25 - 0.25:.3f} 0 0.020">'
@@ -1333,14 +1337,14 @@ class SolverTest(parameterized.TestCase):
     ctx.h.zero_()
     ctx.done.fill_(False)
 
-    if wp.get_device().is_cuda:
+    if wp.get_device().is_cuda and not single_block:
       dim_block = (wp.get_device().sm_count * 6 * 256 + m.dof_tri_row.size - 1) // m.dof_tri_row.size
       nblocks_perblock = (d.naconmax + dim_block - 1) // dim_block
     else:
       dim_block = 1
       nblocks_perblock = d.naconmax
     wp.launch(
-      solver._update_gradient_JTCJ_dense(0),
+      solver._update_gradient_JTCJ_dense(single_block),
       dim=(dim_block, m.dof_tri_row.size),
       inputs=[
         m.opt.impratio_invsqrt,
