@@ -2727,6 +2727,59 @@ class DeterministicJTDAJTest(absltest.TestCase):
     _assert_eq(qacc[0], mjd.qacc, "qacc")
     self.assertLess(retained, retained_default)
 
+  def test_run_to_run_dense_elliptic_solve_matches_and_shrinks_captured_buffers(self):
+    """Inherited RUN_TO_RUN dense elliptic JTCJ launches reserve their loop bound only."""
+    bodies = "".join(
+      f'<body pos="{(i % 3) * 0.25 - 0.25:.3f} {(i // 3) * 0.25 - 0.1:.3f} 0.020">'
+      f'<freejoint/><geom type="box" size="0.04 0.05 0.03" mass="0.5" condim="{(3, 4, 6)[i % 3]}"/></body>'
+      for i in range(6)
+    )
+    xml = f"""
+    <mujoco>
+      <option cone="elliptic" solver="Newton" jacobian="dense" iterations="20" ls_iterations="20" integrator="implicitfast"/>
+      <worldbody>
+        <geom name="floor" type="plane" size="5 5 .1" friction="1 0.01 0.001" condim="1"/>
+        {bodies}
+      </worldbody>
+    </mujoco>
+    """
+    mjm, mjd, m, d0 = test_data.fixture(xml=xml)
+    self.assertFalse(m.is_sparse)
+    mjd.qvel[0::6] = 1.5
+    mujoco.mj_forward(mjm, mjd)
+    self.assertGreater(mjd.nefc, 0)
+
+    factory = solver._update_gradient_JTCJ_dense
+
+    def solve(default_sizing: bool):
+      d = mjw.put_data(mjm, mjd)
+      # The default sizing builds the inherited kernel without a bound, as before the cap.
+      uncapped = mock.patch.object(solver, "_update_gradient_JTCJ_dense", lambda n, det=False: factory(n if det else 0, det))
+      with uncapped if default_sizing else nullcontext():
+        mjw.solve(m, d)  # eager: Warp raises on deterministic record overflow
+        qacc = d.qacc.numpy().copy()
+        before = wp.get_mempool_used_mem_current()
+        with wp.ScopedCapture() as capture:
+          mjw.solve(m, d)
+        retained = wp.get_mempool_used_mem_current() - before
+        del capture
+      return qacc, retained
+
+    with (
+      wp.ScopedDevice("cuda:0"),
+      mock.patch.object(wp.config, "deterministic", wp.DeterministicMode.RUN_TO_RUN),
+      # Newton's per-thread bound for MJWarp's generated dense kernels: every constraint row.
+      mock.patch.object(wp.config, "deterministic_max_records", d0.njmax),
+      mock.patch.object(warp_util, "_KERNEL_CACHE", {}),
+    ):
+      qacc_default, retained_default = solve(default_sizing=True)
+      qacc, retained = solve(default_sizing=False)
+
+    # Binned deterministic sums do not depend on the record order; other modules keep float atomics.
+    np.testing.assert_allclose(qacc, qacc_default, rtol=1e-4, atol=1e-4)
+    _assert_eq(qacc[0], mjd.qacc, "qacc")
+    self.assertLess(retained, retained_default)
+
 
 if __name__ == "__main__":
   wp.init()

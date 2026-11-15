@@ -2823,6 +2823,11 @@ def _update_gradient_JTCJ_dense(nblocks_perblock: int, deterministic: bool = Fal
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+  if nblocks_perblock > 0:
+    # Each thread emits at most one atomic per loop iteration. Stating the bound also caps the
+    # records of a kernel that inherits Warp's global deterministic mode, whose global bound
+    # (e.g. Newton's RUN_TO_RUN: every constraint row) would otherwise size each launch's
+    # scatter buffers, which captured graphs retain.
     module_options["deterministic_max_records"] = nblocks_perblock
 
   @wp.kernel(module="unique", module_options=module_options)
@@ -3673,8 +3678,9 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
         dim_block = 1
         nblocks_perblock = d.naconmax
 
+      inherited = wp.config.deterministic != wp.DeterministicMode.NOT_GUARANTEED
       wp.launch(
-        _update_gradient_JTCJ_dense(nblocks_perblock if det_atomics else 0, det_atomics),
+        _update_gradient_JTCJ_dense(nblocks_perblock if det_atomics or inherited else 0, det_atomics),
         dim=(dim_block, m.dof_tri_row.size),
         inputs=[
           m.opt.impratio_invsqrt,
