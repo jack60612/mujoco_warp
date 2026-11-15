@@ -1193,6 +1193,22 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_level_offsets_host = tuple(level_offsets)
   m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
 
+  # The same elements grouped by the CSR address they update, one segment per M(i,j) and level, in
+  # element order: deterministic factorizations add a segment in one thread, with no atomics.
+  target_elem, target_adr, target_offsets = [], [], [0]
+  for level in range(len(factor_elem_offsets) - 1):
+    start, stop = factor_elem_offsets[level], factor_elem_offsets[level + 1]
+    order = sorted(range(start, stop), key=lambda e: factor_elem[e][0])
+    for n, e in enumerate(order):
+      if n == 0 or factor_elem[e][0] != factor_elem[order[n - 1]][0]:
+        target_adr.append(len(target_elem))
+      target_elem.append(e)
+    target_offsets.append(len(target_adr))
+  target_adr.append(len(target_elem))
+  m.qLD_factor_target_elem = target_elem if target_elem else [0]
+  m.qLD_factor_target_adr = target_adr
+  m.qLD_factor_target_offsets_host = tuple(target_offsets)
+
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
   # MuJoCo stores diagonal-only in the compact (M_rownnz, M_rowadr) layout
@@ -1418,6 +1434,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nqLD_all_updates": len(m.qLD_all_updates),
       "nqLD_level_offsets": len(m.qLD_level_offsets),
       "nqLD_factor_elem": len(m.qLD_factor_elem),
+      "nqLD_factor_target_adr": len(m.qLD_factor_target_adr),
       "nM_fullm": len(m.M_fullm_i),
       "nqD_fullm": len(m.qD_fullm_i),
       "nv_plus_1": len(m.M_mulm_rowadr),

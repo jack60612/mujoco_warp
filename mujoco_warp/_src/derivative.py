@@ -205,11 +205,11 @@ def _nonzero_mask(x: float) -> float:
 
 
 @cache_kernel
-def _qderiv_actuator_passive_actuation_sparse(nM: int, deterministic: bool = False):
+def _qderiv_actuator_passive_actuation_sparse(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nM
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -298,11 +298,11 @@ def _qderiv_actuator_passive(
 
 
 @cache_kernel
-def _qderiv_tendon_damping(max_ten_J_rownnz: int, deterministic: bool = False):
+def _qderiv_tendon_damping(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = max_ten_J_rownnz
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -1547,8 +1547,13 @@ def deriv_smooth_vel(
       )
       # out (qDeriv) is in M-structure.
       det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
+      # An actuator with r moment nonzeros adds r(r+1)/2 elements and the rows share the nJmom
+      # nonzeros: a launch's records, which Warp pools over its threads, are at most
+      # nJmom(nJmom+1)/2, and a thread's at most nM.
+      nJmom = d.actuator_moment.shape[1]
+      max_records = min(m.nM, -(-nJmom * (nJmom + 1) // (2 * m.nactuator))) if det_atomics and m.nactuator else 0
       wp.launch(
-        _qderiv_actuator_passive_actuation_sparse(m.nM if det_atomics else 0, det_atomics),
+        _qderiv_actuator_passive_actuation_sparse(max_records, det_atomics),
         dim=(d.nworld, m.nactuator),
         inputs=[
           m.M_elemid,
@@ -1585,7 +1590,7 @@ def deriv_smooth_vel(
   if tendon_damper:
     det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
     wp.launch(
-      _qderiv_tendon_damping(m.max_ten_J_rownnz if det_atomics else 0, det_atomics),
+      _qderiv_tendon_damping(smooth._ten_J_pair_records(m) if det_atomics else 0, det_atomics),
       dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
       inputs=[
         m.opt.timestep,

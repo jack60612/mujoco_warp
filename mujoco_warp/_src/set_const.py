@@ -685,8 +685,8 @@ class Const0Workspace:
   as many as fit a fixed scratch budget, at most the largest of those counts).
 
   Under deterministic atomics (``opt.deterministic`` with ``DeterminismType.ATOMICS``) the
-  subtree CoM and composite inertia passes and the sparse factorization read a copy of their
-  previous level; the workspace holds those copies too.
+  subtree CoM and composite inertia passes read a copy of their previous level; the workspace
+  holds those copies too.
   """
 
   def __init__(self, m: types.Model, d: types.Data, rhs_chunk: Optional[int] = None):
@@ -701,8 +701,6 @@ class Const0Workspace:
     self.nacon_saved = wp.empty_like(d.nacon)
     self.rhs = wp.empty((d.nworld, self.rhs_chunk, m.nv), dtype=float, device=device)
     self.result = wp.empty_like(self.rhs)
-    # read copy of the previous level for deterministic sparse backsubstitution
-    self.result_scratch = wp.empty_like(self.rhs)
     self.dof_A_diag = wp.empty((d.nworld, m.nv), dtype=float, device=device)
     self.body_A_diag = wp.zeros((d.nworld, m.nbody, 6), dtype=float, device=device)
     self.moment_nnz = wp.empty((d.nworld,), dtype=int, device=device)
@@ -711,12 +709,9 @@ class Const0Workspace:
     self.all_worlds = wp.full(d.nworld, True, dtype=bool, device=device)
     self.subtree_com_scratch = None
     self.crb_scratch = None
-    self.qLD_scratch = None
     if m.opt.deterministic & types.DeterminismType.ATOMICS:
       self.subtree_com_scratch = wp.empty_like(d.subtree_com)
       self.crb_scratch = wp.empty_like(d.crb)
-      if d.qLD.shape[1] > m.qLD_block_total:
-        self.qLD_scratch = wp.empty((d.nworld, d.qLD.shape[1] - m.qLD_block_total), dtype=float, device=device)
 
 
 def set_const_0(
@@ -784,7 +779,7 @@ def set_const_0(
   smooth.tendon(m, d, workspace.wrap_geom_xpos)
   smooth.crb(m, d, workspace.crb_scratch)
   smooth.tendon_armature(m, d)
-  smooth.factor_m(m, d, workspace.qLD_scratch)
+  smooth.factor_m(m, d)
   smooth.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
 
   wp.launch(
@@ -804,14 +799,13 @@ def set_const_0(
   # HINGE/SLIDE: 1 DOF, gets A[0,0]
   rhs = workspace.rhs
   result = workspace.result
-  scratch = workspace.result_scratch
   chunk = workspace.rhs_chunk
   if m.nv > 0:
     dof_A_diag = workspace.dof_A_diag
 
     for dofadr in range(0, m.nv, chunk):
       wp.launch(_set_unit_vectors, dim=(d.nworld, chunk, m.nv), inputs=[mask, dofadr], outputs=[rhs])
-      smooth.solve_m_batched(m, d, result, rhs, scratch, world_mask)
+      smooth.solve_m_batched(m, d, result, rhs, world_mask)
       wp.launch(_extract_dof_A_diag, dim=(d.nworld, chunk), inputs=[mask, m.nv, dofadr, result], outputs=[dof_A_diag])
 
     wp.launch(
@@ -847,7 +841,7 @@ def set_const_0(
         ],
         outputs=[rhs],
       )
-      smooth.solve_m_batched(m, d, result, rhs, scratch, world_mask)
+      smooth.solve_m_batched(m, d, result, rhs, world_mask)
       wp.launch(
         _compute_body_A_diag_entries,
         dim=(d.nworld, chunk),
@@ -874,7 +868,7 @@ def set_const_0(
         inputs=[mask, m.ntendon, tenadr, m.ten_J_rownnz, m.ten_J_rowadr, m.ten_J_colind, d.ten_J],
         outputs=[rhs],
       )
-      smooth.solve_m_batched(m, d, result, rhs, scratch, world_mask)
+      smooth.solve_m_batched(m, d, result, rhs, world_mask)
       wp.launch(
         _compute_tendon_dot_products,
         dim=(m.tendon_invweight0.shape[0], chunk),
@@ -908,7 +902,7 @@ def set_const_0(
         inputs=[mask, m.nactuator, actadr, d.moment_rownnz, d.moment_rowadr, d.moment_colind, d.actuator_moment],
         outputs=[rhs],
       )
-      smooth.solve_m_batched(m, d, result, rhs, scratch, world_mask)
+      smooth.solve_m_batched(m, d, result, rhs, world_mask)
       wp.launch(
         _compute_actuator_acc0,
         dim=(m.actuator_acc0.shape[0], chunk),
@@ -931,7 +925,7 @@ def set_const_0(
     smooth.tendon(m, d, workspace.wrap_geom_xpos)
     smooth.crb(m, d, workspace.crb_scratch)
     smooth.tendon_armature(m, d)
-    smooth.factor_m(m, d, workspace.qLD_scratch)
+    smooth.factor_m(m, d)
     smooth.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
 
 

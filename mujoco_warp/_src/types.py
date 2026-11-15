@@ -1667,6 +1667,11 @@ class Model:
     qLD_factor_elem_offsets: start offset of each depth level in qLD_factor_elem
     qLD_level_offsets_host: host copy of qLD_level_offsets, for per-level factorization launches
     qLD_factor_elem_offsets_host: host copy of qLD_factor_elem_offsets
+    qLD_factor_target_elem: qLD_factor_elem indices grouped by the address M(i,j) they update,
+                            per level, in element order
+    qLD_factor_target_adr: start of each (level, M(i,j)) segment in qLD_factor_target_elem, then
+                           the number of indices
+    qLD_factor_target_offsets_host: first segment of each level in qLD_factor_target_adr (host)
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2196,6 +2201,9 @@ class Model:
   qLD_factor_elem_offsets: array("nqLD_level_offsets", int)
   qLD_level_offsets_host: tuple[int, ...]
   qLD_factor_elem_offsets_host: tuple[int, ...]
+  qLD_factor_target_elem: array("nqLD_factor_elem", int)
+  qLD_factor_target_adr: array("nqLD_factor_target_adr", int)
+  qLD_factor_target_offsets_host: tuple[int, ...]
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

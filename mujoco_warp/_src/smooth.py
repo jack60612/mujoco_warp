@@ -1118,12 +1118,24 @@ def crb(m: Model, d: Data, crb_scratch: Optional[wp.array] = None):
   )
 
 
+def _ten_J_pair_records(m: Model) -> int:
+  """Deterministic record bound of a (world, tendon, row entry) launch adding pair products.
+
+  Each entry adds its products with the entries at or before it in its tendon row, so a row of r
+  nonzeros emits r(r+1)/2 records, at most nJten * (max_ten_J_rownnz + 1) / 2 per world. Warp pools
+  a launch's records over its threads, so that total, not the longest row, sizes the buffer.
+  """
+  if not m.max_ten_J_rownnz:
+    return 0
+  return -(-m.nJten * (m.max_ten_J_rownnz + 1) // (2 * m.ntendon * m.max_ten_J_rownnz))
+
+
 @cache_kernel
-def _tendon_armature(nv: int, deterministic: bool = False):
+def _tendon_armature(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -1180,9 +1192,9 @@ def _tendon_armature(nv: int, deterministic: bool = False):
         else:
           ten_Jj = float(0.0)
 
-      Mij = armature * ten_Jj * ten_Ji
-
-      wp.atomic_add(M_out[worldid], madr_ij, Mij)
+      # ancestors outside the tendon row add nothing (and would take a deterministic record)
+      if ten_Jj != 0.0:
+        wp.atomic_add(M_out[worldid], madr_ij, armature * ten_Jj * ten_Ji)
       madr_ij -= 1
 
       dofid = dof_parentid[dofid]
@@ -1195,7 +1207,7 @@ def tendon_armature(m: Model, d: Data):
   """Add tendon armature to M."""
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
   wp.launch(
-    _tendon_armature(m.nv if det_atomics else 0, det_atomics),
+    _tendon_armature(_ten_J_pair_records(m) if det_atomics else 0, det_atomics),
     dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
     inputs=[
       m.dof_parentid,
@@ -1209,59 +1221,6 @@ def tendon_armature(m: Model, d: Data):
     ],
     outputs=[d.M],
   )
-
-
-@cache_kernel
-def _qLD_acc(nv: int, deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
-
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    M_rownnz: wp.array[int],
-    M_rowadr: wp.array[int],
-    # In:
-    qLD_updates_: wp.array[wp.vec3i],
-    L_in: wp.array2d[float],
-    # Out:
-    L_out: wp.array2d[float],
-  ):
-    worldid, nodeid = wp.tid()
-    update = qLD_updates_[nodeid]
-    i, k, Madr_ki = update[0], update[1], update[2]
-    Madr_i = M_rowadr[i]  # Address of row being updated
-    diag_k = M_rowadr[k] + M_rownnz[k] - 1  # Address of diagonal element of k
-    # tmp = M(k,i) / M(k,k)
-    tmp = L_in[worldid, Madr_ki] / L_in[worldid, diag_k]
-    for j in range(M_rownnz[i]):
-      # M(i,j) -= M(k,j) * tmp
-      wp.atomic_sub(L_out[worldid], Madr_i + j, L_in[worldid, M_rowadr[k] + j] * tmp)
-    if wp.static(not deterministic):
-      # M(k,i) = tmp
-      L_out[worldid, Madr_ki] = tmp
-
-  return kernel
-
-
-@wp.kernel
-def _qLD_scale(
-  # Model:
-  M_rownnz: wp.array[int],
-  M_rowadr: wp.array[int],
-  # In:
-  qLD_updates_: wp.array[wp.vec3i],
-  L_in: wp.array2d[float],
-  # Out:
-  L_out: wp.array2d[float],
-):
-  worldid, nodeid = wp.tid()
-  update = qLD_updates_[nodeid]
-  k, Madr_ki = update[1], update[2]
-  diag_k = M_rowadr[k] + M_rownnz[k] - 1
-  L_out[worldid, Madr_ki] = L_in[worldid, Madr_ki] / L_in[worldid, diag_k]
 
 
 @wp.kernel
@@ -1396,6 +1355,37 @@ def _qLD_acc_level(
 
 
 @wp.kernel
+def _qLD_acc_level_owned(
+  # Model:
+  qLD_factor_elem: wp.array[wp.vec4i],
+  qLD_factor_target_elem: wp.array[int],
+  qLD_factor_target_adr: wp.array[int],
+  # In:
+  target_adr: int,
+  # Out:
+  L_out: wp.array2d[float],
+):
+  """_qLD_acc_level with one thread per updated M(i,j), applying its elements in order.
+
+  A level updates rows i and reads rows k of deeper dofs, so the segments are independent.
+  """
+  worldid, targetid = wp.tid()
+  segment = target_adr + targetid
+  start = qLD_factor_target_adr[segment]
+  end = qLD_factor_target_adr[segment + 1]
+  Madr_ij = qLD_factor_elem[qLD_factor_target_elem[start]][0]
+  Mij = L_out[worldid, Madr_ij]
+  for adr in range(start, end):
+    # CSR addresses of M(i,j), M(k,j), M(k,i), M(k,k)
+    elem = qLD_factor_elem[qLD_factor_target_elem[adr]]
+    # tmp = M(k,i) / M(k,k)
+    tmp = L_out[worldid, elem[2]] / L_out[worldid, elem[3]]
+    # M(i,j) -= M(k,j) * tmp
+    Mij -= L_out[worldid, elem[1]] * tmp
+  L_out[worldid, Madr_ij] = Mij
+
+
+@wp.kernel
 def _qLD_multipliers_level(
   # Model:
   M_rownnz: wp.array[int],
@@ -1437,15 +1427,15 @@ def _factor_i_sparse(
   M: wp.array2d[float],
   L: wp.array2d[float],
   D: wp.array2d[float],
-  L_scratch: Optional[wp.array2d[float]] = None,
 ):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd.
 
   The fused kernel or one launch per level for the element updates and one for the multipliers;
   both apply the element updates M(i,j) -= M(k,j) * M(k,i) / M(k,k) level by level. Deterministic
-  atomics take v3.17's per-level launches, which read a copy of the previous level (`L_scratch`,
-  shaped like L, allocated if not passed): the fused kernel reads its own atomics, and element
-  launches would reserve scatter records per element.
+  atomics take the per-level launches with one thread per updated M(i,j), which applies its
+  elements in order without atomics: the fused kernel reads its own atomics, and deterministic
+  element atomics would reserve a scatter record per element, which captured graphs retain for
+  every launch.
   """
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
   fused = _factor_sparse_fused(m, d.nworld)
@@ -1453,25 +1443,7 @@ def _factor_i_sparse(
     kernel = _factor_i_sparse_fused(m.nv, len(m.qLD_updates)) if fused else _qLD_acc_level
     det_atomics = _deterministic_launch(kernel)
 
-  if det_atomics:
-    wp.copy(L, M)
-    L_in = L_scratch if L_scratch is not None else wp.empty_like(L)
-    for qLD_updates in reversed(m.qLD_updates):
-      wp.copy(L_in, L)
-      wp.launch(
-        _qLD_acc(m.nv, True),
-        dim=(d.nworld, qLD_updates.size),
-        inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L_in],
-        outputs=[L],
-      )
-      wp.launch(
-        _qLD_scale,
-        dim=(d.nworld, qLD_updates.size),
-        inputs=[m.M_rownnz, m.M_rowadr, qLD_updates, L_in],
-        outputs=[L],
-      )
-    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
-  elif fused:
+  if fused and not det_atomics:
     dim_block = m.block_dim.factor_i_sparse_fused if wp.get_device().is_cuda else 1
     wp.launch(
       kernel,
@@ -1488,23 +1460,32 @@ def _factor_i_sparse(
       outputs=[L, D],
       block_dim=dim_block,
     )
-  else:
-    wp.copy(L, M)
-    levels, elems = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host
-    for level in reversed(range(len(levels) - 1)):
+    return
+
+  wp.copy(L, M)
+  levels, elems, targets = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host, m.qLD_factor_target_offsets_host
+  for level in reversed(range(len(levels) - 1)):
+    if det_atomics:
+      wp.launch(
+        _qLD_acc_level_owned,
+        dim=(d.nworld, targets[level + 1] - targets[level]),
+        inputs=[m.qLD_factor_elem, m.qLD_factor_target_elem, m.qLD_factor_target_adr, targets[level]],
+        outputs=[L],
+      )
+    else:
       wp.launch(
         _qLD_acc_level,
         dim=(d.nworld, elems[level + 1] - elems[level]),
         inputs=[m.qLD_factor_elem, elems[level]],
         outputs=[L],
       )
-      wp.launch(
-        _qLD_multipliers_level,
-        dim=(d.nworld, levels[level + 1] - levels[level]),
-        inputs=[m.M_rownnz, m.M_rowadr, m.qLD_all_updates, levels[level]],
-        outputs=[L],
-      )
-    wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
+    wp.launch(
+      _qLD_multipliers_level,
+      dim=(d.nworld, levels[level + 1] - levels[level]),
+      inputs=[m.M_rownnz, m.M_rowadr, m.qLD_all_updates, levels[level]],
+      outputs=[L],
+    )
+  wp.launch(_qLDiag_div, dim=(d.nworld, m.nv), inputs=[m.M_rownnz, m.M_rowadr, L], outputs=[D])
 
 
 @cache_kernel
@@ -1613,7 +1594,7 @@ def _factor_blocks(
 
 
 @event_scope
-def factor_m(m: Model, d: Data, qLD_scratch: Optional[wp.array2d[float]] = None):
+def factor_m(m: Model, d: Data):
   """Factorization of inertia-like matrix M, assumed spd.
 
   Compact blocks use reciprocal diagonals, full small blocks use scalar Cholesky, larger dense
@@ -1622,14 +1603,11 @@ def factor_m(m: Model, d: Data, qLD_scratch: Optional[wp.array2d[float]] = None)
   Args:
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
-    qLD_scratch: Optional array like the sparse region of d.qLD, read copy of the deterministic
-      sparse factorization; allocated on each call if not passed, which is not allowed inside
-      conditional graph nodes.
   """
   if m.M_tiles:
     _factor_blocks(m, d, d.M, d.qLD, d.qLDiagInv)
   if d.qLD.shape[1] > m.qLD_block_total:
-    _factor_i_sparse(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv, qLD_scratch)
+    _factor_i_sparse(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv)
 
 
 @wp.kernel
@@ -4123,14 +4101,24 @@ def solve_m(
 
 
 @cache_kernel
-def _solve_LD_sparse_fused_batched(nv: int, nlevels: int, masked: bool = False):
-  """`_solve_LD_sparse_fused` with one thread block per (world, right-hand side)."""
+def _solve_LD_sparse_fused_batched(nv: int, nlevels: int, masked: bool = False, serial: bool = False):
+  """`_solve_LD_sparse_fused` with one thread block per (world, right-hand side).
+
+  `serial` launches take one thread per block (block_dim 1): every update then runs in a fixed
+  order without contended atomics, so the solve is run-to-run deterministic without Warp's
+  deterministic scatter records. The module never inherits Warp's deterministic mode, whose
+  deferred atomics this kernel cannot use (it reads its own updates after a barrier).
+  """
 
   @wp.func_native(snippet="WP_TILE_SYNC();")
   def _syncthreads():
     pass
 
-  @wp.kernel(module="unique", enable_backward=False)
+  module_options = {"enable_backward": False}
+  if serial:
+    module_options["deterministic"] = wp.DeterministicMode.NOT_GUARANTEED
+
+  @wp.kernel(module="unique", module_options=module_options)
   def kernel(
     # Model:
     qLD_block_adr: wp.array[int],
@@ -4265,113 +4253,27 @@ def _tile_cholesky_solve_block_batched(tile: TileSet, masked: bool = False):
   return kernel
 
 
-@cache_kernel
-def _solve_LD_sparse_copy_batched(masked: bool = False):
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Model:
-    qLD_block_adr: wp.array[int],
-    # In:
-    world_mask: wp.array[bool],
-    y_in: wp.array3d[float],
-    # Out:
-    x_out: wp.array3d[float],
-  ):
-    worldid, rhsid, dofid = wp.tid()
-    if wp.static(masked):
-      if not world_mask[worldid]:
-        return
-    if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
-      x_out[worldid, rhsid, dofid] = y_in[worldid, rhsid, dofid]
-
-  return kernel
-
-
-@cache_kernel
-def _solve_LD_sparse_diag_batched(masked: bool = False):
-  @wp.kernel(module="unique", enable_backward=False)
-  def kernel(
-    # Model:
-    qLD_block_adr: wp.array[int],
-    # In:
-    world_mask: wp.array[bool],
-    D_in: wp.array2d[float],
-    # Out:
-    x_out: wp.array3d[float],
-  ):
-    worldid, rhsid, dofid = wp.tid()
-    if wp.static(masked):
-      if not world_mask[worldid]:
-        return
-    if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
-      x_out[worldid, rhsid, dofid] *= D_in[worldid, dofid]
-
-  return kernel
-
-
-@cache_kernel
-def _solve_LD_sparse_level_batched(up: bool, masked: bool = False, deterministic: bool = False):
-  """`_solve_LD_sparse_level` over (world, right-hand side, update).
-
-  Only launched deterministically. The record bound is set explicitly (one per thread), so that a
-  caller's global bound is not reserved for every update thread.
-  """
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = 0
-
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # In:
-    world_mask: wp.array[bool],
-    L_in: wp.array2d[float],
-    qLD_updates_: wp.array[wp.vec3i],
-    x_in: wp.array3d[float],
-    # Out:
-    x_out: wp.array3d[float],
-  ):
-    worldid, rhsid, nodeid = wp.tid()
-    if wp.static(masked):
-      if not world_mask[worldid]:
-        return
-    update = qLD_updates_[nodeid]
-    i, k, Madr_ki = update[0], update[1], update[2]
-    if wp.static(up):
-      wp.atomic_sub(x_out[worldid, rhsid], i, L_in[worldid, Madr_ki] * x_in[worldid, rhsid, k])
-    else:
-      wp.atomic_sub(x_out[worldid, rhsid], k, L_in[worldid, Madr_ki] * x_in[worldid, rhsid, i])
-
-  return kernel
-
-
-# Threads (one deterministic scatter record each) per deterministic batched backsubstitution
-# launch: ~0.2 GB of scatter buffers. Unsplit, set_const_0's default 16 MiB right-hand-side chunk
-# ran out of memory on a 1455-dof, 371-level tree.
-_DETERMINISTIC_RECORD_BUDGET = 1 << 24
-
-
 def solve_m_batched(
   m: Model,
   d: Data,
   x: wp.array3d[float],
   y: wp.array3d[float],
-  x_scratch: Optional[wp.array3d[float]] = None,
   world_mask: Optional[wp.array] = None,
 ):
   """Computes x[w, r] = inv(M[w]) * y[w, r] for every right-hand side r of every world w.
 
   Uses the factorization from the most recent `factor_m`. Each right-hand side runs the
   same per-block arithmetic as `solve_m`, so a batch of k columns costs a few launches
-  instead of k sequential solves. Deterministic atomics take per-level launches over every
-  (world, right-hand side) pair, as `solve_m` does per world.
+  instead of k sequential solves. Under deterministic atomics (or a kernel that would inherit
+  Warp's deterministic mode) the sparse backsubstitution runs one thread per (world, right-hand
+  side) through every update in level order: deterministic, with no scatter records, which
+  captured graphs would otherwise retain per launch.
 
   Args:
     m: The model containing inertia and factorization information.
     d: The data object containing factorization results.
     x: Output solutions, shape (nworld, nrhs, nv).
     y: Input right-hand sides, shape (nworld, nrhs, nv).
-    x_scratch: Preallocated scratch shaped like x for deterministic sparse backsubstitution.
     world_mask: Optional per-world bool mask. Worlds whose entry is False are skipped and their x
       is left unspecified.
   """
@@ -4399,55 +4301,17 @@ def solve_m_batched(
     return
 
   L = d.qLD[:, m.qLD_block_total :]
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = None if det_atomics else _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), masked)
-  if fused is not None and not _deterministic_launch(fused):
-    dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
-    wp.launch(
-      fused,
-      dim=(d.nworld, nrhs, dim_block),
-      inputs=[m.qLD_block_adr, world_mask, L, d.qLDiagInv, m.qLD_all_updates, m.qLD_level_offsets, y],
-      outputs=[x],
-      block_dim=dim_block,
-    )
-    return
-
-  # Each deterministic launch reserves one scatter record (an int64 key and a value, plus sort
-  # workspace) per thread: split the right-hand sides to bound a level launch by
-  # _DETERMINISTIC_RECORD_BUDGET threads.
-  x_in = x_scratch if x_scratch is not None else wp.empty_like(x)
-  levels = m.qLD_level_offsets_host
-  widest = max(levels[i + 1] - levels[i] for i in range(len(levels) - 1))
-  batch = max(1, min(nrhs, _DETERMINISTIC_RECORD_BUDGET // max(d.nworld * widest, 1)))
-  for start in range(0, nrhs, batch):
-    stop = min(start + batch, nrhs)
-    xs, ys, xs_in = (x, y, x_in) if batch == nrhs else (x[:, start:stop], y[:, start:stop], x_in[:, start:stop])
-    n = stop - start
-    wp.launch(
-      _solve_LD_sparse_copy_batched(masked), dim=(d.nworld, n, m.nv), inputs=[m.qLD_block_adr, world_mask, ys], outputs=[xs]
-    )
-    for qLD_updates in reversed(m.qLD_updates):
-      wp.copy(xs_in, xs)
-      wp.launch(
-        _solve_LD_sparse_level_batched(True, masked, True),
-        dim=(d.nworld, n, qLD_updates.size),
-        inputs=[world_mask, L, qLD_updates, xs_in],
-        outputs=[xs],
-      )
-    wp.launch(
-      _solve_LD_sparse_diag_batched(masked),
-      dim=(d.nworld, n, m.nv),
-      inputs=[m.qLD_block_adr, world_mask, d.qLDiagInv],
-      outputs=[xs],
-    )
-    for qLD_updates in m.qLD_updates:
-      wp.copy(xs_in, xs)
-      wp.launch(
-        _solve_LD_sparse_level_batched(False, masked, True),
-        dim=(d.nworld, n, qLD_updates.size),
-        inputs=[world_mask, L, qLD_updates, xs_in],
-        outputs=[xs],
-      )
+  serial = bool(m.opt.deterministic & DeterminismType.ATOMICS) or not wp.get_device().is_cuda
+  if not serial:
+    serial = _deterministic_launch(_solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), masked))
+  dim_block = 1 if serial else m.block_dim.solve_LD_sparse_fused
+  wp.launch(
+    _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), masked, serial),
+    dim=(d.nworld, nrhs, dim_block),
+    inputs=[m.qLD_block_adr, world_mask, L, d.qLDiagInv, m.qLD_all_updates, m.qLD_level_offsets, y],
+    outputs=[x],
+    block_dim=dim_block,
+  )
 
 
 @cache_kernel

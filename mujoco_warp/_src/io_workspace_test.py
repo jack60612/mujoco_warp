@@ -155,11 +155,10 @@ def test_const0_batched_inverse_weights_match_mujoco(device, rhs_chunk):
 
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("source", ["option", "warp_config"])
-@pytest.mark.parametrize("budget", [None, 1])
-def test_const0_batched_deterministic(device, source, budget):
-  """Deterministic batched solves (per-level launches) agree with the default path, run to run.
+def test_const0_batched_deterministic(device, source):
+  """Deterministic batched solves agree with the default path, run to run.
 
-  A record budget of 1 splits every launch into single right-hand sides.
+  They run one serial thread per right-hand side and never take Warp's scatter records.
   """
   if device.startswith("cuda") and not wp.is_cuda_available():
     pytest.skip("CUDA is unavailable")
@@ -180,13 +179,14 @@ def test_const0_batched_deterministic(device, source, budget):
       warp_util._KERNEL_CACHE.clear()
     fused = smooth._solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates))
     assert smooth._deterministic_launch(fused) == (source == "warp_config")
+    serial = smooth._solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), False, True)
+    assert not smooth._deterministic_launch(serial)
     runs = []
     try:
       for _ in range(2):
         for name in names:
           getattr(m, name).zero_()
-        with mock.patch.object(smooth, "_DETERMINISTIC_RECORD_BUDGET", budget or smooth._DETERMINISTIC_RECORD_BUDGET):
-          mjwarp.set_const_0(m, d, workspace=workspace)
+        mjwarp.set_const_0(m, d, workspace=workspace)
         runs.append({name: getattr(m, name).numpy().copy() for name in names})
     finally:
       wp.config.deterministic = saved

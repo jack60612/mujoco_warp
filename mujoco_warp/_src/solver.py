@@ -2012,12 +2012,12 @@ def _zero_qfrc_constraint_sparse(
 
 
 @cache_kernel
-def _update_constraint_init_qfrc_constraint_sparse(compact: bool, nv: int, deterministic: bool = False):
+def _update_constraint_init_qfrc_constraint_sparse(compact: bool, max_records: int, deterministic: bool = False):
   COMPACT = compact
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options, grid_stride=True)
   def kernel(
@@ -2279,8 +2279,11 @@ def _update_constraint(
       outputs=[d.qfrc_constraint],
     )
     det_atomics = bool(m.opt.deterministic & types.DeterminismType.ATOMICS)
+    # One atomic per Jacobian nonzero: a launch's scatter records, which Warp pools over its
+    # threads, are bounded by the nonzero capacity, not by nv per row.
+    max_records = -(-dj.efc.J.shape[2] // d.njmax) if det_atomics and d.njmax else 0
     wp.launch(
-      _update_constraint_init_qfrc_constraint_sparse(sc, m.nv if det_atomics else 0, det_atomics),
+      _update_constraint_init_qfrc_constraint_sparse(sc, max_records, det_atomics),
       dim=(d.nworld, d.njmax),
       inputs=[d.nefc, dj.efc.J_rownnz, dj.efc.J_rowadr, dj.efc.J_colind, dj.efc.J, d.efc.force, dj.dof_cdof, changed, ctx.done],
       outputs=[d.qfrc_constraint],

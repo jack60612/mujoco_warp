@@ -158,6 +158,22 @@ class SparseLDLTest(parameterized.TestCase):
     self.assertEqual(m.qLD_level_offsets_host, tuple(int(x) for x in offsets))
     self.assertEqual(m.qLD_factor_elem_offsets_host, tuple(int(x) for x in elem_offsets))
 
+    # every level's elements, grouped by updated address in element order
+    target_elem, target_adr = m.qLD_factor_target_elem.numpy(), m.qLD_factor_target_adr.numpy()
+    targets = m.qLD_factor_target_offsets_host
+    self.assertEqual(len(targets), len(offsets))
+    self.assertEqual(target_adr[-1], len(elems))
+    for level in range(len(offsets) - 1):
+      level_elems = []
+      for segment in range(targets[level], targets[level + 1]):
+        seg = target_elem[target_adr[segment] : target_adr[segment + 1]]
+        self.assertGreater(len(seg), 0)
+        self.assertTrue(np.all(np.diff(seg) > 0))
+        self.assertEqual(len(set(elems[seg, 0])), 1)
+        level_elems.extend(seg)
+      self.assertEqual(sorted(level_elems), list(range(elem_offsets[level], elem_offsets[level + 1])))
+      self.assertEqual(len(set(elems[level_elems, 0])), targets[level + 1] - targets[level])
+
   @parameterized.parameters((True, 1), (True, 32), (True, 256), (True, 1024), (False, 1024))
   def test_factor_matches_level_kernels(self, fused, block_dim):
     """The fused kernel and the per-level element launches equal the original per-level kernels."""
@@ -241,7 +257,7 @@ class SparseLDLTest(parameterized.TestCase):
       d.qLD.zero_()
       mjw.factor_m(m, d)
     self.assertNotIn(smooth._qLD_acc_level, launched)
-    self.assertIn(smooth._qLD_acc(m.nv, True), launched)
+    self.assertIn(smooth._qLD_acc_level_owned, launched)
     sparse = slice(m.qLD_block_total, None)
     np.testing.assert_allclose(d.qLD.numpy()[:, sparse], L_ref[:, sparse], rtol=1e-4, atol=1e-5 * np.abs(L_ref).max())
     np.testing.assert_allclose(d.qLDiagInv.numpy(), D_ref, rtol=1e-4, atol=1e-5 * np.abs(D_ref).max())
