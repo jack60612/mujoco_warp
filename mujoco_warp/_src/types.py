@@ -53,6 +53,11 @@ M_BLOCK_SCALAR_MAX = 6
 # with moderately wide levels on the fused kernel (per-level launches win 4-12x at 65k-187k).
 M_SPARSE_LEVEL_WIDTH_MIN = 32768
 
+# Sparse LDL under deterministic atomics: max terms of an updated entry summed by one thread. Longer
+# sums (entries of dofs with large subtrees) are split over the 32 lanes of a warp and reduced in a
+# fixed shuffle order.
+M_SPARSE_SEGMENT_SERIAL_MAX = 32
+
 # qLD_block_adr sentinels for factorless block layouts
 Q_LD_BLOCK_COMPACT = -2
 Q_LD_BLOCK_SPARSE = -1
@@ -1620,6 +1625,10 @@ class Model:
     tendon_geom_adr: geom tendon address
     tendon_limited_adr: addresses for limited tendons
     max_ten_J_rownnz: maximum number of non-zeros in a tendon row
+    ten_J_pair: (tendon, ten_J address of entry i, of entry j <= i) of every tendon pair product
+                whose M(dof_i, dof_j) is in the M pattern, grouped by that M address
+    ten_J_pair_adr: start of each M address's segment in ten_J_pair, then the number of pairs
+    ten_J_pair_madr: the M address of each ten_J_pair segment
     ten_wrapadr_site: wrap object starting address for sites
     ten_wrapnum_site: number of site wrap objects per tendon
     wrap_jnt_adr: addresses for joint tendon wrap object
@@ -1668,10 +1677,23 @@ class Model:
     qLD_level_offsets_host: host copy of qLD_level_offsets, for per-level factorization launches
     qLD_factor_elem_offsets_host: host copy of qLD_factor_elem_offsets
     qLD_factor_target_elem: qLD_factor_elem indices grouped by the address M(i,j) they update,
-                            per level, in element order
+                            per level, in element order; a level's segments of at most
+                            M_SPARSE_SEGMENT_SERIAL_MAX indices come first
     qLD_factor_target_adr: start of each (level, M(i,j)) segment in qLD_factor_target_elem, then
                            the number of indices
     qLD_factor_target_offsets_host: first segment of each level in qLD_factor_target_adr (host)
+    qLD_factor_target_long_host: first segment of each level with more than
+                                 M_SPARSE_SEGMENT_SERIAL_MAX indices (host)
+    qLD_solve_target_update: qLD_all_updates indices grouped by the dof they update in the
+                             sparse backsubstitution, per level, in update order: x(i) in the
+                             up pass, then x(k) in the down pass; segments ordered as
+                             qLD_factor_target_elem's
+    qLD_solve_target_adr: start of each segment in qLD_solve_target_update, then the number of
+                          indices
+    qLD_solve_target_offsets: first segment of each up-pass level, then of each down-pass level,
+                              then the number of segments
+    qLD_solve_target_long: first segment of each up-pass, then down-pass level with more than
+                           M_SPARSE_SEGMENT_SERIAL_MAX indices
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2160,6 +2182,9 @@ class Model:
   tendon_geom_adr: array("ntendon_geom", int)
   tendon_limited_adr: array("ntendon_limited", int)
   max_ten_J_rownnz: int
+  ten_J_pair: array("nten_J_pair", wp.vec3i)
+  ten_J_pair_adr: array("nten_J_pair_adr", int)
+  ten_J_pair_madr: array("nten_J_pair_madr", int)
   ten_wrapadr_site: array("nten_wrapadr_site", int)
   ten_wrapnum_site: array("ntendon", int)
   wrap_jnt_adr: array("nwrap_jnt", int)
@@ -2204,6 +2229,11 @@ class Model:
   qLD_factor_target_elem: array("nqLD_factor_elem", int)
   qLD_factor_target_adr: array("nqLD_factor_target_adr", int)
   qLD_factor_target_offsets_host: tuple[int, ...]
+  qLD_factor_target_long_host: tuple[int, ...]
+  qLD_solve_target_update: array("nqLD_solve_target_update", int)
+  qLD_solve_target_adr: array("nqLD_solve_target_adr", int)
+  qLD_solve_target_offsets: array("nqLD_solve_target_offsets", int)
+  qLD_solve_target_long: array("nqLD_solve_target_long", int)
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)
@@ -2733,7 +2763,6 @@ class SolverContext:
   # inside wp.capture_while where memory cannot be allocated (None otherwise)
   efm_con: Optional[tuple] = None
   flex_scratch: Optional[tuple] = None
-  solve_ld_scratch: Optional[wp.array] = None
 
 
 @dataclasses.dataclass

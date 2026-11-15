@@ -158,7 +158,7 @@ def test_const0_batched_inverse_weights_match_mujoco(device, rhs_chunk):
 def test_const0_batched_deterministic(device, source):
   """Deterministic batched solves agree with the default path, run to run.
 
-  They run one serial thread per right-hand side and never take Warp's scatter records.
+  They take the owned sparse backsubstitution and never take Warp's scatter records.
   """
   if device.startswith("cuda") and not wp.is_cuda_available():
     pytest.skip("CUDA is unavailable")
@@ -177,21 +177,30 @@ def test_const0_batched_deterministic(device, source):
     else:
       wp.config.deterministic = wp.DeterministicMode.RUN_TO_RUN
       warp_util._KERNEL_CACHE.clear()
-    fused = smooth._solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates))
+    fused = smooth._solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), False)
     assert smooth._deterministic_launch(fused) == (source == "warp_config")
-    serial = smooth._solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), False, True)
-    assert not smooth._deterministic_launch(serial)
+    owned = smooth._solve_LD_sparse_fused_batched_owned(m.nv, len(m.qLD_updates), False)
+    launched = []
+    launch = wp.launch
+
+    def record(kernel, *args, **kwargs):
+      launched.append(kernel)
+      return launch(kernel, *args, **kwargs)
+
     runs = []
     try:
-      for _ in range(2):
-        for name in names:
-          getattr(m, name).zero_()
-        mjwarp.set_const_0(m, d, workspace=workspace)
-        runs.append({name: getattr(m, name).numpy().copy() for name in names})
+      with mock.patch.object(wp, "launch", record):
+        for _ in range(2):
+          for name in names:
+            getattr(m, name).zero_()
+          mjwarp.set_const_0(m, d, workspace=workspace)
+          runs.append({name: getattr(m, name).numpy().copy() for name in names})
     finally:
       wp.config.deterministic = saved
       m.opt.deterministic = types.DeterminismType.NONE
       warp_util._KERNEL_CACHE.clear()
+
+  assert owned in launched and fused not in launched
 
   for name in names:
     # summation order differs from the default path (determinism_test's NONE vs ATOMICS tolerance)

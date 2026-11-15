@@ -676,17 +676,13 @@ _CONST0_RHS_ELEMENTS = 1 << 22
 class Const0Workspace:
   """Reusable device scratch for :func:`set_const_0`, allocated before graph capture.
 
-  A workspace is bound to a model's fixed dimensions, determinism options, world count and
-  device. It must not be shared by concurrent refreshes. All scratch is overwritten on each call.
-  Unselected worlds of a masked call leave their scratch rows unspecified.
+  A workspace is bound to a model's fixed dimensions, world count and device. It must not be
+  shared by concurrent refreshes. All scratch is overwritten on each call. Unselected worlds of
+  a masked call leave their scratch rows unspecified.
 
   The inverse weights solve one inertia system per DOF, body Jacobian row, tendon and
   actuator. They run in batches of ``rhs_chunk`` right-hand sides per world (default:
   as many as fit a fixed scratch budget, at most the largest of those counts).
-
-  Under deterministic atomics (``opt.deterministic`` with ``DeterminismType.ATOMICS``) the
-  subtree CoM and composite inertia passes read a copy of their previous level; the workspace
-  holds those copies too.
   """
 
   def __init__(self, m: types.Model, d: types.Data, rhs_chunk: Optional[int] = None):
@@ -707,11 +703,6 @@ class Const0Workspace:
     self.transmission_ncon = wp.empty((d.nworld, m.nacttrnbody), dtype=int, device=device)
     self.wrap_geom_xpos = wp.empty((d.nworld, m.nwrap), dtype=wp.spatial_vector, device=device)
     self.all_worlds = wp.full(d.nworld, True, dtype=bool, device=device)
-    self.subtree_com_scratch = None
-    self.crb_scratch = None
-    if m.opt.deterministic & types.DeterminismType.ATOMICS:
-      self.subtree_com_scratch = wp.empty_like(d.subtree_com)
-      self.crb_scratch = wp.empty_like(d.crb)
 
 
 def set_const_0(
@@ -773,11 +764,11 @@ def set_const_0(
     )
 
   smooth.kinematics(m, d)
-  smooth.com_pos(m, d, workspace.subtree_com_scratch)
+  smooth.com_pos(m, d)
   smooth.camlight(m, d)
   smooth.flex(m, d)
   smooth.tendon(m, d, workspace.wrap_geom_xpos)
-  smooth.crb(m, d, workspace.crb_scratch)
+  smooth.crb(m, d)
   smooth.tendon_armature(m, d)
   smooth.factor_m(m, d)
   smooth.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
@@ -919,11 +910,11 @@ def set_const_0(
 
   if restore:
     smooth.kinematics(m, d)
-    smooth.com_pos(m, d, workspace.subtree_com_scratch)
+    smooth.com_pos(m, d)
     smooth.camlight(m, d)
     smooth.flex(m, d)
     smooth.tendon(m, d, workspace.wrap_geom_xpos)
-    smooth.crb(m, d, workspace.crb_scratch)
+    smooth.crb(m, d)
     smooth.tendon_armature(m, d)
     smooth.factor_m(m, d)
     smooth.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)

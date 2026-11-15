@@ -174,6 +174,27 @@ class SparseLDLTest(parameterized.TestCase):
       self.assertEqual(sorted(level_elems), list(range(elem_offsets[level], elem_offsets[level + 1])))
       self.assertEqual(len(set(elems[level_elems, 0])), targets[level + 1] - targets[level])
 
+    # every level's updates, grouped by the dof they update: x(i) up, then x(k) down
+    solve_update, solve_adr = m.qLD_solve_target_update.numpy(), m.qLD_solve_target_adr.numpy()
+    solve_offsets = m.qLD_solve_target_offsets.numpy()
+    nlevels = len(offsets) - 1
+    self.assertEqual(len(solve_offsets), 2 * nlevels + 1)
+    self.assertEqual(solve_adr[-1], 2 * len(updates))
+    for target in (0, 1):
+      for level in range(nlevels):
+        level_updates = []
+        segments = range(solve_offsets[target * nlevels + level], solve_offsets[target * nlevels + level + 1])
+        for segment in segments:
+          seg = solve_update[solve_adr[segment] : solve_adr[segment + 1]]
+          self.assertGreater(len(seg), 0)
+          self.assertTrue(np.all(np.diff(seg) > 0))
+          self.assertEqual(len(set(updates[seg, target])), 1)
+          level_updates.extend(seg)
+        self.assertEqual(sorted(level_updates), list(range(offsets[level], offsets[level + 1])))
+        self.assertEqual(len(set(updates[level_updates, target])), len(segments))
+        # a level never reads the dofs it updates
+        self.assertFalse(set(updates[level_updates, target]) & set(updates[level_updates, 1 - target]))
+
   @parameterized.parameters((True, 1), (True, 32), (True, 256), (True, 1024), (False, 1024))
   def test_factor_matches_level_kernels(self, fused, block_dim):
     """The fused kernel and the per-level element launches equal the original per-level kernels."""
@@ -203,7 +224,7 @@ class SparseLDLTest(parameterized.TestCase):
 
   @parameterized.parameters("option", "warp_config")
   def test_deterministic_factor_and_solve(self, source):
-    """Deterministic atomics take the per-level paths and still factor and solve M.
+    """Deterministic atomics take the owned paths and still factor and solve M.
 
     Requested by Option.deterministic, or by Warp's global configuration for kernels created in it.
     """
@@ -308,6 +329,35 @@ class SparseLDLTest(parameterized.TestCase):
       mjw.solve_m(m, d, x, y)
       results[dim] = x.numpy()
     _assert_same_class(results[block_dim], results[128], "x")
+    _assert_solves(mjm, d.M.numpy(), results[block_dim], y.numpy())
+
+  @parameterized.parameters(32, 512, 1024)
+  def test_owned_solve_block_dims(self, block_dim):
+    """The owned backsubstitution is bitwise the same at any block width and solves M x = y.
+
+    Every dof sums its terms in a fixed order (one thread, or one warp for long sums) and subtracts
+    the sum, so it agrees with the fused kernel to rounding.
+    """
+    mjm, m, d = _fixture()
+    mjw.factor_m(m, d)
+    rng = np.random.default_rng(1)
+    y = wp.array(rng.normal(size=(d.nworld, m.nv)).astype(np.float32), dtype=float)
+    x = wp.zeros((d.nworld, m.nv), dtype=float)
+    mjw.solve_m(m, d, x, y)
+    fused = x.numpy()
+
+    m.opt.deterministic = types.DeterminismType.ATOMICS
+    results = {}
+    try:
+      for dim in (128, block_dim):
+        m.block_dim.solve_LD_sparse_fused = dim
+        x = wp.zeros((d.nworld, m.nv), dtype=float)
+        mjw.solve_m(m, d, x, y)
+        results[dim] = x.numpy()
+    finally:
+      m.opt.deterministic = types.DeterminismType.NONE
+    np.testing.assert_array_equal(results[block_dim].view(np.uint32), results[128].view(np.uint32))
+    np.testing.assert_allclose(results[block_dim], fused, rtol=1e-4, atol=1e-5 * np.abs(fused).max())
     _assert_solves(mjm, d.M.numpy(), results[block_dim], y.numpy())
 
 

@@ -139,7 +139,7 @@ def _branched_tendons_xml() -> str:
 
 class TendonDampingTest(parameterized.TestCase):
   def test_entry_parallel_matches_serial(self):
-    """One thread per J entry adds the same terms as the serial per-tendon loop."""
+    """One thread per J entry, and one per M address, add the serial per-tendon loop's terms."""
     mjm, _, m, d = test_data.fixture(xml=_branched_tendons_xml(), nworld=3)
     rng = np.random.default_rng(0)
     wp.copy(d.qvel, wp.array(rng.normal(size=(d.nworld, mjm.nv)).astype(np.float32), dtype=float))
@@ -160,14 +160,31 @@ class TendonDampingTest(parameterized.TestCase):
     wp.launch(_qderiv_tendon_damping_serial, dim=(d.nworld, m.ntendon), inputs=inputs, outputs=[serial])
     parallel = wp.clone(d.M)
     wp.launch(
-      derivative._qderiv_tendon_damping(0), dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz), inputs=inputs, outputs=[parallel]
+      derivative._qderiv_tendon_damping, dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz), inputs=inputs, outputs=[parallel]
+    )
+    owned = wp.clone(d.M)
+    wp.launch(
+      derivative._qderiv_tendon_damping_owned,
+      dim=(d.nworld, m.ten_J_pair_madr.size),
+      inputs=[
+        m.opt.timestep,
+        m.tendon_damping,
+        m.tendon_dampingpoly,
+        m.ten_J_pair,
+        m.ten_J_pair_adr,
+        m.ten_J_pair_madr,
+        d.ten_J,
+        d.ten_velocity,
+      ],
+      outputs=[owned],
     )
     self.assertFalse(np.array_equal(serial.numpy(), d.M.numpy()))
-    if wp.get_device().is_cuda:
-      # tendons sharing an M entry add in GPU scheduling order, before and after
-      np.testing.assert_allclose(parallel.numpy(), serial.numpy(), rtol=1e-6, atol=1e-7)
-    else:
-      np.testing.assert_array_equal(parallel.numpy(), serial.numpy())
+    for result in (parallel, owned):
+      if wp.get_device().is_cuda:
+        # tendons sharing an M entry add in GPU scheduling order in the atomic kernels
+        np.testing.assert_allclose(result.numpy(), serial.numpy(), rtol=1e-6, atol=1e-7)
+      else:
+        np.testing.assert_array_equal(result.numpy(), serial.numpy())
 
   @parameterized.product(jacobian=(0, 1), disabled=(False, True))
   def test_native_derivative(self, jacobian, disabled):
@@ -205,7 +222,7 @@ class TendonDampingTest(parameterized.TestCase):
     timestep = np.array([0.01, 0.02], dtype=np.float32)
     out = wp.full((2, 5), 7.0, dtype=float)
     wp.launch(
-      derivative._qderiv_tendon_damping(0),
+      derivative._qderiv_tendon_damping,
       dim=(2, 2, 3),
       inputs=[
         wp.array(timestep),

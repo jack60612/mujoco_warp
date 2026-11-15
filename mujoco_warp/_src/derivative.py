@@ -297,64 +297,92 @@ def _qderiv_actuator_passive(
   qDeriv_out[worldid, madr] = M_in[worldid, madr] - qderiv
 
 
-@cache_kernel
-def _qderiv_tendon_damping(max_records: int, deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = max_records
+@wp.kernel
+def _qderiv_tendon_damping(
+  # Model:
+  opt_timestep: wp.array[float],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  tendon_damping: wp.array2d[float],
+  tendon_dampingpoly: wp.array2d[wp.vec2],
+  M_elemid: wp.array2d[int],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  ten_velocity_in: wp.array2d[float],
+  # Out:
+  qDeriv_out: wp.array2d[float],
+):
+  worldid, tenid, i = wp.tid()
+  rownnz = ten_J_rownnz[tenid]
+  if i >= rownnz:
+    return
 
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    opt_timestep: wp.array[float],
-    ten_J_rownnz: wp.array[int],
-    ten_J_rowadr: wp.array[int],
-    ten_J_colind: wp.array[int],
-    tendon_damping: wp.array2d[float],
-    tendon_dampingpoly: wp.array2d[wp.vec2],
-    M_elemid: wp.array2d[int],
-    # Data in:
-    ten_J_in: wp.array2d[float],
-    ten_velocity_in: wp.array2d[float],
-    # Out:
-    qDeriv_out: wp.array2d[float],
-  ):
-    worldid, tenid, i = wp.tid()
-    rownnz = ten_J_rownnz[tenid]
-    if i >= rownnz:
-      return
+  damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
+  dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
+  if damping == 0.0 and dpoly[0] == 0.0 and dpoly[1] == 0.0:
+    return
 
+  v = ten_velocity_in[worldid, tenid]
+  deriv = opt_timestep[worldid % opt_timestep.shape[0]] * util_misc._poly_force_deriv(damping, dpoly, v, 1)
+  if deriv == 0.0:
+    return
+
+  # Scatter row i of J.T @ damping' @ J into the existing lower-triangular M pattern, one thread
+  # per Jacobian entry i: a tendon's (i, j) pairs hit distinct M entries.
+  # As for actuator damping, couplings outside that pattern are omitted.
+  rowadr = ten_J_rowadr[tenid]
+  sparsei = rowadr + i
+  Ji = ten_J_in[worldid, sparsei]
+  if Ji == 0.0:
+    return
+  dofi = ten_J_colind[sparsei]
+  for j in range(i + 1):
+    sparsej = rowadr + j
+    Jj = ten_J_in[worldid, sparsej]
+    if Jj == 0.0:
+      continue
+    dofj = ten_J_colind[sparsej]
+    madr = M_elemid[dofi, dofj]
+    if madr >= 0:
+      # plain kernel: deterministic atomics take _qderiv_tendon_damping_owned
+      wp.atomic_add(qDeriv_out[worldid], madr, Ji * Jj * deriv)  # kernel_analyzer: ignore[atomic]
+
+
+@wp.kernel
+def _qderiv_tendon_damping_owned(
+  # Model:
+  opt_timestep: wp.array[float],
+  tendon_damping: wp.array2d[float],
+  tendon_dampingpoly: wp.array2d[wp.vec2],
+  ten_J_pair: wp.array[wp.vec3i],
+  ten_J_pair_adr: wp.array[int],
+  ten_J_pair_madr: wp.array[int],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  ten_velocity_in: wp.array2d[float],
+  # Out:
+  qDeriv_out: wp.array2d[float],
+):
+  """_qderiv_tendon_damping with one thread per M address, adding its pairs in order."""
+  worldid, targetid = wp.tid()
+  timestep = opt_timestep[worldid % opt_timestep.shape[0]]
+  madr = ten_J_pair_madr[targetid]
+  qderiv = qDeriv_out[worldid, madr]
+  for adr in range(ten_J_pair_adr[targetid], ten_J_pair_adr[targetid + 1]):
+    pair = ten_J_pair[adr]
+    tenid = pair[0]
     damping = tendon_damping[worldid % tendon_damping.shape[0], tenid]
     dpoly = tendon_dampingpoly[worldid % tendon_dampingpoly.shape[0], tenid]
     if damping == 0.0 and dpoly[0] == 0.0 and dpoly[1] == 0.0:
-      return
-
-    v = ten_velocity_in[worldid, tenid]
-    deriv = opt_timestep[worldid % opt_timestep.shape[0]] * util_misc._poly_force_deriv(damping, dpoly, v, 1)
-    if deriv == 0.0:
-      return
-
-    # Scatter row i of J.T @ damping' @ J into the existing lower-triangular M pattern, one thread
-    # per Jacobian entry i: a tendon's (i, j) pairs hit distinct M entries.
-    # As for actuator damping, couplings outside that pattern are omitted.
-    rowadr = ten_J_rowadr[tenid]
-    sparsei = rowadr + i
-    Ji = ten_J_in[worldid, sparsei]
-    if Ji == 0.0:
-      return
-    dofi = ten_J_colind[sparsei]
-    for j in range(i + 1):
-      sparsej = rowadr + j
-      Jj = ten_J_in[worldid, sparsej]
-      if Jj == 0.0:
-        continue
-      dofj = ten_J_colind[sparsej]
-      madr = M_elemid[dofi, dofj]
-      if madr >= 0:
-        wp.atomic_add(qDeriv_out[worldid], madr, Ji * Jj * deriv)
-
-  return kernel
+      continue
+    deriv = timestep * util_misc._poly_force_deriv(damping, dpoly, ten_velocity_in[worldid, tenid], 1)
+    Ji = ten_J_in[worldid, pair[1]]
+    Jj = ten_J_in[worldid, pair[2]]
+    if deriv == 0.0 or Ji == 0.0 or Jj == 0.0:
+      continue
+    qderiv += Ji * Jj * deriv
+  qDeriv_out[worldid, madr] = qderiv
 
 
 @cache_kernel
@@ -1587,10 +1615,30 @@ def deriv_smooth_vel(
     wp.copy(out, d.M)
 
   tendon_damper = m.ntendon > 0 and not (m.opt.disableflags & DisableBit.DAMPER)
-  if tendon_damper:
-    det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
+  if tendon_damper and (
+    bool(m.opt.deterministic & DeterminismType.ATOMICS) or smooth._deterministic_launch(_qderiv_tendon_damping)
+  ):
+    # one thread per M address adds its tendon pairs in order: the pair atomics would reserve
+    # deterministic scatter records, which captured graphs sort in full on every replay
+    if m.ten_J_pair_madr.size:
+      wp.launch(
+        _qderiv_tendon_damping_owned,
+        dim=(d.nworld, m.ten_J_pair_madr.size),
+        inputs=[
+          m.opt.timestep,
+          m.tendon_damping,
+          m.tendon_dampingpoly,
+          m.ten_J_pair,
+          m.ten_J_pair_adr,
+          m.ten_J_pair_madr,
+          d.ten_J,
+          d.ten_velocity,
+        ],
+        outputs=[out],
+      )
+  elif tendon_damper:
     wp.launch(
-      _qderiv_tendon_damping(smooth._ten_J_pair_records(m) if det_atomics else 0, det_atomics),
+      _qderiv_tendon_damping,
       dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
       inputs=[
         m.opt.timestep,
@@ -4581,7 +4629,6 @@ def eff_prec(
   res: wp.array2d[float],
   vec: wp.array2d[float],
   epL: Optional[wp.array] = None,
-  x_scratch: Optional[wp.array] = None,
 ):
   """Preconditions residual vector using 3x3 flex block Cholesky and backbone qHLD."""
   if m.efm0_active:
@@ -4592,7 +4639,7 @@ def eff_prec(
         inputs=[m.nv, m.efm_dofblk, vec],
         outputs=[res],
       )
-      smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res, x_scratch=x_scratch)
+      smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res)
     wp.launch(
       _eff_prec_efm0_solve,
       dim=d.nworld,
@@ -4639,7 +4686,7 @@ def eff_prec(
     inputs=[m.nv, dofblk, vec],
     outputs=[res],
   )
-  smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res, x_scratch=x_scratch)
+  smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, res)
   wp.launch(
     _eff_block_solve,
     dim=(d.nworld, m.nefmdof),
@@ -4709,13 +4756,8 @@ def eff_solve(m: Model, d: Data, qacc: wp.array2d[float], qfrc: Optional[wp.arra
   efm_iter.zero_()
   # allocated here since _pcg_iteration may run inside wp.capture_while
   efm_con, flex_scratch = eff_mul_m_scratch(m, d)
-  solve_ld_scratch = (
-    wp.empty((d.nworld, m.nv), dtype=float)
-    if (m.opt.deterministic & DeterminismType.ATOMICS) and d.qHLD.shape[1] > m.qLD_block_total
-    else None
-  )
 
-  eff_prec(m, d, efm_z, rhs, x_scratch=solve_ld_scratch)
+  eff_prec(m, d, efm_z, rhs)
   wp.launch_tiled(
     _pcg_init_tiled,
     dim=d.nworld,
@@ -4762,7 +4804,7 @@ def eff_solve(m: Model, d: Data, qacc: wp.array2d[float], qfrc: Optional[wp.arra
       ],
       block_dim=m.block_dim.eff_pcg,
     )
-    eff_prec(m, d, efm_z, efm_r, x_scratch=solve_ld_scratch)
+    eff_prec(m, d, efm_z, efm_r)
     wp.launch_tiled(
       _pcg_beta_and_p_update_tiled,
       dim=d.nworld,

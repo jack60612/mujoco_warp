@@ -77,6 +77,20 @@ def _create_array(data: Any, spec, sizes: dict[str, int], batch_size: int = 1) -
   return array
 
 
+def _target_segments(indices, entries, field: int) -> tuple[list[list[int]], list[list[int]]]:
+  """Groups `indices` by `entries[index][field]` in index order, ordered by that target.
+
+  Returns the segments of at most M_SPARSE_SEGMENT_SERIAL_MAX indices, then the longer ones.
+  """
+  segments = {}
+  for index in indices:
+    segments.setdefault(int(entries[index][field]), []).append(index)
+  ordered = [segments[target] for target in sorted(segments)]
+  serial = [segment for segment in ordered if len(segment) <= types.M_SPARSE_SEGMENT_SERIAL_MAX]
+  warp = [segment for segment in ordered if len(segment) > types.M_SPARSE_SEGMENT_SERIAL_MAX]
+  return serial, warp
+
+
 def _create_constraint(
   mjm,
   nworld: int,
@@ -1194,20 +1208,38 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
 
   # The same elements grouped by the CSR address they update, one segment per M(i,j) and level, in
-  # element order: deterministic factorizations add a segment in one thread, with no atomics.
-  target_elem, target_adr, target_offsets = [], [], [0]
+  # element order: deterministic factorizations add a segment without atomics, in one thread or,
+  # past M_SPARSE_SEGMENT_SERIAL_MAX elements, one warp. A level lists its serial segments first.
+  target_elem, target_adr, target_offsets, target_long = [], [], [0], []
   for level in range(len(factor_elem_offsets) - 1):
-    start, stop = factor_elem_offsets[level], factor_elem_offsets[level + 1]
-    order = sorted(range(start, stop), key=lambda e: factor_elem[e][0])
-    for n, e in enumerate(order):
-      if n == 0 or factor_elem[e][0] != factor_elem[order[n - 1]][0]:
-        target_adr.append(len(target_elem))
-      target_elem.append(e)
+    serial, warp = _target_segments(range(factor_elem_offsets[level], factor_elem_offsets[level + 1]), factor_elem, 0)
+    target_long.append(len(target_adr) + len(serial))
+    for segment in serial + warp:
+      target_adr.append(len(target_elem))
+      target_elem.extend(segment)
     target_offsets.append(len(target_adr))
   target_adr.append(len(target_elem))
   m.qLD_factor_target_elem = target_elem if target_elem else [0]
   m.qLD_factor_target_adr = target_adr
   m.qLD_factor_target_offsets_host = tuple(target_offsets)
+  m.qLD_factor_target_long_host = tuple(target_long)
+
+  # The updates of each level grouped by the dof they update, in update order: x(i) in the
+  # backsubstitution's up pass, x(k) in its down pass, segments as for the factorization.
+  solve_update, solve_adr, solve_offsets, solve_long = [], [], [0], []
+  for target in (0, 1):
+    for level in range(len(level_offsets) - 1):
+      serial, warp = _target_segments(range(level_offsets[level], level_offsets[level + 1]), all_updates_flat, target)
+      solve_long.append(len(solve_adr) + len(serial))
+      for segment in serial + warp:
+        solve_adr.append(len(solve_update))
+        solve_update.extend(segment)
+      solve_offsets.append(len(solve_adr))
+  solve_adr.append(len(solve_update))
+  m.qLD_solve_target_update = solve_update if solve_update else [0]
+  m.qLD_solve_target_adr = solve_adr
+  m.qLD_solve_target_offsets = solve_offsets
+  m.qLD_solve_target_long = solve_long if solve_long else [0]
 
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
@@ -1236,6 +1268,25 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       M_hinit_i[madr] = i
   m.M_elemid = M_elemid
   m.M_hinit_i = M_hinit_i
+
+  # Tendon pair products J(t,i) * J(t,j) for row entries j <= i whose M(dof_i, dof_j) is in the
+  # pattern (dof_j a chain ancestor of dof_i or itself), grouped by M address in (tendon, i, j)
+  # order: deterministic tendon armature and damping sum a segment in one thread, with no atomics.
+  ten_pairs = {}
+  for t in range(mjm.ntendon):
+    rowadr = mjm.ten_J_rowadr[t]
+    for i in range(mjm.ten_J_rownnz[t]):
+      for j in range(i + 1):
+        madr = M_elemid[mjm.ten_J_colind[rowadr + i], mjm.ten_J_colind[rowadr + j]]
+        if madr >= 0:
+          ten_pairs.setdefault(int(madr), []).append((t, rowadr + i, rowadr + j))
+  m.ten_J_pair, m.ten_J_pair_adr, m.ten_J_pair_madr = [], [], sorted(ten_pairs)
+  for madr in m.ten_J_pair_madr:
+    m.ten_J_pair_adr.append(len(m.ten_J_pair))
+    m.ten_J_pair.extend(ten_pairs[madr])
+  m.ten_J_pair_adr.append(len(m.ten_J_pair))
+  if not m.ten_J_pair:
+    m.ten_J_pair = [(0, 0, 0)]
 
   # Precompute per-block gather indices for the dense-block densify (tile_load_indexed). For each
   # dense block and flat slot (row, col), store the CSR address of M[max(i,j), min(i,j)], or nC
@@ -1435,6 +1486,13 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nqLD_level_offsets": len(m.qLD_level_offsets),
       "nqLD_factor_elem": len(m.qLD_factor_elem),
       "nqLD_factor_target_adr": len(m.qLD_factor_target_adr),
+      "nqLD_solve_target_update": len(m.qLD_solve_target_update),
+      "nqLD_solve_target_adr": len(m.qLD_solve_target_adr),
+      "nqLD_solve_target_offsets": len(m.qLD_solve_target_offsets),
+      "nqLD_solve_target_long": len(m.qLD_solve_target_long),
+      "nten_J_pair": len(m.ten_J_pair),
+      "nten_J_pair_adr": len(m.ten_J_pair_adr),
+      "nten_J_pair_madr": len(m.ten_J_pair_madr),
       "nM_fullm": len(m.M_fullm_i),
       "nqD_fullm": len(m.qD_fullm_i),
       "nv_plus_1": len(m.M_mulm_rowadr),

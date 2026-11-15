@@ -670,30 +670,41 @@ def _subtree_com_init(
   subtree_com_out[worldid, bodyid] = xipos_in[worldid, bodyid] * body_mass[worldid % body_mass.shape[0], bodyid]
 
 
-@cache_kernel
-def _subtree_com_acc(deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+@wp.kernel
+def _subtree_com_acc(
+  # Model:
+  body_parentid: wp.array[int],
+  # Data in:
+  subtree_com_in: wp.array2d[wp.vec3],
+  # In:
+  body_tree_: wp.array[int],
+  # Data out:
+  subtree_com_out: wp.array2d[wp.vec3],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  if bodyid != 0:
+    # plain kernel: deterministic atomics take _subtree_com_owned
+    wp.atomic_add(subtree_com_out, worldid, pid, subtree_com_in[worldid, bodyid])  # kernel_analyzer: ignore[atomic]
 
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    body_parentid: wp.array[int],
-    # Data in:
-    subtree_com_in: wp.array2d[wp.vec3],
-    # In:
-    body_tree_: wp.array[int],
-    # Data out:
-    subtree_com_out: wp.array2d[wp.vec3],
-  ):
-    worldid, nodeid = wp.tid()
-    bodyid = body_tree_[nodeid]
-    pid = body_parentid[bodyid]
-    if bodyid != 0:
-      wp.atomic_add(subtree_com_out, worldid, pid, subtree_com_in[worldid, bodyid])
 
-  return kernel
+@wp.kernel
+def _subtree_com_owned(
+  # Model:
+  body_mass: wp.array2d[float],
+  body_subtreenum: wp.array[int],
+  # Data in:
+  xipos_in: wp.array2d[wp.vec3],
+  # Data out:
+  subtree_com_out: wp.array2d[wp.vec3],
+):
+  """Sums the mass-weighted positions of a body's subtree (a contiguous body range) in order."""
+  worldid, bodyid = wp.tid()
+  com = wp.vec3(0.0)
+  for subtreeid in range(bodyid, bodyid + body_subtreenum[bodyid]):
+    com += xipos_in[worldid, subtreeid] * body_mass[worldid % body_mass.shape[0], subtreeid]
+  subtree_com_out[worldid, bodyid] = com
 
 
 @wp.kernel
@@ -804,37 +815,34 @@ def _cdof(
 
 
 @event_scope
-def com_pos(m: Model, d: Data, subtree_com_scratch: Optional[wp.array] = None):
+def com_pos(m: Model, d: Data):
   """Computes subtree center of mass positions.
 
   Transforms inertia and motion to global frame centered at subtree CoM. Accumulates the
   mass-weighted positions up the kinematic tree, divides by total mass, and computes composite
-  inertias and motion degrees of freedom in the subtree CoM frame.
+  inertias and motion degrees of freedom in the subtree CoM frame. Deterministic atomics sum each
+  body's subtree in one thread instead of accumulating level by level.
 
   Args:
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
-    subtree_com_scratch: Optional array like d.subtree_com for the read copy of deterministic
-      atomics; allocated on each call if not passed, which is not allowed inside conditional
-      graph nodes.
   """
-  wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
-
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  subtree_com_in = d.subtree_com
-  if det_atomics:
-    subtree_com_in = subtree_com_scratch if subtree_com_scratch is not None else wp.empty_like(d.subtree_com)
-  for i in reversed(range(len(m.body_tree))):
-    body_tree = m.body_tree[i]
-    if det_atomics:
-      wp.copy(subtree_com_in, d.subtree_com)
+  if m.opt.deterministic & DeterminismType.ATOMICS:
     wp.launch(
-      _subtree_com_acc(det_atomics),
-      dim=(d.nworld, body_tree.size),
-      inputs=[m.body_parentid, subtree_com_in, body_tree],
+      _subtree_com_owned,
+      dim=(d.nworld, m.nbody),
+      inputs=[m.body_mass, m.body_subtreenum, d.xipos],
       outputs=[d.subtree_com],
     )
-
+  else:
+    wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
+    for body_tree in reversed(m.body_tree):
+      wp.launch(
+        _subtree_com_acc,
+        dim=(d.nworld, body_tree.size),
+        inputs=[m.body_parentid, d.subtree_com, body_tree],
+        outputs=[d.subtree_com],
+      )
   wp.launch(_subtree_div, dim=(d.nworld, m.nbody), inputs=[m.body_subtreemass, d.subtree_com], outputs=[d.subtree_com])
   wp.launch(
     _cinert,
@@ -1021,31 +1029,45 @@ def camlight(m: Model, d: Data):
   )
 
 
-@cache_kernel
-def _crb_accumulate(deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+@wp.kernel
+def _crb_accumulate(
+  # Model:
+  body_parentid: wp.array[int],
+  # Data in:
+  crb_in: wp.array2d[vec10],
+  # In:
+  body_tree_: wp.array[int],
+  # Data out:
+  crb_out: wp.array2d[vec10],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  if pid == 0:
+    return
+  # plain kernel: deterministic atomics take _crb_owned
+  wp.atomic_add(crb_out, worldid, pid, crb_in[worldid, bodyid])  # kernel_analyzer: ignore[atomic]
 
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    body_parentid: wp.array[int],
-    # Data in:
-    crb_in: wp.array2d[vec10],
-    # In:
-    body_tree_: wp.array[int],
-    # Data out:
-    crb_out: wp.array2d[vec10],
-  ):
-    worldid, nodeid = wp.tid()
-    bodyid = body_tree_[nodeid]
-    pid = body_parentid[bodyid]
-    if pid == 0:
-      return
-    wp.atomic_add(crb_out, worldid, pid, crb_in[worldid, bodyid])
 
-  return kernel
+@wp.kernel
+def _crb_owned(
+  # Model:
+  body_subtreenum: wp.array[int],
+  # Data in:
+  cinert_in: wp.array2d[vec10],
+  # Data out:
+  crb_out: wp.array2d[vec10],
+):
+  """Sums the inertias of a body's subtree, a contiguous body range, in body order.
+
+  The world body keeps its own inertia, as _crb_accumulate adds no body into it.
+  """
+  worldid, bodyid = wp.tid()
+  crb = cinert_in[worldid, bodyid]
+  if bodyid != 0:
+    for subtreeid in range(bodyid + 1, bodyid + body_subtreenum[bodyid]):
+      crb += cinert_in[worldid, subtreeid]
+  crb_out[worldid, bodyid] = crb
 
 
 @wp.kernel
@@ -1080,34 +1102,29 @@ def _M(
 
 
 @event_scope
-def crb(m: Model, d: Data, crb_scratch: Optional[wp.array] = None):
+def crb(m: Model, d: Data):
   """Computes composite rigid body inertias for each body and the joint-space inertia matrix.
 
   Accumulates composite rigid body inertias up the kinematic tree and computes the
   joint-space inertia matrix in either sparse or dense format, depending on model options.
+  Deterministic atomics sum each body's subtree in one thread instead of accumulating level by
+  level.
 
   Args:
     m: The model containing kinematic and dynamic information (device).
     d: The data object containing the current state and output arrays (device).
-    crb_scratch: Optional array like d.crb for the read copy of deterministic atomics; allocated
-      on each call if not passed, which is not allowed inside conditional graph nodes.
   """
-  wp.copy(d.crb, d.cinert)
-
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  crb_in = d.crb
-  if det_atomics:
-    crb_in = crb_scratch if crb_scratch is not None else wp.empty_like(d.crb)
-  for i in reversed(range(len(m.body_tree))):
-    body_tree = m.body_tree[i]
-    if det_atomics:
-      wp.copy(crb_in, d.crb)
-    wp.launch(
-      _crb_accumulate(det_atomics),
-      dim=(d.nworld, body_tree.size),
-      inputs=[m.body_parentid, crb_in, body_tree],
-      outputs=[d.crb],
-    )
+  if m.opt.deterministic & DeterminismType.ATOMICS:
+    wp.launch(_crb_owned, dim=(d.nworld, m.nbody), inputs=[m.body_subtreenum, d.cinert], outputs=[d.crb])
+  else:
+    wp.copy(d.crb, d.cinert)
+    for body_tree in reversed(m.body_tree):
+      wp.launch(
+        _crb_accumulate,
+        dim=(d.nworld, body_tree.size),
+        inputs=[m.body_parentid, d.crb, body_tree],
+        outputs=[d.crb],
+      )
 
   d.M.zero_()
   wp.launch(
@@ -1118,96 +1135,118 @@ def crb(m: Model, d: Data, crb_scratch: Optional[wp.array] = None):
   )
 
 
-def _ten_J_pair_records(m: Model) -> int:
-  """Deterministic record bound of a (world, tendon, row entry) launch adding pair products.
+@wp.kernel
+def _tendon_armature(
+  # Model:
+  dof_parentid: wp.array[int],
+  ten_J_rownnz: wp.array[int],
+  ten_J_rowadr: wp.array[int],
+  ten_J_colind: wp.array[int],
+  tendon_armature: wp.array2d[float],
+  M_rownnz: wp.array[int],
+  M_rowadr: wp.array[int],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  # Data out:
+  M_out: wp.array2d[float],
+):
+  worldid, tenid, dofid = wp.tid()
 
-  Each entry adds its products with the entries at or before it in its tendon row, so a row of r
-  nonzeros emits r(r+1)/2 records, at most nJten * (max_ten_J_rownnz + 1) / 2 per world. Warp pools
-  a launch's records over its threads, so that total, not the longest row, sizes the buffer.
-  """
-  if not m.max_ten_J_rownnz:
-    return 0
-  return -(-m.nJten * (m.max_ten_J_rownnz + 1) // (2 * m.ntendon * m.max_ten_J_rownnz))
+  armature = tendon_armature[worldid % tendon_armature.shape[0], tenid]
 
+  if armature == 0.0:
+    return
 
-@cache_kernel
-def _tendon_armature(max_records: int, deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = max_records
+  rownnz = ten_J_rownnz[tenid]
+  if dofid >= rownnz:
+    return
+  rowadr = ten_J_rowadr[tenid]
+  dofid_sparse = dofid
+  sparseid = rowadr + dofid_sparse
+  dofid = ten_J_colind[sparseid]
+  ten_Ji = ten_J_in[worldid, sparseid]
 
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    dof_parentid: wp.array[int],
-    ten_J_rownnz: wp.array[int],
-    ten_J_rowadr: wp.array[int],
-    ten_J_colind: wp.array[int],
-    tendon_armature: wp.array2d[float],
-    M_rownnz: wp.array[int],
-    M_rowadr: wp.array[int],
-    # Data in:
-    ten_J_in: wp.array2d[float],
-    # Data out:
-    M_out: wp.array2d[float],
-  ):
-    worldid, tenid, dofid = wp.tid()
+  if ten_Ji == 0.0:
+    return
 
-    armature = tendon_armature[worldid % tendon_armature.shape[0], tenid]
+  # Walk the row's entries from the diagonal backward over ancestors.
+  madr_ij = M_rowadr[dofid] + M_rownnz[dofid] - 1
 
-    if armature == 0.0:
-      return
-
-    rownnz = ten_J_rownnz[tenid]
-    if dofid >= rownnz:
-      return
-    rowadr = ten_J_rowadr[tenid]
-    dofid_sparse = dofid
-    sparseid = rowadr + dofid_sparse
-    dofid = ten_J_colind[sparseid]
-    ten_Ji = ten_J_in[worldid, sparseid]
-
-    if ten_Ji == 0.0:
-      return
-
-    # Walk the row's entries from the diagonal backward over ancestors.
-    madr_ij = M_rowadr[dofid] + M_rownnz[dofid] - 1
-
-    # sparse backward pass over ancestors
-    dofidi = dofid
-    ptr = dofid_sparse
-    while dofid >= 0:
-      if dofid == dofidi:
-        ten_Jj = ten_Ji
+  # sparse backward pass over ancestors
+  dofidi = dofid
+  ptr = dofid_sparse
+  while dofid >= 0:
+    if dofid == dofidi:
+      ten_Jj = ten_Ji
+    else:
+      # scan pointer backward to find matching colind entry
+      while ptr >= 0:
+        sparseid = rowadr + ptr
+        if ten_J_colind[sparseid] <= dofid:
+          break
+        ptr -= 1
+      if ptr >= 0 and ten_J_colind[sparseid] == dofid:
+        ten_Jj = ten_J_in[worldid, sparseid]
       else:
-        # scan pointer backward to find matching colind entry
-        while ptr >= 0:
-          sparseid = rowadr + ptr
-          if ten_J_colind[sparseid] <= dofid:
-            break
-          ptr -= 1
-        if ptr >= 0 and ten_J_colind[sparseid] == dofid:
-          ten_Jj = ten_J_in[worldid, sparseid]
-        else:
-          ten_Jj = float(0.0)
+        ten_Jj = float(0.0)
 
-      # ancestors outside the tendon row add nothing (and would take a deterministic record)
-      if ten_Jj != 0.0:
-        wp.atomic_add(M_out[worldid], madr_ij, armature * ten_Jj * ten_Ji)
-      madr_ij -= 1
+    Mij = armature * ten_Jj * ten_Ji
 
-      dofid = dof_parentid[dofid]
+    # plain kernel: deterministic atomics take _tendon_armature_owned
+    wp.atomic_add(M_out[worldid], madr_ij, Mij)  # kernel_analyzer: ignore[atomic]
+    madr_ij -= 1
 
-  return kernel
+    dofid = dof_parentid[dofid]
+
+
+@wp.kernel
+def _tendon_armature_owned(
+  # Model:
+  tendon_armature: wp.array2d[float],
+  ten_J_pair: wp.array[wp.vec3i],
+  ten_J_pair_adr: wp.array[int],
+  ten_J_pair_madr: wp.array[int],
+  # Data in:
+  ten_J_in: wp.array2d[float],
+  # Data out:
+  M_out: wp.array2d[float],
+):
+  """_tendon_armature with one thread per M address, adding its pairs in (tendon, i, j) order."""
+  worldid, targetid = wp.tid()
+  madr = ten_J_pair_madr[targetid]
+  Mij = M_out[worldid, madr]
+  for adr in range(ten_J_pair_adr[targetid], ten_J_pair_adr[targetid + 1]):
+    pair = ten_J_pair[adr]
+    armature = tendon_armature[worldid % tendon_armature.shape[0], pair[0]]
+    if armature == 0.0:
+      continue
+    ten_Ji = ten_J_in[worldid, pair[1]]
+    ten_Jj = ten_J_in[worldid, pair[2]]
+    if ten_Ji == 0.0 or ten_Jj == 0.0:
+      continue
+    Mij += armature * ten_Jj * ten_Ji
+  M_out[worldid, madr] = Mij
 
 
 @event_scope
 def tendon_armature(m: Model, d: Data):
-  """Add tendon armature to M."""
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
+  """Add tendon armature to M.
+
+  Deterministic atomics take one thread per M address, which adds its tendon pairs in order: the
+  pair atomics would reserve deterministic scatter records, which captured graphs sort in full on
+  every replay.
+  """
+  if bool(m.opt.deterministic & DeterminismType.ATOMICS) or _deterministic_launch(_tendon_armature):
+    if m.ten_J_pair_madr.size:
+      wp.launch(
+        _tendon_armature_owned,
+        dim=(d.nworld, m.ten_J_pair_madr.size),
+        inputs=[m.tendon_armature, m.ten_J_pair, m.ten_J_pair_adr, m.ten_J_pair_madr, d.ten_J],
+        outputs=[d.M],
+      )
+    return
   wp.launch(
-    _tendon_armature(_ten_J_pair_records(m) if det_atomics else 0, det_atomics),
+    _tendon_armature,
     dim=(d.nworld, m.ntendon, m.max_ten_J_rownnz),
     inputs=[
       m.dof_parentid,
@@ -1247,6 +1286,32 @@ def _deterministic_launch(kernel) -> bool:
   inside a caller's scoped deterministic configuration, unless its options set the mode.
   """
   return kernel.module.options["deterministic"] != wp.DeterministicMode.NOT_GUARANTEED
+
+
+@wp.func_native(
+  snippet="""
+  float sum = value;
+#if defined(__CUDA_ARCH__)
+  if (lanes == 32) {
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    }
+  }
+#endif
+  return sum;
+"""
+)
+def _warp_sum(value: float, lanes: int) -> float:
+  """Sums `value` over a warp's `lanes` (32, or 1 for a serial sum) in a fixed order, into lane 0.
+
+  Every lane of the warp must call it.
+  """
+  ...
+
+
+def _segment_lanes(block_dim: int = 32) -> int:
+  """Lanes that sum one long segment: a CUDA warp, or a single CPU thread."""
+  return 32 if wp.get_device().is_cuda and block_dim % 32 == 0 else 1
 
 
 @cache_kernel
@@ -1362,27 +1427,42 @@ def _qLD_acc_level_owned(
   qLD_factor_target_adr: wp.array[int],
   # In:
   target_adr: int,
+  target_long: int,
+  serial_threads: int,
+  lanes: int,
   # Out:
   L_out: wp.array2d[float],
 ):
-  """_qLD_acc_level with one thread per updated M(i,j), applying its elements in order.
+  """_qLD_acc_level with one thread, or one warp, per updated M(i,j), summing in a fixed order.
 
-  A level updates rows i and reads rows k of deeper dofs, so the segments are independent.
+  The first `serial_threads` (a multiple of `lanes`) take the segments of at most
+  M_SPARSE_SEGMENT_SERIAL_MAX elements, and every following group of `lanes` threads one longer
+  segment. A level updates rows i and reads rows k of deeper dofs, so segments are independent.
   """
-  worldid, targetid = wp.tid()
-  segment = target_adr + targetid
+  worldid, threadid = wp.tid()
+  segment = target_adr + threadid
+  lane = int(0)
+  stride = int(1)
+  if threadid < serial_threads:
+    if segment >= target_long:
+      return
+  else:
+    segment = target_long + (threadid - serial_threads) // lanes
+    lane = (threadid - serial_threads) % lanes
+    stride = lanes
   start = qLD_factor_target_adr[segment]
-  end = qLD_factor_target_adr[segment + 1]
-  Madr_ij = qLD_factor_elem[qLD_factor_target_elem[start]][0]
-  Mij = L_out[worldid, Madr_ij]
-  for adr in range(start, end):
+  update = float(0.0)
+  for adr in range(start + lane, qLD_factor_target_adr[segment + 1], stride):
     # CSR addresses of M(i,j), M(k,j), M(k,i), M(k,k)
     elem = qLD_factor_elem[qLD_factor_target_elem[adr]]
-    # tmp = M(k,i) / M(k,k)
-    tmp = L_out[worldid, elem[2]] / L_out[worldid, elem[3]]
-    # M(i,j) -= M(k,j) * tmp
-    Mij -= L_out[worldid, elem[1]] * tmp
-  L_out[worldid, Madr_ij] = Mij
+    # M(k,j) * M(k,i) / M(k,k)
+    update += L_out[worldid, elem[1]] * (L_out[worldid, elem[2]] / L_out[worldid, elem[3]])
+  if threadid >= serial_threads:
+    update = _warp_sum(update, lanes)
+  if lane == 0:
+    # M(i,j) -= sum over the segment
+    Madr_ij = qLD_factor_elem[qLD_factor_target_elem[start]][0]
+    L_out[worldid, Madr_ij] = L_out[worldid, Madr_ij] - update
 
 
 @wp.kernel
@@ -1432,10 +1512,10 @@ def _factor_i_sparse(
 
   The fused kernel or one launch per level for the element updates and one for the multipliers;
   both apply the element updates M(i,j) -= M(k,j) * M(k,i) / M(k,k) level by level. Deterministic
-  atomics take the per-level launches with one thread per updated M(i,j), which applies its
-  elements in order without atomics: the fused kernel reads its own atomics, and deterministic
-  element atomics would reserve a scatter record per element, which captured graphs retain for
-  every launch.
+  atomics take the per-level launches with one thread, or one warp, per updated M(i,j), which sums
+  its elements in a fixed order without atomics: the fused kernel reads its own atomics, and
+  deterministic element atomics would reserve scatter records, which captured graphs sort in full
+  on every replay.
   """
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
   fused = _factor_sparse_fused(m, d.nworld)
@@ -1463,13 +1543,24 @@ def _factor_i_sparse(
     return
 
   wp.copy(L, M)
-  levels, elems, targets = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host, m.qLD_factor_target_offsets_host
+  levels, elems = m.qLD_level_offsets_host, m.qLD_factor_elem_offsets_host
+  targets, targets_long = m.qLD_factor_target_offsets_host, m.qLD_factor_target_long_host
+  lanes = _segment_lanes()
   for level in reversed(range(len(levels) - 1)):
     if det_atomics:
+      serial_threads = -(-(targets_long[level] - targets[level]) // lanes) * lanes
       wp.launch(
         _qLD_acc_level_owned,
-        dim=(d.nworld, targets[level + 1] - targets[level]),
-        inputs=[m.qLD_factor_elem, m.qLD_factor_target_elem, m.qLD_factor_target_adr, targets[level]],
+        dim=(d.nworld, serial_threads + lanes * (targets[level + 1] - targets_long[level])),
+        inputs=[
+          m.qLD_factor_elem,
+          m.qLD_factor_target_elem,
+          m.qLD_factor_target_adr,
+          targets[level],
+          targets_long[level],
+          serial_threads,
+          lanes,
+        ],
         outputs=[L],
       )
     else:
@@ -1716,42 +1807,58 @@ def _rne_cfrc(m: Model, d: Data, flg_cfrc_ext: bool = False):
   wp.launch(_cfrc, dim=[d.nworld, m.nbody], inputs=[d.cinert, d.cvel, d.cacc, d.cfrc_ext, flg_cfrc_ext], outputs=[d.cfrc_int])
 
 
-@cache_kernel
-def _cfrc_backward(deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+@wp.kernel
+def _cfrc_backward(
+  # Model:
+  body_parentid: wp.array[int],
+  # Data in:
+  cfrc_int_in: wp.array2d[wp.spatial_vector],
+  # In:
+  body_tree_: wp.array[int],
+  # Data out:
+  cfrc_int_out: wp.array2d[wp.spatial_vector],
+):
+  worldid, nodeid = wp.tid()
+  bodyid = body_tree_[nodeid]
+  pid = body_parentid[bodyid]
+  if bodyid != 0:
+    # plain kernel: deterministic atomics take _cfrc_backward_owned
+    wp.atomic_add(cfrc_int_out[worldid], pid, cfrc_int_in[worldid, bodyid])  # kernel_analyzer: ignore[atomic]
 
-  @wp.kernel(module="unique", module_options=module_options)
-  def kernel(
-    # Model:
-    body_parentid: wp.array[int],
-    # Data in:
-    cfrc_int_in: wp.array2d[wp.spatial_vector],
-    # In:
-    body_tree_: wp.array[int],
-    # Data out:
-    cfrc_int_out: wp.array2d[wp.spatial_vector],
-  ):
-    worldid, nodeid = wp.tid()
-    bodyid = body_tree_[nodeid]
-    pid = body_parentid[bodyid]
-    if bodyid != 0:
-      wp.atomic_add(cfrc_int_out[worldid], pid, cfrc_int_in[worldid, bodyid])
 
-  return kernel
+@wp.kernel
+def _cfrc_backward_owned(
+  # Model:
+  body_subtreenum: wp.array[int],
+  # Data in:
+  cfrc_int_in: wp.array2d[wp.spatial_vector],
+  # Data out:
+  cfrc_int_out: wp.array2d[wp.spatial_vector],
+):
+  """Sums the body forces of a body's subtree, a contiguous body range, in body order."""
+  worldid, bodyid = wp.tid()
+  cfrc = cfrc_int_in[worldid, bodyid]
+  for subtreeid in range(bodyid + 1, bodyid + body_subtreenum[bodyid]):
+    cfrc += cfrc_int_in[worldid, subtreeid]
+  cfrc_int_out[worldid, bodyid] = cfrc
 
 
 def _rne_cfrc_backward(m: Model, d: Data):
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  cfrc_int_in = wp.empty_like(d.cfrc_int) if det_atomics else d.cfrc_int
-  for body_tree in reversed(m.body_tree):
-    if det_atomics:
-      wp.copy(cfrc_int_in, d.cfrc_int)
+  if m.opt.deterministic & DeterminismType.ATOMICS:
+    # deterministic atomics sum each body's subtree in one thread, from a copy of the body forces
+    cfrc_int_in = wp.clone(d.cfrc_int)
     wp.launch(
-      _cfrc_backward(det_atomics),
+      _cfrc_backward_owned,
+      dim=(d.nworld, m.nbody),
+      inputs=[m.body_subtreenum, cfrc_int_in],
+      outputs=[d.cfrc_int],
+    )
+    return
+  for body_tree in reversed(m.body_tree):
+    wp.launch(
+      _cfrc_backward,
       dim=[d.nworld, body_tree.size],
-      inputs=[m.body_parentid, cfrc_int_in, body_tree],
+      inputs=[m.body_parentid, d.cfrc_int, body_tree],
       outputs=[d.cfrc_int],
     )
 
@@ -3746,50 +3853,175 @@ def _solve_LD_sparse_update_fn(
     wp.atomic_sub(x_out[worldid], k, L_in[worldid, Madr_ki] * x_in[worldid, i])
 
 
-@wp.kernel
-def _solve_LD_sparse_copy(
+@wp.func
+def _solve_LD_sparse_owned_sum(
   # Model:
-  qLD_block_adr: wp.array[int],
+  qLD_all_updates: wp.array[wp.vec3i],
+  qLD_solve_target_update: wp.array[int],
+  qLD_solve_target_adr: wp.array[int],
   # In:
-  y_in: wp.array2d[float],
-  # Out:
-  x_out: wp.array2d[float],
-):
-  worldid, dofid = wp.tid()
-  _solve_LD_sparse_copy_fn(qLD_block_adr, y_in, worldid, dofid, x_out)
+  L: wp.array[float],
+  x: wp.array[float],
+  segment: int,
+  up: bool,
+  lane: int,
+  stride: int,
+) -> float:
+  """Sum of a segment's update terms L(k,i) * x(source) at lanes lane, lane + stride, ..."""
+  total = float(0.0)
+  for adr in range(qLD_solve_target_adr[segment] + lane, qLD_solve_target_adr[segment + 1], stride):
+    update = qLD_all_updates[qLD_solve_target_update[adr]]
+    source = update[0]
+    if up:
+      source = update[1]
+    total += L[update[2]] * x[source]
+  return total
 
 
-@wp.kernel
-def _solve_LD_sparse_diag(
+@wp.func
+def _solve_LD_sparse_owned_level(
   # Model:
-  qLD_block_adr: wp.array[int],
+  qLD_all_updates: wp.array[wp.vec3i],
+  qLD_solve_target_update: wp.array[int],
+  qLD_solve_target_adr: wp.array[int],
+  qLD_solve_target_offsets: wp.array[int],
+  qLD_solve_target_long: wp.array[int],
   # In:
-  D_in: wp.array2d[float],
-  x_in: wp.array2d[float],
+  L: wp.array[float],
+  group: int,
+  up: bool,
+  tid: int,
+  nthread: int,
+  lanes: int,
   # Out:
-  x_out: wp.array2d[float],
+  x_out: wp.array[float],
 ):
-  worldid, dofid = wp.tid()
-  _solve_LD_sparse_diag_fn(qLD_block_adr, D_in, x_in, worldid, dofid, x_out)
+  """One level (`group`) of an owned backsubstitution pass, summing every dof's terms in order.
+
+  An update (i, k, Madr_ki) is x(i) -= L(k,i) * x(k) in the up pass and x(k) -= L(k,i) * x(i) in
+  the down pass. One thread takes each segment of at most M_SPARSE_SEGMENT_SERIAL_MAX updates and
+  one warp (`lanes` threads) each longer one. A level's updated dofs are never read in that level,
+  so segments are independent.
+  """
+  long_start = qLD_solve_target_long[group]
+  for segment in range(qLD_solve_target_offsets[group] + tid, long_start, nthread):
+    target = _solve_LD_sparse_owned_target(qLD_all_updates, qLD_solve_target_update, qLD_solve_target_adr, segment, up)
+    total = _solve_LD_sparse_owned_sum(
+      qLD_all_updates, qLD_solve_target_update, qLD_solve_target_adr, L, x_out, segment, up, 0, 1
+    )
+    x_out[target] = x_out[target] - total
+  lane = tid % lanes
+  for segment in range(long_start + tid // lanes, qLD_solve_target_offsets[group + 1], nthread // lanes):
+    total = _solve_LD_sparse_owned_sum(
+      qLD_all_updates, qLD_solve_target_update, qLD_solve_target_adr, L, x_out, segment, up, lane, lanes
+    )
+    total = _warp_sum(total, lanes)
+    if lane == 0:
+      target = _solve_LD_sparse_owned_target(qLD_all_updates, qLD_solve_target_update, qLD_solve_target_adr, segment, up)
+      x_out[target] = x_out[target] - total
+
+
+@wp.func
+def _solve_LD_sparse_owned_target(
+  # Model:
+  qLD_all_updates: wp.array[wp.vec3i],
+  qLD_solve_target_update: wp.array[int],
+  qLD_solve_target_adr: wp.array[int],
+  # In:
+  segment: int,
+  up: bool,
+) -> int:
+  """The dof a segment updates: x(i) in the up pass, x(k) in the down pass."""
+  first = qLD_all_updates[qLD_solve_target_update[qLD_solve_target_adr[segment]]]
+  if up:
+    return first[0]
+  return first[1]
 
 
 @cache_kernel
-def _solve_LD_sparse_level(up: bool, deterministic: bool = False):
-  module_options = {"enable_backward": False}
-  if deterministic:
-    module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
+def _solve_LD_sparse_fused_owned(nv: int, nlevels: int, masked: bool = False):
+  """`_solve_LD_sparse_fused` with one thread, or one warp, per updated dof of a level.
 
-  @wp.kernel(module="unique", module_options=module_options)
+  Every dof sums its updates in a fixed order without atomics, so the solve is run-to-run
+  deterministic without Warp's deterministic scatter records, which captured graphs sort in full
+  on every replay.
+  """
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
   def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    qLD_all_updates: wp.array[wp.vec3i],
+    qLD_solve_target_update: wp.array[int],
+    qLD_solve_target_adr: wp.array[int],
+    qLD_solve_target_offsets: wp.array[int],
+    qLD_solve_target_long: wp.array[int],
     # In:
-    L_in: wp.array2d[float],
-    qLD_updates_: wp.array[wp.vec3i],
-    x_in: wp.array2d[float],
+    lanes: int,
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    y: wp.array2d[float],
+    done_in: wp.array[bool],
     # Out:
     x_out: wp.array2d[float],
   ):
-    worldid, nodeid = wp.tid()
-    _solve_LD_sparse_update_fn(L_in, x_in, qLD_updates_[nodeid], worldid, wp.static(up), x_out)
+    worldid, tid = wp.tid()
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    BLOCK_DIM = wp.block_dim()
+
+    # every thread of the block has the same worldid, so the block returns as a whole
+    if wp.static(masked):
+      if done_in[worldid]:
+        return
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      _solve_LD_sparse_copy_fn(qLD_block_adr, y, worldid, dofid, x_out)
+    _syncthreads()
+
+    L_world = L[worldid]
+    x = x_out[worldid]
+    for level in range(NLEVELS):
+      _solve_LD_sparse_owned_level(
+        qLD_all_updates,
+        qLD_solve_target_update,
+        qLD_solve_target_adr,
+        qLD_solve_target_offsets,
+        qLD_solve_target_long,
+        L_world,
+        NLEVELS - 1 - level,
+        True,
+        tid,
+        BLOCK_DIM,
+        lanes,
+        x,
+      )
+      _syncthreads()
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      _solve_LD_sparse_diag_fn(qLD_block_adr, D, x_out, worldid, dofid, x_out)
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      _solve_LD_sparse_owned_level(
+        qLD_all_updates,
+        qLD_solve_target_update,
+        qLD_solve_target_adr,
+        qLD_solve_target_offsets,
+        qLD_solve_target_long,
+        L_world,
+        NLEVELS + level,
+        False,
+        tid,
+        BLOCK_DIM,
+        lanes,
+        x,
+      )
+      _syncthreads()
 
   return kernel
 
@@ -3874,47 +4106,42 @@ def _solve_LD_sparse(
   D: wp.array2d[float],
   x: wp.array2d[float],
   y: wp.array2d[float],
-  x_scratch: Optional[wp.array] = None,
   done: Optional[wp.array] = None,
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y.
 
-  Deterministic atomics take the per-level launches, as the fused kernel reads its own atomics.
-  With `done`, the fused kernel leaves the rows of done worlds unchanged; the per-level launches
-  solve every world.
+  Deterministic atomics take the owned fused kernel, as the fused kernel reads its own atomics.
+  With `done`, either kernel leaves the rows of done worlds unchanged.
   """
-  det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = None if det_atomics else _solve_LD_sparse_fused(m.nv, len(m.qLD_updates), done is not None)
-  if fused is None or _deterministic_launch(fused):
-    x_in = x_scratch if x_scratch is not None else wp.empty_like(x)
-    wp.launch(_solve_LD_sparse_copy, dim=(d.nworld, m.nv), inputs=[m.qLD_block_adr, y], outputs=[x])
-    for qLD_updates in reversed(m.qLD_updates):
-      wp.copy(x_in, x)
-      wp.launch(
-        _solve_LD_sparse_level(True, True),
-        dim=(d.nworld, qLD_updates.size),
-        inputs=[L, qLD_updates, x_in],
-        outputs=[x],
-      )
-    wp.launch(_solve_LD_sparse_diag, dim=(d.nworld, m.nv), inputs=[m.qLD_block_adr, D, x], outputs=[x])
-    for qLD_updates in m.qLD_updates:
-      wp.copy(x_in, x)
-      wp.launch(
-        _solve_LD_sparse_level(False, True),
-        dim=(d.nworld, qLD_updates.size),
-        inputs=[L, qLD_updates, x_in],
-        outputs=[x],
-      )
+  nlevels, masked = len(m.qLD_updates), done is not None
+  owned = bool(m.opt.deterministic & DeterminismType.ATOMICS) or _deterministic_launch(
+    _solve_LD_sparse_fused(m.nv, nlevels, masked)
+  )
+  dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
+  if owned:
+    wp.launch(
+      _solve_LD_sparse_fused_owned(m.nv, nlevels, masked),
+      dim=(d.nworld, dim_block),
+      inputs=[
+        m.qLD_block_adr,
+        m.qLD_all_updates,
+        m.qLD_solve_target_update,
+        m.qLD_solve_target_adr,
+        m.qLD_solve_target_offsets,
+        m.qLD_solve_target_long,
+        _segment_lanes(dim_block),
+        L,
+        D,
+        y,
+        done,
+      ],
+      outputs=[x],
+      block_dim=dim_block,
+    )
     return
 
-  if wp.get_device().is_cuda:
-    dim_block = m.block_dim.solve_LD_sparse_fused
-  else:
-    # Fallback for CPU
-    dim_block = 1
-
   wp.launch(
-    fused,
+    _solve_LD_sparse_fused(m.nv, nlevels, masked),
     dim=(d.nworld, dim_block),
     inputs=[m.qLD_block_adr, L, D, m.qLD_all_updates, m.qLD_level_offsets, y, done],
     outputs=[x],
@@ -4053,7 +4280,6 @@ def solve_LD(
   D: wp.array2d[float],
   x: wp.array2d[float],
   y: wp.array2d[float],
-  x_scratch: Optional[wp.array] = None,
   done: Optional[wp.array] = None,
 ):
   """Computes backsubstitution for the inertia factorization.
@@ -4068,14 +4294,13 @@ def solve_LD(
     D: Reciprocal diagonal for compact and sparse blocks.
     x: Output array for the solution.
     y: Input right-hand side array.
-    x_scratch: Preallocated scratch array for deterministic sparse backsubstitution.
-    done: Optional per-world flags (nworld,). The block and fused sparse kernels skip done worlds
-      and leave their rows of x unchanged (the deterministic per-level sparse path solves them).
+    done: Optional per-world flags (nworld,). The block and sparse kernels skip done worlds and
+      leave their rows of x unchanged.
   """
   if m.M_tiles:
     _solve_blocks(m, d, L, D, x, y, done=done)
   if L.shape[1] > m.qLD_block_total:
-    _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, x_scratch=x_scratch, done=done)
+    _solve_LD_sparse(m, d, L[:, m.qLD_block_total :], D, x, y, done=done)
 
 
 @event_scope
@@ -4084,7 +4309,6 @@ def solve_m(
   d: Data,
   x: wp.array2d[float],
   y: wp.array2d[float],
-  x_scratch: Optional[wp.array] = None,
   done: Optional[wp.array] = None,
 ):
   """Computes backsubstitution: x = qLD * y.
@@ -4094,31 +4318,20 @@ def solve_m(
     d: The data object containing factorization results.
     x: Output array for the solution.
     y: Input right-hand side array.
-    x_scratch: Preallocated scratch array for deterministic sparse backsubstitution.
     done: Optional per-world flags (nworld,); see `solve_LD`.
   """
-  solve_LD(m, d, d.qLD, d.qLDiagInv, x, y, x_scratch=x_scratch, done=done)
+  solve_LD(m, d, d.qLD, d.qLDiagInv, x, y, done=done)
 
 
 @cache_kernel
-def _solve_LD_sparse_fused_batched(nv: int, nlevels: int, masked: bool = False, serial: bool = False):
-  """`_solve_LD_sparse_fused` with one thread block per (world, right-hand side).
-
-  `serial` launches take one thread per block (block_dim 1): every update then runs in a fixed
-  order without contended atomics, so the solve is run-to-run deterministic without Warp's
-  deterministic scatter records. The module never inherits Warp's deterministic mode, whose
-  deferred atomics this kernel cannot use (it reads its own updates after a barrier).
-  """
+def _solve_LD_sparse_fused_batched(nv: int, nlevels: int, masked: bool = False):
+  """`_solve_LD_sparse_fused` with one thread block per (world, right-hand side)."""
 
   @wp.func_native(snippet="WP_TILE_SYNC();")
   def _syncthreads():
     pass
 
-  module_options = {"enable_backward": False}
-  if serial:
-    module_options["deterministic"] = wp.DeterministicMode.NOT_GUARANTEED
-
-  @wp.kernel(module="unique", module_options=module_options)
+  @wp.kernel(module="unique", enable_backward=False)
   def kernel(
     # Model:
     qLD_block_adr: wp.array[int],
@@ -4171,6 +4384,89 @@ def _solve_LD_sparse_fused_batched(nv: int, nlevels: int, masked: bool = False, 
         update = all_updates[level_offset + u]
         i, k, Madr_ki = update[0], update[1], update[2]
         wp.atomic_sub(x, k, L[worldid, Madr_ki] * x[i])  # kernel_analyzer: ignore[atomic]
+      _syncthreads()
+
+  return kernel
+
+
+@cache_kernel
+def _solve_LD_sparse_fused_batched_owned(nv: int, nlevels: int, masked: bool = False):
+  """`_solve_LD_sparse_fused_owned` with one thread block per (world, right-hand side)."""
+
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    # Model:
+    qLD_block_adr: wp.array[int],
+    qLD_all_updates: wp.array[wp.vec3i],
+    qLD_solve_target_update: wp.array[int],
+    qLD_solve_target_adr: wp.array[int],
+    qLD_solve_target_offsets: wp.array[int],
+    qLD_solve_target_long: wp.array[int],
+    # In:
+    lanes: int,
+    world_mask: wp.array[bool],
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    y: wp.array3d[float],
+    # Out:
+    x_out: wp.array3d[float],
+  ):
+    worldid, rhsid, tid = wp.tid()
+    if wp.static(masked):
+      if not world_mask[worldid]:
+        return
+    NV = wp.static(nv)
+    NLEVELS = wp.static(nlevels)
+    BLOCK_DIM = wp.block_dim()
+    L_world = L[worldid]
+    x = x_out[worldid, rhsid]
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x[dofid] = y[worldid, rhsid, dofid]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      _solve_LD_sparse_owned_level(
+        qLD_all_updates,
+        qLD_solve_target_update,
+        qLD_solve_target_adr,
+        qLD_solve_target_offsets,
+        qLD_solve_target_long,
+        L_world,
+        NLEVELS - 1 - level,
+        True,
+        tid,
+        BLOCK_DIM,
+        lanes,
+        x,
+      )
+      _syncthreads()
+
+    for dofid in range(tid, NV, BLOCK_DIM):
+      if qLD_block_adr[dofid] == Q_LD_BLOCK_SPARSE:
+        x[dofid] *= D[worldid, dofid]
+    _syncthreads()
+
+    for level in range(NLEVELS):
+      _solve_LD_sparse_owned_level(
+        qLD_all_updates,
+        qLD_solve_target_update,
+        qLD_solve_target_adr,
+        qLD_solve_target_offsets,
+        qLD_solve_target_long,
+        L_world,
+        NLEVELS + level,
+        False,
+        tid,
+        BLOCK_DIM,
+        lanes,
+        x,
+      )
       _syncthreads()
 
   return kernel
@@ -4265,9 +4561,8 @@ def solve_m_batched(
   Uses the factorization from the most recent `factor_m`. Each right-hand side runs the
   same per-block arithmetic as `solve_m`, so a batch of k columns costs a few launches
   instead of k sequential solves. Under deterministic atomics (or a kernel that would inherit
-  Warp's deterministic mode) the sparse backsubstitution runs one thread per (world, right-hand
-  side) through every update in level order: deterministic, with no scatter records, which
-  captured graphs would otherwise retain per launch.
+  Warp's deterministic mode) the sparse backsubstitution takes the owned kernel, which applies
+  every dof's updates in a fixed order without atomics.
 
   Args:
     m: The model containing inertia and factorization information.
@@ -4301,12 +4596,33 @@ def solve_m_batched(
     return
 
   L = d.qLD[:, m.qLD_block_total :]
-  serial = bool(m.opt.deterministic & DeterminismType.ATOMICS) or not wp.get_device().is_cuda
-  if not serial:
-    serial = _deterministic_launch(_solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), masked))
-  dim_block = 1 if serial else m.block_dim.solve_LD_sparse_fused
+  nlevels = len(m.qLD_updates)
+  dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
+  if bool(m.opt.deterministic & DeterminismType.ATOMICS) or _deterministic_launch(
+    _solve_LD_sparse_fused_batched(m.nv, nlevels, masked)
+  ):
+    wp.launch(
+      _solve_LD_sparse_fused_batched_owned(m.nv, nlevels, masked),
+      dim=(d.nworld, nrhs, dim_block),
+      inputs=[
+        m.qLD_block_adr,
+        m.qLD_all_updates,
+        m.qLD_solve_target_update,
+        m.qLD_solve_target_adr,
+        m.qLD_solve_target_offsets,
+        m.qLD_solve_target_long,
+        _segment_lanes(dim_block),
+        world_mask,
+        L,
+        d.qLDiagInv,
+        y,
+      ],
+      outputs=[x],
+      block_dim=dim_block,
+    )
+    return
   wp.launch(
-    _solve_LD_sparse_fused_batched(m.nv, len(m.qLD_updates), masked, serial),
+    _solve_LD_sparse_fused_batched(m.nv, nlevels, masked),
     dim=(d.nworld, nrhs, dim_block),
     inputs=[m.qLD_block_adr, world_mask, L, d.qLDiagInv, m.qLD_all_updates, m.qLD_level_offsets, y],
     outputs=[x],

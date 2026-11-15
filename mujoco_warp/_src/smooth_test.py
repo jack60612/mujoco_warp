@@ -1597,15 +1597,22 @@ class SmoothTest(parameterized.TestCase):
     expected_res = np.linalg.solve(A_sparse, vec.numpy()[0])
     _assert_eq(res.numpy()[0], expected_res, "qLU \\ 1 (sparse)")
 
-  @parameterized.parameters(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE)
-  def test_tendon_armature(self, jacobian):
+  @parameterized.product(
+    jacobian=(mujoco.mjtJacobian.mjJAC_SPARSE, mujoco.mjtJacobian.mjJAC_DENSE),
+    deterministic=(types.DeterminismType.NONE, types.DeterminismType.ATOMICS),
+  )
+  def test_tendon_armature(self, jacobian, deterministic):
+    """Tendon armature matches MuJoCo; deterministic atomics add it one thread per M address."""
     mjm, mjd, m, d = test_data.fixture("tendon/armature.xml", keyframe=0, overrides={"opt.jacobian": jacobian})
+    self.assertGreater(m.ten_J_pair_madr.size, 0)
 
     # M
     d.M.fill_(wp.inf)
 
+    m.opt.deterministic = deterministic
     mjw._src.smooth.crb(m, d)
     mjw._src.smooth.tendon_armature(m, d)
+    m.opt.deterministic = types.DeterminismType.NONE
 
     _assert_eq(d.M.numpy()[0], mjd.M, "M")
 

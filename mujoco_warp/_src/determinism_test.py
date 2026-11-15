@@ -237,18 +237,14 @@ _TREE_CASES = (
       "sensor._tendon_actuator_force",
       "set_const._accumulate_subtreemass",
       "smooth._angular_momentum",
-      "smooth._cfrc_backward",
       "smooth._cfrc_ext_equality",
       "smooth._cfrc_ext_spatial_tendon",
       "smooth._cfrc_ext_tendon_actuator",
       "smooth._cfrc_ext_tendon_constraint",
-      "smooth._crb_accumulate",
       "smooth._joint_tendon",
       "smooth._linear_momentum",
       "smooth._spatial_geom_tendon",
       "smooth._spatial_site_tendon",
-      "smooth._subtree_com_acc",
-      "smooth._tendon_armature",
       "smooth._tendon_bias_coef",
       "smooth._tendon_bias_qfrc",
       "smooth._transmission",
@@ -260,6 +256,12 @@ _TREE_CASES = (
       "solver._update_gradient_grad",
       "solver._update_gradient_h_incremental_sparse",
     ),
+    owned=(
+      "smooth._cfrc_backward_owned",
+      "smooth._crb_owned",
+      "smooth._subtree_com_owned",
+      "smooth._tendon_armature_owned",
+    ),
   ),
   dict(
     testcase_name="implicit",
@@ -268,10 +270,10 @@ _TREE_CASES = (
       "derivative._qderiv_actuator_passive_actuation_sparse",
       "derivative._qderiv_box_fluid",
       "derivative._qderiv_ellipsoid_fluid",
-      "derivative._qderiv_tendon_damping",
       "derivative.deriv_rne_body2jnt_sparse",
       "derivative.deriv_rne_cfrcbody_backward",
     ),
+    owned=("derivative._qderiv_tendon_damping_owned",),
   ),
   dict(testcase_name="implicitfast", overrides={"opt.integrator": "IMPLICITFAST"}, covers=()),
   dict(
@@ -298,7 +300,8 @@ _TREE_CASES = (
   dict(
     testcase_name="dense_blocks",
     overrides={"opt.jacobian": "DENSE"},
-    covers=("smooth._solve_LD_sparse_level",),
+    covers=(),
+    owned=("smooth._qLD_acc_level_owned", "smooth._solve_LD_sparse_fused_owned"),
     sparse_blocks=True,
   ),
 )
@@ -400,10 +403,11 @@ class DeterminismTest(parameterized.TestCase):
         for arg in _RECORDS_ONLY_ARGS[name]:
           self.assertEqual(args.get(arg, 0), 0, f"{name} is called with {arg} != 0 on the default path")
 
-  def _check_scene(self, mjm, m, d, covers, replay=False, extra=None, rc=None, perturb=True, tol=1e-3):
+  def _check_scene(self, mjm, m, d, covers, replay=False, extra=None, rc=None, perturb=True, tol=1e-3, owned=()):
     """Compares ATOMICS with NONE and checks that ATOMICS is bitwise reproducible.
 
-    Returns the arrays after the first ATOMICS run.
+    `owned` names the atomic-free kernels that replace atomics under ATOMICS. Returns the arrays
+    after the first ATOMICS run.
     """
     if perturb:
       _perturb(d)
@@ -427,7 +431,7 @@ class DeterminismTest(parameterized.TestCase):
     with _record_launches() as launches:
       none = run(DeterminismType.NONE)
     self.assertEqual([name for name, mode, _ in launches if mode == _RUN_TO_RUN], [])
-    if "smooth._solve_LD_sparse_level" in covers:
+    if "smooth._solve_LD_sparse_fused_owned" in owned:
       self.assertIn("smooth._solve_LD_sparse_fused", {name for name, _, nonzero in launches if nonzero})
     self._assert_default_path_keys()
 
@@ -438,6 +442,8 @@ class DeterminismTest(parameterized.TestCase):
     self.assertNotIn("smooth._solve_LD_sparse_fused", {name for name, _, _ in launches})
     launched = {name for name, mode, nonzero in launches if mode == _RUN_TO_RUN and nonzero}
     self.assertEqual(set(covers) - launched, set(), "factories not exercised")
+    owned_launched = {name for name, mode, nonzero in launches if mode != _RUN_TO_RUN and nonzero}
+    self.assertEqual(set(owned) - owned_launched, set(), "owned kernels not exercised")
 
     # NONE and ATOMICS only differ in floating-point summation order
     names = [f"d.{field}" for field in _PHYSICS_FIELDS]
@@ -456,7 +462,7 @@ class DeterminismTest(parameterized.TestCase):
     return ref
 
   @parameterized.named_parameters(*_TREE_CASES)
-  def test_tree(self, overrides, covers, sparse_blocks=False):
+  def test_tree(self, overrides, covers, sparse_blocks=False, owned=()):
     """Tree with tendons, actuators, sensors, fluid, gravity compensation, equality and limits."""
     blocks = mock.patch.multiple("mujoco_warp._src.types", M_BLOCK_SCALAR_MAX=0, M_BLOCK_DENSE_MAX=0)
     with blocks if sparse_blocks else contextlib.nullcontext():
@@ -562,7 +568,7 @@ class DeterminismTest(parameterized.TestCase):
       set_const.set_const(m, d)
       mjw.inverse(m, d)
 
-    ref = self._check_scene(mjm, m, d, covers, extra=extra)
+    ref = self._check_scene(mjm, m, d, covers, extra=extra, owned=owned)
 
     # actuator moment rows are in actuator order with ascending columns
     rownnz, rowadr, colind = ref["d.moment_rownnz"], ref["d.moment_rowadr"], ref["d.moment_colind"]
