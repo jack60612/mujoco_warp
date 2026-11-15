@@ -804,17 +804,26 @@ def _cdof(
 
 
 @event_scope
-def com_pos(m: Model, d: Data):
+def com_pos(m: Model, d: Data, subtree_com_scratch: Optional[wp.array] = None):
   """Computes subtree center of mass positions.
 
   Transforms inertia and motion to global frame centered at subtree CoM. Accumulates the
   mass-weighted positions up the kinematic tree, divides by total mass, and computes composite
   inertias and motion degrees of freedom in the subtree CoM frame.
+
+  Args:
+    m: The model containing kinematic and dynamic information (device).
+    d: The data object containing the current state and output arrays (device).
+    subtree_com_scratch: Optional array like d.subtree_com for the read copy of deterministic
+      atomics; allocated on each call if not passed, which is not allowed inside conditional
+      graph nodes.
   """
   wp.launch(_subtree_com_init, dim=(d.nworld, m.nbody), inputs=[m.body_mass, d.xipos], outputs=[d.subtree_com])
 
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  subtree_com_in = wp.empty_like(d.subtree_com) if det_atomics else d.subtree_com
+  subtree_com_in = d.subtree_com
+  if det_atomics:
+    subtree_com_in = subtree_com_scratch if subtree_com_scratch is not None else wp.empty_like(d.subtree_com)
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
     if det_atomics:
@@ -1071,16 +1080,24 @@ def _M(
 
 
 @event_scope
-def crb(m: Model, d: Data):
+def crb(m: Model, d: Data, crb_scratch: Optional[wp.array] = None):
   """Computes composite rigid body inertias for each body and the joint-space inertia matrix.
 
   Accumulates composite rigid body inertias up the kinematic tree and computes the
   joint-space inertia matrix in either sparse or dense format, depending on model options.
+
+  Args:
+    m: The model containing kinematic and dynamic information (device).
+    d: The data object containing the current state and output arrays (device).
+    crb_scratch: Optional array like d.crb for the read copy of deterministic atomics; allocated
+      on each call if not passed, which is not allowed inside conditional graph nodes.
   """
   wp.copy(d.crb, d.cinert)
 
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  crb_in = wp.empty_like(d.crb) if det_atomics else d.crb
+  crb_in = d.crb
+  if det_atomics:
+    crb_in = crb_scratch if crb_scratch is not None else wp.empty_like(d.crb)
   for i in reversed(range(len(m.body_tree))):
     body_tree = m.body_tree[i]
     if det_atomics:
@@ -1414,13 +1431,21 @@ def _factor_sparse_fused(m: Model, nworld: int) -> bool:
   return width * idle < M_SPARSE_LEVEL_WIDTH_MIN
 
 
-def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[float], D: wp.array2d[float]):
+def _factor_i_sparse(
+  m: Model,
+  d: Data,
+  M: wp.array2d[float],
+  L: wp.array2d[float],
+  D: wp.array2d[float],
+  L_scratch: Optional[wp.array2d[float]] = None,
+):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd.
 
   The fused kernel or one launch per level for the element updates and one for the multipliers;
   both apply the element updates M(i,j) -= M(k,j) * M(k,i) / M(k,k) level by level. Deterministic
-  atomics take v3.17's per-level launches, which read a copy of the previous level: the fused
-  kernel reads its own atomics, and element launches would reserve scatter records per element.
+  atomics take v3.17's per-level launches, which read a copy of the previous level (`L_scratch`,
+  shaped like L, allocated if not passed): the fused kernel reads its own atomics, and element
+  launches would reserve scatter records per element.
   """
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
   fused = _factor_sparse_fused(m, d.nworld)
@@ -1430,7 +1455,7 @@ def _factor_i_sparse(m: Model, d: Data, M: wp.array2d[float], L: wp.array2d[floa
 
   if det_atomics:
     wp.copy(L, M)
-    L_in = wp.empty_like(L)
+    L_in = L_scratch if L_scratch is not None else wp.empty_like(L)
     for qLD_updates in reversed(m.qLD_updates):
       wp.copy(L_in, L)
       wp.launch(
@@ -1588,16 +1613,23 @@ def _factor_blocks(
 
 
 @event_scope
-def factor_m(m: Model, d: Data):
+def factor_m(m: Model, d: Data, qLD_scratch: Optional[wp.array2d[float]] = None):
   """Factorization of inertia-like matrix M, assumed spd.
 
   Compact blocks use reciprocal diagonals, full small blocks use scalar Cholesky, larger dense
   blocks use tile Cholesky, and oversized blocks use sparse LDL.
+
+  Args:
+    m: The model containing kinematic and dynamic information (device).
+    d: The data object containing the current state and output arrays (device).
+    qLD_scratch: Optional array like the sparse region of d.qLD, read copy of the deterministic
+      sparse factorization; allocated on each call if not passed, which is not allowed inside
+      conditional graph nodes.
   """
   if m.M_tiles:
     _factor_blocks(m, d, d.M, d.qLD, d.qLDiagInv)
   if d.qLD.shape[1] > m.qLD_block_total:
-    _factor_i_sparse(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv)
+    _factor_i_sparse(m, d, d.M, d.qLD[:, m.qLD_block_total :], d.qLDiagInv, qLD_scratch)
 
 
 @wp.kernel

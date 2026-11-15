@@ -94,6 +94,35 @@ def _layout_coverage_xml() -> str:
 _AXES = (("x", "1 0 0"), ("y", "0 1 0"), ("z", "0 0 1"))
 
 
+def test_const0_deterministic_workspace_in_conditional_graph():
+  """Under deterministic atomics a workspace refresh runs inside a conditional graph node.
+
+  The subtree CoM and composite inertia passes and the sparse factorization read copies of
+  their previous level; allocating them per call is not allowed in a conditional body.
+  """
+  if not wp.is_cuda_available():
+    pytest.skip("CUDA is unavailable")
+  mjm = mujoco.MjModel.from_xml_string(_layout_coverage_xml())
+  names = ("dof_invweight0", "body_invweight0", "tendon_invweight0", "actuator_acc0")
+  with wp.ScopedDevice("cuda:0"):
+    m = mjwarp.put_model(mjm)
+    m.opt.deterministic = types.DeterminismType.ATOMICS
+    d = mjwarp.make_data(mjm, nworld=2)
+    assert d.qLD.shape[1] > m.qLD_block_total
+    workspace = mjwarp.Const0Workspace(m, d)
+    mjwarp.set_const_0(m, d, workspace=workspace)
+    expected = {name: getattr(m, name).numpy().copy() for name in names}
+    for name in names:
+      getattr(m, name).zero_()
+
+    condition = wp.ones(1, dtype=int)
+    with wp.ScopedCapture() as capture:
+      wp.capture_if(condition, lambda: mjwarp.set_const_0(m, d, workspace=workspace))
+    wp.capture_launch(capture.graph)
+    for name, value in expected.items():
+      np.testing.assert_array_equal(getattr(m, name).numpy(), value, err_msg=name)
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda:0"])
 @pytest.mark.parametrize("rhs_chunk", [1, 7, None])
 def test_const0_batched_inverse_weights_match_mujoco(device, rhs_chunk):
