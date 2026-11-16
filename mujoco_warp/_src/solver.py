@@ -87,7 +87,7 @@ def _create_solver_context(
   alloc_hfactor = alloc_h and nv > _BLOCK_CHOLESKY_DIM
   alloc_mgrad = m.opt.solver == types.SolverType.CG
   alloc_incremental = _use_incremental(m)
-  # the discrete warm start solves with the metric factor under every solver, not only CG
+  # the discrete warm start, qacc_smooth + qacc_constraint, is formed in this scratch
   alloc_qacc_start = m.opt.integrator == types.IntegratorType.DISCRETE
 
   return SolverContext(
@@ -1776,14 +1776,15 @@ def _mark_constrained_trees(is_sparse: bool):
 
 
 @wp.kernel
-def _add_qacc_smooth(
+def _discrete_warmstart(
   # Data in:
   qacc_smooth_in: wp.array2d[float],
+  qacc_constraint_in: wp.array2d[float],
   # Out:
   qacc_start_out: wp.array2d[float],
 ):
   worldid, dofid = wp.tid()
-  qacc_start_out[worldid, dofid] += qacc_smooth_in[worldid, dofid]
+  qacc_start_out[worldid, dofid] = qacc_smooth_in[worldid, dofid] + qacc_constraint_in[worldid, dofid]
 
 
 @cache_kernel
@@ -4363,13 +4364,15 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # A light DOF whose damping dominates its inertia (h*c/I >> 1) has an acceleration near -v/h
     # that changes completely every step, so the previous qacc is a stale start for it, and CG
     # stops on its relative-improvement test long before it corrects that DOF (the lag acts as
-    # explicit damping and grows). The constraint force changes slowly, so warm start it instead:
-    # qacc0 = qacc_smooth + M_hat^-1 qfrc_constraint, with qfrc_constraint from the previous solve.
-    # The metric factor (exact when it holds the couplings, else the backbone that preconditions CG)
-    # applies M_hat^-1; DOFs no row acts on start at their exact solution.
+    # explicit damping and grows). The constraint part of the acceleration changes slowly, so warm
+    # start that instead: qacc0 = qacc_smooth + qacc_constraint, with qacc_constraint = qacc -
+    # qacc_smooth of the previous step. The start inherits the previous solve's error and does not
+    # amplify it. Restarting from the constraint force, qacc_smooth + M_hat^-1 qfrc_constraint,
+    # multiplies the error of a stiff row by -D*A per step (about -450 for the friction rows of
+    # resting contact at impratio 10) and CG stops before it removes the excess: a mirror-odd
+    # perturbation of 1e-25 grew x50 per step. DOFs no row acts on start at their exact solution.
     qacc_start = ctx.qacc_start
-    derivative.eff_solve_qH(m, d, qacc_start, d.qfrc_constraint)
-    wp.launch(_add_qacc_smooth, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth], outputs=[qacc_start])
+    wp.launch(_discrete_warmstart, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, d.qacc_constraint], outputs=[qacc_start])
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse, free_tree_start),
     dim=(d.nworld, m.nv),

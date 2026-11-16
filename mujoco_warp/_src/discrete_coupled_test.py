@@ -398,15 +398,14 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     m = mjw.put_model(mjm)
     m.efm_qH_coupled = coupled and m.efm_qH_coupled
     d = mjw.put_data(mjm, mjd)
-    qfrc_constraint = wp.array(mjd.qfrc_constraint[None], dtype=float)  # the previous solve's force
+    qacc_constraint = np.linspace(0.5, 2.0, mjm.nv, dtype=np.float32)[None]  # the previous step's constraint acceleration
+    d.qacc_constraint.assign(qacc_constraint)
     mjw.forward(m, d)
     self.assertEqual(int(d.nefc.numpy()[0]), 1)
     qacc, qacc_smooth = d.qacc.numpy()[0], d.qacc_smooth.numpy()[0]
     np.testing.assert_array_equal(qacc[free], qacc_smooth[free])
-    # the constrained set starts from the previous constraint force, not the qacc warmstart
-    ac = wp.empty((1, mjm.nv), dtype=float)
-    derivative.eff_solve_qH(m, d, ac, qfrc_constraint)
-    np.testing.assert_allclose(qacc[rowset], qacc_smooth[rowset] + ac.numpy()[0][rowset], rtol=1e-5, atol=1e-5)
+    # the constrained set starts at qacc_smooth + the previous constraint acceleration
+    np.testing.assert_allclose(qacc[rowset], qacc_smooth[rowset] + qacc_constraint[0][rowset], rtol=1e-5, atol=1e-5)
     self.assertFalse(np.allclose(qacc[rowset], 1.0))
 
     # converged, the solve matches MuJoCo
@@ -430,7 +429,6 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     mjd = mujoco.MjData(mjm)
     mujoco.mj_resetDataKeyframe(mjm, mjd, 0)
     mujoco.mj_forward(mjm, mjd)
-    mjd.qacc_warmstart[:] = 1.0  # far from the solution in every tree
     set_tree_mask = solver._set_tree_mask
 
     qacc, masks = {}, []
@@ -444,6 +442,7 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
       m.efm_qH_coupled = coupled and m.efm_qH_coupled
       m.opt.skip_unconstrained_trees = skip
       d = mjw.put_data(mjm, mjd)
+      d.qacc_constraint.fill_(1.0)  # a start far from the solution in every tree
       with mock.patch.object(solver, "_set_tree_mask", record):
         mjw.forward(m, d)
       qacc[skip] = d.qacc.numpy()[0]
@@ -460,6 +459,31 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     np.testing.assert_allclose(qacc[False], mjd.qacc, rtol=1e-3, atol=1e-4 * scale)
     np.testing.assert_allclose(qacc[True], mjd.qacc, rtol=1e-3, atol=1e-4 * scale)
     np.testing.assert_allclose(qacc[True], qacc[False], rtol=1e-3, atol=1e-4 * scale)
+
+  def test_qacc_constraint_is_the_previous_constraint_acceleration(self):
+    """A discrete step stores qacc - qacc_smooth for the next start; reset_data zeroes it."""
+    xml = _xml(False, floor=True)
+    _, _, m, d = test_data.fixture(xml=xml, keyframe=0, nworld=2, nconmax=64, njmax=256)
+    self.assertEqual(float(np.abs(d.qacc_constraint.numpy()).max()), 0.0)  # a cold first step
+    for _ in range(3):
+      mjw.step(m, d)
+    qacc_constraint = d.qacc_constraint.numpy()
+    np.testing.assert_array_equal(qacc_constraint, d.qacc.numpy() - d.qacc_smooth.numpy())
+    self.assertGreater(np.abs(qacc_constraint).max(), 0.0)  # the floor holds the fruit
+
+    # only the discrete integrator keeps it
+    _, _, m_fast, d_fast = test_data.fixture(
+      xml=xml.replace('integrator="discrete"', 'integrator="implicitfast"'), keyframe=0, nconmax=64, njmax=256
+    )
+    for _ in range(3):
+      mjw.step(m_fast, d_fast)
+    self.assertEqual(float(np.abs(d_fast.qacc_constraint.numpy()).max()), 0.0)
+
+    # a reset world forgets it, the other keeps it
+    mjw.reset_data(m, d, reset=wp.array([True, False], dtype=bool))
+    after = d.qacc_constraint.numpy()
+    np.testing.assert_array_equal(after[0], 0.0)
+    np.testing.assert_array_equal(after[1], qacc_constraint[1])
 
 
 class DiscreteCoupledRolloutTest(parameterized.TestCase):
@@ -493,7 +517,7 @@ class DiscreteCoupledRolloutTest(parameterized.TestCase):
       step()
       nefc.append(d.nefc.numpy().max())
     self.assertGreater(max(nefc), 0)  # the contacts are active: the solver iterates
-    return [a.numpy() for a in (d.qpos, d.qvel, d.qacc, d.qacc_warmstart, d.efm_qHLD)]
+    return [a.numpy() for a in (d.qpos, d.qvel, d.qacc, d.qacc_warmstart, d.qacc_constraint, d.efm_qHLD)]
 
   @parameterized.product(solver=["NEWTON", "CG"], graph=[False, True])
   def test_rollout_bitwise(self, solver, graph):
@@ -503,6 +527,9 @@ class DiscreteCoupledRolloutTest(parameterized.TestCase):
     first, second = (self._rollout(solver, 20, graph) for _ in range(2))
     for a, b in zip(first, second):
       np.testing.assert_array_equal(a, b)
+    if graph:  # a replayed graph carries qacc_constraint from step to step like the eager launches
+      for a, b in zip(first, self._rollout(solver, 20, False)):
+        np.testing.assert_array_equal(a, b)
 
 
 if __name__ == "__main__":

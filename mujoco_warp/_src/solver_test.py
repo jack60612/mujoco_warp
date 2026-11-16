@@ -2216,12 +2216,12 @@ class SolverTest(parameterized.TestCase):
     _assert_eq(d.qacc.numpy()[0], mjd.qacc, "qacc")
 
   @parameterized.parameters(mujoco.mjtSolver.mjSOL_CG, mujoco.mjtSolver.mjSOL_NEWTON)
-  def test_discrete_warmstart_from_constraint_force(self, solver_):
-    """Discrete solves start at qacc_smooth + M_hat^-1 qfrc_constraint, not at the previous qacc.
+  def test_discrete_warmstart_from_constraint_acceleration(self, solver_):
+    """Discrete solves start at qacc_smooth + qacc_constraint, not at the previous qacc.
 
     A light FREE body hangs from a CONNECT at its COM; a site damper (h*c/I ~ 1e5) is the only
     thing acting on its twist. After the twist velocity changes, the previous qacc is far from the
-    new solution, but the previous constraint force (the CONNECT holding gravity) is not.
+    new solution, but the previous constraint acceleration (the CONNECT holding gravity) is not.
     """
     xml = """
     <mujoco>
@@ -2246,17 +2246,24 @@ class SolverTest(parameterized.TestCase):
     for _ in range(50):
       mujoco.mj_step(mjm, mjd)
     self.assertGreater(np.abs(mjd.qfrc_constraint[:3]).max(), 1e-3)  # the CONNECT holds the weight
-    mjd.qvel[5] = 1.0  # twist: the damper now dominates the solution
 
     m = mjw.put_model(mjm)
     d = mjw.put_data(mjm, mjd)
+    mjw.forward(m, d)  # converged: the previous step
+    qacc_previous = d.qacc.numpy()[0].copy()
+    qacc_constraint = d.qacc.numpy() - d.qacc_smooth.numpy()
+    self.assertGreater(np.abs(qacc_constraint[0, :3]).max(), 1.0)  # the CONNECT holds the weight
+
+    qvel = d.qvel.numpy()
+    qvel[0, 5] = 1.0  # twist: the damper now dominates the solution
+    d.qvel.assign(qvel)
     mjw.forward(m, d)  # converged; also builds qacc_smooth and the metric factor of this step
     converged = d.qacc.numpy()[0].copy()
-    self.assertGreater(abs(converged[5] - mjd.qacc_warmstart[5]), 100.0)  # the qacc warmstart is far off
+    self.assertGreater(abs(converged[5] - qacc_previous[5]), 100.0)  # the previous qacc is far off
 
-    # Solve the same step again without iterations from the previous step's constraint force: the
-    # start must already be the solution (the twist exactly; the CONNECT to rounding).
-    d.qfrc_constraint.assign(mjd.qfrc_constraint[None].astype(np.float32))
+    # Solve the same step again without iterations from the previous step's constraint acceleration:
+    # the start must already be the solution (the twist exactly; the CONNECT to rounding).
+    d.qacc_constraint.assign(qacc_constraint)
     m.opt.iterations = 0
     mjw.solve(m, d)
     start = d.qacc.numpy()[0]

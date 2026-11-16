@@ -3259,6 +3259,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
     flex_hessian_valid_out: wp.array2d[bool],
     nacon_out: wp.array[int],
     overflow_out: wp.array[int],
+    qacc_constraint_out: wp.array2d[float],
   ):
     worldid = wp.tid()
 
@@ -3284,6 +3285,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
       if i < nv:
         qvel_out[worldid, i] = 0.0
         qacc_warmstart_out[worldid, i] = 0.0
+        qacc_constraint_out[worldid, i] = 0.0
         qfrc_applied_out[worldid, i] = 0.0
         qacc_out[worldid, i] = 0.0
     for i in range(nu):
@@ -3542,6 +3544,7 @@ def reset_data(m: types.Model, d: types.Data, reset: Optional[wp.array] = None):
       d.flex_hessian_valid,
       d.nacon,
       d.overflow,
+      d.qacc_constraint,
     ],
   )
 

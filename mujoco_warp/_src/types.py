@@ -2624,6 +2624,8 @@ class Data:
     overflow: overflow bitmask (OverflowType)                   (nworld,)
     face_xpos: cartesian flex face positions                    (nworld, nflexface, 9, 3)
     face_quat: cartesian flex face orientations                 (nworld, nflexface, 4)
+    qacc_constraint: constraint acceleration qacc - qacc_smooth of the previous discrete step,
+                     the discrete warm start is qacc_smooth + qacc_constraint      (nworld, nv)
   """
 
   solver_niter: array("nworld", int)
@@ -2785,6 +2787,7 @@ class Data:
   overflow: array("nworld", int)
   face_xpos: array("nworld", "nflexface", 9, wp.vec3)
   face_quat: array("nworld", "nflexface", wp.quat)
+  qacc_constraint: array("nworld", "nv", float)
 
 
 @dataclasses.dataclass
@@ -2835,7 +2838,7 @@ class SolverContext:
   quad_changed_ids: wp.array2d[int]
   quad_changed_count: wp.array[int]
   inertia_scale: wp.array[float]
-  # discrete warm start qacc_smooth + M_hat^-1 qfrc_constraint, padded like Mgrad (solve scratch)
+  # discrete warm start qacc_smooth + qacc_constraint, padded like Mgrad (solve scratch)
   qacc_start: wp.array2d[float]
   # the full-coordinate Data, set by solve_compact (None natively)
   compact_m_full: Optional["Model"] = None

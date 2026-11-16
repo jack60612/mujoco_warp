@@ -2452,8 +2452,7 @@ class DerivativeTest(parameterized.TestCase):
 
     d.qacc_smooth.fill_(wp.inf)
     d.qacc.fill_(wp.inf)
-    # the discrete warm start reads the previous qfrc_constraint: a finite stale value, overwritten
-    d.qfrc_constraint.fill_(1e3)
+    d.qfrc_constraint.fill_(wp.inf)
 
     mujoco.mj_forward(mjm, mjd)
     mjw.forward(m, d)

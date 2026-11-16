@@ -396,6 +396,18 @@ def _next_time_builder(warn_overflow: int):
   return _next_time
 
 
+@wp.kernel
+def _discrete_qacc_constraint(
+  # Data in:
+  qacc_in: wp.array2d[float],
+  qacc_smooth_in: wp.array2d[float],
+  # Data out:
+  qacc_constraint_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  qacc_constraint_out[worldid, dofid] = qacc_in[worldid, dofid] - qacc_smooth_in[worldid, dofid]
+
+
 def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None):
   """Advance state and time given activation derivatives and acceleration."""
   # TODO(team): can we assume static timesteps?
@@ -471,6 +483,9 @@ def _advance(m: Model, d: Data, qacc: wp.array, qvel: Optional[wp.array] = None)
   )
 
   wp.copy(d.qacc_warmstart, d.qacc)
+  if m.opt.integrator == IntegratorType.DISCRETE:
+    # warm start of the next discrete solve (solver._solve)
+    wp.launch(_discrete_qacc_constraint, dim=(d.nworld, m.nv), inputs=[d.qacc, d.qacc_smooth], outputs=[d.qacc_constraint])
 
   sleep_enabled = bool(m.opt.enableflags & EnableBit.SLEEP) and not bool(m.opt.disableflags & DisableBit.ISLAND)
   if sleep_enabled:
