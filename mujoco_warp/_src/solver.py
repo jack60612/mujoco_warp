@@ -1787,6 +1787,22 @@ def _discrete_warmstart(
   qacc_start_out[worldid, dofid] = qacc_smooth_in[worldid, dofid] + qacc_constraint_in[worldid, dofid]
 
 
+@wp.kernel
+def _hold_idle_friction_start(
+  # Data in:
+  solver_niter_in: wp.array[int],
+  nf_in: wp.array[int],
+  nefc_in: wp.array[int],
+  qacc_warmstart_in: wp.array2d[float],
+  # Out:
+  qacc_start_out: wp.array2d[float],
+):
+  worldid, dofid = wp.tid()
+  nf = nf_in[worldid]
+  if nf > 0 and nf == nefc_in[worldid] and solver_niter_in[worldid] == 0:
+    qacc_start_out[worldid, dofid] = qacc_warmstart_in[worldid, dofid]
+
+
 @cache_kernel
 def _solve_init_dof(warmstart: bool, sparse: bool, free_tree_start: bool):
   WARMSTART = warmstart
@@ -4373,6 +4389,17 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
     # perturbation of 1e-25 grew x50 per step. DOFs no row acts on start at their exact solution.
     qacc_start = ctx.qacc_start
     wp.launch(_discrete_warmstart, dim=(d.nworld, m.nv), inputs=[d.qacc_smooth, d.qacc_constraint], outputs=[qacc_start])
+    # Dry friction rows only (frictionloss), after a solve that exited before its first iteration:
+    # that solve returned its start, not a solution, so its qacc - qacc_smooth holds no response of
+    # the rows (they sit below CG's exit test) and the start follows every change of qacc_smooth:
+    # the float32 staircase noise of the smooth acceleration reaches qacc unfiltered and the rows
+    # never stick. The previous qacc is a fixed point of the exit test: hold it.
+    wp.launch(
+      _hold_idle_friction_start,
+      dim=(d.nworld, m.nv),
+      inputs=[d.solver_niter, d.nf, d.nefc, d.qacc_warmstart],
+      outputs=[qacc_start],
+    )
   wp.launch(
     _solve_init_dof(warmstart, m.is_sparse, free_tree_start),
     dim=(d.nworld, m.nv),

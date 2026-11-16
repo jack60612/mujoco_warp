@@ -2270,6 +2270,110 @@ class SolverTest(parameterized.TestCase):
     np.testing.assert_allclose(start[3:], converged[3:], rtol=1e-4, atol=1e-3)
     np.testing.assert_allclose(start[:3], converged[:3], atol=1e-2)
 
+  def test_discrete_idle_solve_holds_its_start(self):
+    """A CG solve that did not iterate is held, not restarted from the smooth acceleration.
+
+    A 1 kg slider rests on a dry-friction (frictionloss) row under a load 10x below it. The start
+    already satisfies CG's exit test, so the solve returns it after 0 iterations and its
+    qacc - qacc_smooth holds no response of the row (below the tolerance the row never engages).
+    The next start then follows qacc_smooth alone and the slider accelerates under the load, qvel
+    growing by h*load/m per step (2e-8, 8e-7 within 40 steps). The previous qacc is a fixed point
+    of the exit test: the slider sticks.
+    """
+    xml = """
+    <mujoco>
+      <option integrator="discrete" timestep="0.002" solver="CG"/>
+      <worldbody>
+        <body>
+          <joint type="slide" axis="1 0 0" frictionloss="1e-4"/>
+          <geom type="sphere" size="0.05" mass="1"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjd = mujoco.MjData(mjm)
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    d.qfrc_applied.fill_(1e-5)
+
+    qvel = []
+    for _ in range(40):
+      mjw.step(m, d)
+      qvel.append(d.qvel.numpy()[0, 0])
+
+    self.assertEqual(d.nefc.numpy()[0], 1)  # the friction row is active
+    self.assertEqual(d.solver_niter.numpy()[0], 0)  # and CG exits before its first iteration
+    np.testing.assert_array_less(np.abs(qvel), 1e-9)
+
+  @parameterized.product(friction_only=(True, False), previous_niter=(0, 3))
+  def test_discrete_idle_hold_is_for_friction_only_worlds(self, friction_only, previous_niter):
+    """Only an idle solve of dry-friction rows is held.
+
+    Any other start is qacc_smooth + qacc_constraint.
+    """
+    equality = "" if friction_only else '<equality><joint joint1="a" joint2="b"/></equality>'
+    xml = f"""
+    <mujoco>
+      <option integrator="discrete" timestep="0.002" solver="CG" iterations="0"/>
+      <worldbody>
+        <body>
+          <joint name="a" type="slide" axis="1 0 0" frictionloss="1e-4"/>
+          <geom type="sphere" size="0.05" mass="1"/>
+        </body>
+        <body pos="1 0 0">
+          <joint name="b" type="slide" axis="1 0 0"/>
+          <geom type="sphere" size="0.05" mass="1"/>
+        </body>
+      </worldbody>
+      {equality}
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjd = mujoco.MjData(mjm)
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    d.qacc_warmstart.fill_(7.0)
+    d.qacc_constraint.assign(np.array([[0.25, 0.0]], dtype=np.float32))  # the previous step's constraint accel
+    d.solver_niter.fill_(previous_niter)
+
+    mjw.forward(m, d)  # no iterations: qacc is the start
+
+    self.assertEqual(d.nf.numpy()[0], 1)
+    self.assertEqual(d.nefc.numpy()[0], 1 if friction_only else 2)
+    held = friction_only and previous_niter == 0
+    np.testing.assert_allclose(d.qacc.numpy()[0, 0], 7.0 if held else 0.25, rtol=1e-5)
+
+  def test_discrete_idle_hold_follows_solver_niter_in_a_graph(self):
+    """A captured solve reads solver_niter on the device: every replay holds or restarts."""
+    if not wp.get_device().is_cuda:
+      self.skipTest("CUDA graph capture needs a CUDA device")
+    xml = """
+    <mujoco>
+      <option integrator="discrete" timestep="0.002" solver="CG" iterations="0"/>
+      <worldbody>
+        <body>
+          <joint type="slide" axis="1 0 0" frictionloss="1e-4"/>
+          <geom type="sphere" size="0.05" mass="1"/>
+        </body>
+      </worldbody>
+    </mujoco>
+    """
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    mjd = mujoco.MjData(mjm)
+    m = mjw.put_model(mjm)
+    d = mjw.put_data(mjm, mjd)
+    d.qacc_warmstart.fill_(7.0)
+    d.qacc_constraint.fill_(0.25)
+
+    mjw.forward(m, d)  # compile outside the capture
+    with wp.ScopedCapture() as capture:  # recorded, not run
+      mjw.forward(m, d)
+    for niter, held in ((0, True), (3, False), (0, True), (3, False)):
+      d.solver_niter.fill_(niter)  # the iteration count of the previous solve, set between replays
+      wp.capture_launch(capture.graph)
+      np.testing.assert_allclose(d.qacc.numpy()[0, 0], 7.0 if held else 0.25, rtol=1e-5)
+
 
 def _hinge_chain(name: str, n: int, pos: str, axis: str) -> str:
   bodies = "".join(

@@ -400,6 +400,7 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     d = mjw.put_data(mjm, mjd)
     qacc_constraint = np.linspace(0.5, 2.0, mjm.nv, dtype=np.float32)[None]  # the previous step's constraint acceleration
     d.qacc_constraint.assign(qacc_constraint)
+    d.solver_niter.fill_(1)  # the previous solve iterated: a friction-only world after an idle one holds its qacc
     mjw.forward(m, d)
     self.assertEqual(int(d.nefc.numpy()[0]), 1)
     qacc, qacc_smooth = d.qacc.numpy()[0], d.qacc_smooth.numpy()[0]
@@ -443,6 +444,7 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
       m.opt.skip_unconstrained_trees = skip
       d = mjw.put_data(mjm, mjd)
       d.qacc_constraint.fill_(1.0)  # a start far from the solution in every tree
+      d.solver_niter.fill_(1)  # the previous solve iterated: no idle hold of the friction-only start
       with mock.patch.object(solver, "_set_tree_mask", record):
         mjw.forward(m, d)
       qacc[skip] = d.qacc.numpy()[0]
