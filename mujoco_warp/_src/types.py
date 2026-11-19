@@ -1713,7 +1713,7 @@ class Model:
                     when those are not known statically) (ntree,)
     efm_qH_coupled: discrete integrator factors the metric with its tendon and actuator
                     couplings (efm_qH_* layout) instead of the qH backbone
-    efm_qH_rownnz: coupled metric factor row lengths (every elimination-tree ancestor) (nv,)
+    efm_qH_rownnz: coupled metric factor row lengths (fill + diagonal)         (nv,)
     efm_qH_rowadr: coupled metric factor row addresses                         (nv,)
     efm_qH_colind: coupled metric factor column indices                        (nefm_qH,)
     efm_qH_madr: qH address (M's sparsity) of each coupled metric element, -1 outside it (nefm_qH,)

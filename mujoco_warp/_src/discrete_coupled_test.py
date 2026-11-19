@@ -109,6 +109,35 @@ _TREE_QVEL = ".4  .3 -.2 .5  1.1  -.9"
 _FRUIT_QPOS = ".61 .06 .88 1 .1 0 0  .62 -.04 .89 .98 0 .2 0"
 _FRUIT_QVEL = ".1 -.2 .3 2 -1 3  -.3 .1 .2 -1 2 1"
 
+# Four free bodies in a row, each pair of neighbours joined by a stiff, damped spatial tendon: a
+# chain of couplings (the collars of a branch) whose elimination ancestors reach beyond the dofs
+# a row is coupled to.
+_CHAIN = """
+<mujoco>
+  <option integrator="discrete" timestep=".002"/>
+  <default><geom type="sphere" size=".03" mass=".2" contype="0" conaffinity="0"/></default>
+  <worldbody>
+    <body name="a" pos="0 0 1"><freejoint/><geom/><site name="a_next" pos=".05 0 0"/></body>
+    <body name="b" pos=".2 0 1">
+      <freejoint/><geom/><site name="b_prev" pos="-.05 0 0"/><site name="b_next" pos=".05 0 0"/>
+    </body>
+    <body name="c" pos=".4 0 1">
+      <freejoint/><geom/><site name="c_prev" pos="-.05 0 0"/><site name="c_next" pos=".05 0 0"/>
+    </body>
+    <body name="d" pos=".6 0 1"><freejoint/><geom/><site name="d_prev" pos="-.05 0 0"/></body>
+  </worldbody>
+  <tendon>
+    <spatial stiffness="300" damping="2" springlength=".12"><site site="a_next"/><site site="b_prev"/></spatial>
+    <spatial stiffness="250" damping="3" springlength=".12"><site site="b_next"/><site site="c_prev"/></spatial>
+    <spatial stiffness="200" damping="1" springlength=".12"><site site="c_next"/><site site="d_prev"/></spatial>
+  </tendon>
+  <keyframe>
+    <key qpos="0 0 1 1 0 0 0  .2 .01 1 1 .1 0 0  .4 0 .99 .98 0 .2 0  .6 .02 1 1 0 0 .1"
+         qvel=".1 .2 -.1 .3 -.2 .1  -.3 .1 .2 .1 .4 -.2  .2 -.1 .1 -.4 .3 .2  .1 .3 -.2 .2 -.1 .5"/>
+  </keyframe>
+</mujoco>
+"""
+
 
 def _xml(fruit_first: bool, dt: float = 0.002, floor: bool = False) -> str:
   tree_first = not fruit_first
@@ -277,16 +306,57 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
     np.testing.assert_allclose(d.qacc_smooth.numpy(), qacc_smooth, rtol=1e-5, atol=1e-6 * np.max(np.abs(qacc_smooth)))
 
   def test_layout(self):
-    """Rows hold every elimination-tree ancestor; fill follows the dof order."""
+    """Rows hold the exact fill; fill follows the dof order."""
     tree_first = mujoco.MjModel.from_xml_string(_xml(False))
     fruit_first = mujoco.MjModel.from_xml_string(_xml(True))
-    parent = io.efm_qH_parent(tree_first)
+    elimination = io.efm_qH_elimination(tree_first)
     # each fruit hangs below its twig's dof; the twigs' fixed tendon makes twig_b a child of twig_a
-    np.testing.assert_array_equal(parent, [-1, 0, 1, 2, 3, 4, 4, 6, 7, 8, 9, 10, 5, 12, 13, 14, 15, 16])
-    layout = io.efm_qH_layout(tree_first, parent)
+    np.testing.assert_array_equal(elimination[0], [-1, 0, 1, 2, 3, 4, 4, 6, 7, 8, 9, 10, 5, 12, 13, 14, 15, 16])
+    layout = io.efm_qH_layout(tree_first, elimination)
     self.assertEqual(int(layout["rownnz"].sum()), io.efm_qH_nnz(tree_first))
     # declaring the fruit first moves the branch below both fruit: more fill, same metric
     self.assertGreater(io.efm_qH_nnz(fruit_first), io.efm_qH_nnz(tree_first))
+
+  def test_layout_is_the_symbolic_cholesky_structure(self):
+    """Rows of a chain of coupled pairs hold the couplings and their fill, not every ancestor."""
+    mjm, mjd, m, d = test_data.fixture(xml=_CHAIN, keyframe=0)
+    self.assertTrue(m.efm_qH_coupled)
+    # the dense symbolic factorization of M's pattern plus the coupled dof sets, last dof first
+    pattern = np.zeros((mjm.nv, mjm.nv), dtype=bool)
+    for i in range(mjm.nv):
+      cols = mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]]
+      pattern[i, cols] = pattern[cols, i] = True
+    for group in io._efm_coupling_groups(mjm):
+      pattern[np.ix_(group, group)] = True
+    for k in reversed(range(mjm.nv)):
+      lower = np.flatnonzero(pattern[k, :k])
+      pattern[np.ix_(lower, lower)] = True
+
+    parent, rows = io.efm_qH_elimination(mjm)
+    for i in range(mjm.nv):
+      np.testing.assert_array_equal(rows[i], np.flatnonzero(pattern[i, :i]))
+    rownnz, rowadr, colind = (a.numpy() for a in (m.efm_qH_rownnz, m.efm_qH_rowadr, m.efm_qH_colind))
+    for i in range(mjm.nv):
+      np.testing.assert_array_equal(colind[rowadr[i] : rowadr[i] + rownnz[i]], [*rows[i], i])
+    # the last body of the chain is not coupled to the first, which is its elimination ancestor
+    ancestors = int((io._efm_qH_depth(parent) + 1).sum())
+    self.assertEqual(len(colind), io.efm_qH_nnz(mjm))
+    self.assertLess(len(colind), ancestors)
+    self.assertEqual(set(colind[rowadr[-1] : rowadr[-1] + rownnz[-1]]), set(range(12, 24)))
+
+    # the exact layout solves the same metric: MuJoCo's qacc_smooth, and a zero residual
+    mjw.forward(m, d)
+    self.assertLess(_metric_residual(m, d), 1e-5)
+    mujoco.mj_forward(mjm, mjd)
+    np.testing.assert_allclose(
+      d.qacc_smooth.numpy()[0], mjd.qacc_smooth, rtol=1e-4, atol=1e-5 * np.max(np.abs(mjd.qacc_smooth))
+    )
+    # the per-level factorization reads the same schedule
+    expected = d.efm_qHLD.numpy()
+    d.efm_qHLD.zero_()
+    with mock.patch.object(smooth, "_factor_sparse_fused", return_value=False):
+      mjw.forward(m, d)
+    np.testing.assert_allclose(d.efm_qHLD.numpy(), expected, rtol=1e-5, atol=1e-6 * np.max(np.abs(expected)))
 
   def test_layout_matches_m_without_couplings(self):
     """With M's own elimination tree and no pairs, the layout and schedules are M's sparse LDL."""
@@ -298,7 +368,8 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
       # M's rows hold every ancestor, so the last entry before the diagonal is the parent
       last = mjm.M_rowadr + mjm.M_rownnz - 2
       parent = np.where(mjm.M_rownnz > 1, mjm.M_colind[np.maximum(last, 0)], -1)
-      layout = io.efm_qH_layout(mjm, parent)
+      rows = [mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i] - 1] for i in range(mjm.nv)]
+      layout = io.efm_qH_layout(mjm, (parent, rows))
     self.assertEqual(m.qLD_block_total, 0)
     targets = io._ldl_targets(
       layout["factor_elem"], layout["factor_elem_offsets"], layout["all_updates"], layout["level_offsets"]

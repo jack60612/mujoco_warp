@@ -458,14 +458,15 @@ def tree_coupledid(mjm: mujoco.MjModel) -> np.ndarray:
   return np.array([find(t) for t in range(mjm.ntree)], dtype=int)
 
 
-def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
-  """Elimination tree of the discrete integrator's metric with its tendon and actuator couplings.
+def efm_qH_elimination(mjm: mujoco.MjModel) -> Optional[tuple[np.ndarray, list[np.ndarray]]]:
+  """Elimination tree and exact factor rows of the discrete integrator's metric with its couplings.
 
-  The metric couples the dofs of each set in _efm_coupling_groups. Under MuJoCo's reverse
-  elimination (the last dof first), dof i's factor row holds the dofs j < i it shares a coupling
-  with, plus the fill of the dofs eliminated before it; parent[i] is the largest of them. A factor
-  whose rows hold every ancestor in this tree has the prefix layout of M's own factor, so the tree
-  factorization and back-substitution apply unchanged.
+  The metric couples the dofs of each set in _efm_coupling_groups, on top of M's pattern. Under
+  MuJoCo's reverse elimination (the last dof first), dof i's factor row holds the dofs j < i it
+  shares a coupling with, plus the fill of the dofs eliminated before it (the symbolic Cholesky
+  structure); parent[i] is the largest of them. Returns (parent, rows), rows[i] being the sorted
+  columns j < i of row i. The rows are not every ancestor of the tree: a dof is coupled only to its
+  own collar's dofs and its parent's, and the fill adds to that only what elimination creates.
 
   Returns None (the backbone path) when the integrator is not discrete, flexes contribute metric
   terms, an actuator's moment depends on the state (body transmission), or no tendon or actuator
@@ -485,13 +486,20 @@ def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
     for n in range(1, cols.size):
       lower[cols[n]].update(int(j) for j in cols[:n])
 
-  # eliminating i connects its lower dofs, i.e. they join the lower set of its parent
+  # eliminating i connects its lower dofs, i.e. they join the lower set of its parent; every lower
+  # set is complete (the fill of its subtree included) by the time its dof is eliminated
   parent = np.full(mjm.nv, -1, dtype=int)
   for i in reversed(range(mjm.nv)):
     if lower[i]:
       parent[i] = max(lower[i])
       lower[parent[i]].update(lower[i] - {parent[i]})
-  return parent
+  return parent, [np.array(sorted(row), dtype=int) for row in lower]
+
+
+def efm_qH_parent(mjm: mujoco.MjModel) -> Optional[np.ndarray]:
+  """Elimination tree of efm_qH_elimination, or None without a coupled metric."""
+  elimination = efm_qH_elimination(mjm)
+  return None if elimination is None else elimination[0]
 
 
 def _efm_qH_depth(parent: np.ndarray) -> np.ndarray:
@@ -502,81 +510,77 @@ def _efm_qH_depth(parent: np.ndarray) -> np.ndarray:
   return depth
 
 
-def efm_qH_layout(mjm: mujoco.MjModel, parent: Optional[np.ndarray]) -> dict:
+def efm_qH_layout(mjm: mujoco.MjModel, elimination: Optional[tuple[np.ndarray, list[np.ndarray]]]) -> dict:
   """Row layout, sparse L'*D*L schedule and assembly lists of the coupled metric factor.
 
-  Row i holds every ancestor of i in the elimination tree `parent`, then i: the prefix layout of
-  M's factor, so the update lists follow put_model's qLD_* construction. `madr` gives the address
-  of M's sparsity (and of qH, which shares it) that holds each element's backbone value, -1 for
-  the elements outside it. For every element (i, j), j < i, the pair lists hold the tendons
-  (their ten_J addresses of i and j) and the actuators (i and j) whose pair product enters it, in
-  tendon then actuator order: an owned assembly sums them in that order, with no atomics.
+  Row i holds the exact structure of its factor row (the dofs j < i it is coupled to, with the fill
+  of the dofs eliminated before it, see efm_qH_elimination), then i. M's own factor stores every
+  ancestor of the elimination tree because there every ancestor is coupled; here the couplings
+  reach one collar's dofs and its parent's, so a row that held every ancestor would carry up to
+  90x the updates of the true fill on a deep chain of collars. An update (i, k, address of (k, i))
+  exists for every off-diagonal element (k, i), grouped by the depth of i in the elimination tree
+  (an element's row is a descendant of its column, so a level only reads rows of deeper levels),
+  and applies M(i,j) -= M(k,j) * M(k,i) / M(k,k) to every element (k, j), j <= i, of row k: the
+  schedule and kernels of M's factor apply unchanged. `madr` gives the address of M's sparsity
+  (and of qH, which shares it) that holds each element's backbone value, -1 for the elements
+  outside it. For every element (i, j), j < i, the pair lists hold the tendons (their ten_J
+  addresses of i and j) and the actuators (i and j) whose pair product enters it, in tendon then
+  actuator order: an owned assembly sums them in that order, with no atomics.
   """
-  couplings = _efm_couplings(mjm) if parent is not None else ([], [])
+  couplings = _efm_couplings(mjm) if elimination is not None else ([], [])
   nv = mjm.nv
-  if parent is None:
+  if elimination is None:
     rownnz, rowadr = np.zeros(nv, dtype=int), np.zeros(nv, dtype=int)
     colind, madr = np.zeros(0, dtype=int), np.zeros(0, dtype=int)
-    updates = {}
+    keys = np.zeros(0, dtype=np.int64)
+    all_updates, level_offsets = np.zeros((1, 3), dtype=int), [0]
+    factor_elem, factor_elem_offsets = np.zeros((1, 4), dtype=int), [0]
   else:
+    parent, rows = elimination
     depth = _efm_qH_depth(parent)
-    rownnz = depth + 1
+    rownnz = np.array([len(row) + 1 for row in rows], dtype=int)
     rowadr = np.concatenate(([0], np.cumsum(rownnz)[:-1]))
-    colind = np.zeros(rownnz.sum(), dtype=int)
-    for i in range(nv):
-      j, adr = i, rowadr[i] + rownnz[i] - 1
-      while j >= 0:
-        colind[adr] = j
-        j, adr = parent[j], adr - 1
+    colind = np.concatenate([np.append(row, i) for i, row in enumerate(rows)])
+    rowid = np.repeat(np.arange(nv, dtype=np.int64), rownnz)
+    # rows and the columns of a row ascend: element (i, j) sits at searchsorted(keys, i * nv + j)
+    keys = rowid * nv + colind
 
+    # M's sparsity lies in the factor's (every row starts from M's)
+    mrow = np.repeat(np.arange(nv, dtype=np.int64), mjm.M_rownnz)
+    mkey = mrow * nv + mjm.M_colind[: len(mrow)]
+    pos = np.searchsorted(keys, mkey)
+    assert np.array_equal(keys[pos], mkey), "M's sparsity must lie in the coupled metric's"
     madr = np.full(len(colind), -1, dtype=int)
-    for i in range(nv):
-      row = colind[rowadr[i] : rowadr[i] + rownnz[i]]
-      cols = mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]]
-      pos = np.searchsorted(row, cols)
-      assert np.array_equal(row[pos], cols), "M's sparsity must lie in the coupled metric's"
-      madr[rowadr[i] + pos] = mjm.M_rowadr[i] + np.arange(mjm.M_rownnz[i])
+    madr[pos] = np.arange(len(mkey))
 
-    # update (i, k, address of (k, i)) for every ancestor i of k, grouped by the depth of i
-    updates = {}
-    for k in range(nv):
-      i, Madr_ki = parent[k], rowadr[k] + rownnz[k] - 2
-      while i >= 0:
-        updates.setdefault(depth[i], []).append((i, k, Madr_ki))
-        i, Madr_ki = parent[i], Madr_ki - 1
+    # update (i, k, address of (k, i)) per off-diagonal element (k, i), by depth of i then k
+    off = colind != rowid
+    ui, uk, uadr = colind[off], rowid[off], np.flatnonzero(off)
+    udepth = depth[ui]
+    order = np.lexsort((uk, udepth))
+    ui, uk, uadr, udepth = ui[order], uk[order], uadr[order], udepth[order]
+    levels = np.bincount(udepth) if len(ui) else np.zeros(0, dtype=int)
+    all_updates = np.stack((ui, uk, uadr), axis=1) if len(ui) else np.zeros((1, 3), dtype=int)
+    level_offsets = [0, *np.cumsum(levels[levels > 0])]
 
-  all_updates, level_offsets, factor_elem, factor_elem_offsets = [], [0], [], [0]
-  for level in sorted(updates):
-    u = np.array(updates[level], dtype=int)
-    i, k, Madr_ki = u[:, 0], u[:, 1], u[:, 2]
-    n = rownnz[i]
+    # element (i, j) -= (k, j) * (k, i) / (k, k) for every element (k, j) of row k up to column i
+    n = uadr - rowadr[uk] + 1
     j = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)
-    factor_elem.append(
-      np.stack(
-        (
-          np.repeat(rowadr[i], n) + j,
-          np.repeat(rowadr[k], n) + j,
-          np.repeat(Madr_ki, n),
-          np.repeat(rowadr[k] + rownnz[k] - 1, n),
-        ),
-        axis=1,
-      )
-    )
-    all_updates.append(u)
-    level_offsets.append(level_offsets[-1] + len(u))
-    factor_elem_offsets.append(factor_elem_offsets[-1] + n.sum())
-  all_updates = np.concatenate(all_updates) if all_updates else np.zeros((1, 3), dtype=int)
-  factor_elem = np.concatenate(factor_elem) if factor_elem else np.zeros((1, 4), dtype=int)
+    src = np.repeat(rowadr[uk], n) + j
+    want = np.repeat(ui, n).astype(np.int64) * nv + colind[src]
+    dst = np.searchsorted(keys, want)
+    assert np.array_equal(keys[dst], want), "the factor's fill must lie in the coupled metric's layout"
+    factor_elem = np.stack((dst, src, np.repeat(uadr, n), np.repeat(rowadr[uk] + rownnz[uk] - 1, n)), axis=1)
+    if not len(ui):
+      factor_elem = np.zeros((1, 4), dtype=int)
+    elems = np.bincount(udepth, weights=n).astype(int) if len(ui) else np.zeros(0, dtype=int)
+    factor_elem_offsets = [0, *np.cumsum(elems[levels > 0])]
 
   def element(rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
     """Addresses of the elements (rows[n], cols[n]) of the factor's layout."""
-    adr = np.empty(len(rows), dtype=int)
-    for i in np.unique(rows):
-      row = colind[rowadr[i] : rowadr[i] + rownnz[i]]
-      sel = rows == i
-      pos = np.searchsorted(row, cols[sel])
-      assert np.array_equal(row[pos], cols[sel]), "a coupling's pairs must lie in the coupled metric's"
-      adr[sel] = rowadr[i] + pos
+    want = rows.astype(np.int64) * nv + cols
+    adr = np.searchsorted(keys, want)
+    assert np.array_equal(keys[adr], want), "a coupling's pairs must lie in the coupled metric's"
     return adr
 
   def pairs(sources: list[tuple[int, np.ndarray, np.ndarray]]):
@@ -619,11 +623,11 @@ def efm_qH_layout(mjm: mujoco.MjModel, parent: Optional[np.ndarray]) -> dict:
 
 
 def efm_qH_nnz(mjm: mujoco.MjModel) -> int:
-  """Element count of the coupled metric factor, 0 without one (see efm_qH_parent)."""
-  parent = efm_qH_parent(mjm)
-  if parent is None:
+  """Element count of the coupled metric factor, 0 without one (see efm_qH_elimination)."""
+  elimination = efm_qH_elimination(mjm)
+  if elimination is None:
     return 0
-  return int((_efm_qH_depth(parent) + 1).sum())
+  return sum(len(row) + 1 for row in elimination[1])
 
 
 def is_sparse(mjm: mujoco.MjModel) -> bool:
@@ -1593,12 +1597,12 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.tree_coupledid = tree_coupledid(mjm)
 
   # Discrete integrator: layout of the metric factored with its tendon and actuator couplings
-  efm_parent = efm_qH_parent(mjm)
-  efm_lay = efm_qH_layout(mjm, efm_parent)
+  efm_elimination = efm_qH_elimination(mjm)
+  efm_lay = efm_qH_layout(mjm, efm_elimination)
   efm_targets = _ldl_targets(
     efm_lay["factor_elem"], efm_lay["factor_elem_offsets"], efm_lay["all_updates"], efm_lay["level_offsets"]
   )
-  m.efm_qH_coupled = efm_parent is not None
+  m.efm_qH_coupled = efm_elimination is not None
   m.efm_qH_rownnz = efm_lay["rownnz"]
   m.efm_qH_rowadr = efm_lay["rowadr"]
   m.efm_qH_colind = efm_lay["colind"]
