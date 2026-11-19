@@ -1139,7 +1139,6 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
   @wp.kernel(module="unique")
   def _discrete_free_gyro(
     # Model:
-    nactuator: int,
     opt_timestep: wp.array[float],
     opt_enableflags: int,
     body_dofadr: wp.array[int],
@@ -1152,6 +1151,9 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
     body_free_tenadr: wp.array[int],
     body_free_tennum: wp.array[int],
     body_free_tenid: wp.array[int],
+    body_free_actadr: wp.array[int],
+    body_free_actnum: wp.array[int],
+    body_free_actid: wp.array[int],
     # Data in:
     nefc_in: wp.array[int],
     qvel_in: wp.array2d[float],
@@ -1195,8 +1197,8 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
       return
 
     # Decoupling guards (mjd_freeGyroPossible): skip if K, constraints, or rank-1 touch DOFs.
-    # Static guards first: tendons come from the precomputed list of tendons whose Jacobian
-    # sparsity touches the body, so coupled bodies return before the per-step efc scan.
+    # Static guards first: the tendons and actuators come from precomputed lists of those whose
+    # Jacobian/moment sparsity touches the body, so coupled bodies return before the efc scan.
     for r in range(6):
       if efm_K_rownnz[dof_adr + r] != 0:
         return
@@ -1204,7 +1206,9 @@ def _discrete_free_gyro_kernel(has_fluid: bool, has_flex_passive: bool, is_inver
     for k in range(body_free_tennum[freeid]):
       if efm_ts_in[worldid, body_free_tenid[tenadr + k]] != 0.0:
         return
-    for a in range(nactuator):
+    actadr = body_free_actadr[freeid]
+    for k in range(body_free_actnum[freeid]):
+      a = body_free_actid[actadr + k]
       if efm_as_in[worldid, a] != 0.0:
         radr = moment_rowadr_in[worldid, a]
         for j in range(moment_rownnz_in[worldid, a]):
@@ -1321,7 +1325,6 @@ def _launch_discrete_free_gyro(m: Model, d: Data, out: wp.array2d[float], qacc: 
     _discrete_free_gyro_kernel(has_fluid, m.has_flex_passive, is_inverse, m.is_sparse),
     dim=(d.nworld, m.body_freeadr.size),
     inputs=[
-      m.nactuator,
       m.opt.timestep,
       m.opt.enableflags,
       m.body_dofadr,
@@ -1334,6 +1337,9 @@ def _launch_discrete_free_gyro(m: Model, d: Data, out: wp.array2d[float], qacc: 
       m.body_free_tenadr,
       m.body_free_tennum,
       m.body_free_tenid,
+      m.body_free_actadr,
+      m.body_free_actnum,
+      m.body_free_actid,
       d.nefc,
       d.qvel,
       qacc,

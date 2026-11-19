@@ -1613,6 +1613,11 @@ class Model:
     body_free_tennum: number of tendons whose Jacobian        (nbodyfree,)
                       sparsity touches the free body's dofs
     body_free_tenid: tendon ids touching free bodies          (nbody_free_ten,)
+    body_free_actadr: start of each free body's actuators in  (nbodyfree,)
+                      body_free_actid
+    body_free_actnum: number of actuators whose moment can    (nbodyfree,)
+                      touch the free body's dofs
+    body_free_actid: actuator ids touching free bodies        (nbody_free_act,)
     jnt_limited_slide_hinge_adr: limited/slide/hinge jntadr
     jnt_limited_ball_adr: limited/ball jntadr
     body_isdofancestor: precomputed mask of which DOFs affect each body
@@ -2210,6 +2215,9 @@ class Model:
   body_free_tenadr: array("nbodyfree", int)
   body_free_tennum: array("nbodyfree", int)
   body_free_tenid: array("nbody_free_ten", int)
+  body_free_actadr: array("nbodyfree", int)
+  body_free_actnum: array("nbodyfree", int)
+  body_free_actid: array("nbody_free_act", int)
   jnt_limited_slide_hinge_adr: array("njnt_limited_slide_hinge", int)
   jnt_limited_ball_adr: array("njnt_limited_ball", int)
   body_isdofancestor: array("nbody", "nv_pad", int)

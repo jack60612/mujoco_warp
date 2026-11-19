@@ -3355,6 +3355,61 @@ class DiscreteIntegratorTest(parameterized.TestCase):
     for w in range(nworld):
       _assert_eq(d.qacc.numpy()[w], mjd.qacc, "qacc")
 
+  @parameterized.parameters(1, 2)
+  def test_discrete_free_gyro_actuator_guard(self, nworld):
+    """Free gyro guard uses the static list of actuators whose moment can touch each free body."""
+    mjm, mjd, m, d = test_data.fixture(
+      xml="""
+      <mujoco>
+        <option integrator="discrete" timestep="0.01">
+          <flag gravity="disable"/>
+        </option>
+        <worldbody>
+          <body name="arm" pos="0 0 1">
+            <joint name="hinge" type="hinge" axis="0 1 0" damping="0.1"/>
+            <geom type="capsule" fromto="0 0 0 0.3 0 0" size="0.02" mass="0.5"/>
+            <site name="tip" pos="0.3 0 0"/>
+          </body>
+          <body name="held" pos="0.3 0 0.8">
+            <freejoint/>
+            <geom type="box" size="0.03 0.04 0.05" mass="0.1"/>
+            <site name="held_top" pos="0.01 0 0.05"/>
+          </body>
+          <body name="driven" pos="1 0 0.8">
+            <freejoint name="driven"/>
+            <geom type="box" size="0.03 0.04 0.05" mass="0.1"/>
+          </body>
+          <body name="loose" pos="2 0 0.8">
+            <freejoint/>
+            <geom type="box" size="0.03 0.04 0.05" mass="0.1"/>
+          </body>
+        </worldbody>
+        <actuator>
+          <position joint="hinge" kp="5" kv=".5"/>
+          <general site="held_top" refsite="tip" gear="0 0 1 0 0 0" biastype="affine" biasprm="0 -8 -.6"/>
+          <general joint="driven" gear="1 0 0 0 0 0" biastype="affine" biasprm="0 -3 -.2"/>
+        </actuator>
+        <keyframe>
+          <key qpos="0  0.3 0 0.8 1 0 0 0  1 0 0.8 1 0 0 0  2 0 0.8 1 0 0 0"
+               qvel="0.2  0 0 0.1 1 2 3  0 0 0 -2 1 3  0 0 0 3 -1 2" ctrl=".1 .2 .1"/>
+        </keyframe>
+      </mujoco>
+      """,
+      keyframe=0,
+      nworld=nworld,
+    )
+    np.testing.assert_array_equal(m.body_freeadr.numpy(), [2, 3, 4])
+    # `held` is moved by the site actuator, `driven` by the free joint actuator, `loose` by none
+    np.testing.assert_array_equal(m.body_free_actnum.numpy(), [1, 1, 0])
+    np.testing.assert_array_equal(m.body_free_actadr.numpy(), [0, 1, 2])
+    np.testing.assert_array_equal(m.body_free_actid.numpy(), [1, 2])
+
+    d.qacc.fill_(wp.inf)
+    mujoco.mj_forward(mjm, mjd)
+    mjw.forward(m, d)
+    for w in range(nworld):
+      _assert_eq(d.qacc.numpy()[w], mjd.qacc, "qacc")
+
   @absltest.skipIf(
     not util_pkg.check_version("mujoco>=3.14.1.dev990351372"),
     "Requires MuJoCo >= 3.14.1.dev990351372",

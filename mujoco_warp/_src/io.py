@@ -1163,6 +1163,18 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.body_free_tennum = [len(tendons) for tendons in free_tendons]
   m.body_free_tenadr = np.concatenate(([0], np.cumsum(m.body_free_tennum)[:-1])).astype(int) if free_tendons else []
   m.body_free_tenid = [t for tendons in free_tendons for t in tendons]
+  # actuators whose moment can touch each free body's dofs (a static superset of the rows they hold
+  # at run time; a state-dependent moment may touch any body), as for the tendons above
+  free_actuators = [[] for _ in m.body_freeadr]
+  for a in range(mjm.nactuator):
+    dofs = _efm_actuator_dofs(mjm, a)
+    touched = range(len(m.body_freeadr)) if dofs is None else np.unique(dof_freeid[np.asarray(dofs, dtype=int)])
+    for freeid in touched:
+      if freeid >= 0:
+        free_actuators[freeid].append(a)
+  m.body_free_actnum = [len(actuators) for actuators in free_actuators]
+  m.body_free_actadr = np.concatenate(([0], np.cumsum(m.body_free_actnum)[:-1])).astype(int) if free_actuators else []
+  m.body_free_actid = [a for actuators in free_actuators for a in actuators]
   body_fluid_box = np.zeros(mjm.nbody, dtype=bool)
   for b in range(1, mjm.nbody):
     if not m.body_fluid_ellipsoid[b] and mjm.body_mass[b] >= types.MJ_MINVAL:
@@ -1834,6 +1846,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nbranch_start": len(m.body_branch_start),
       "nbodyfree": sum(body_is_free),
       "nbody_free_ten": len(m.body_free_tenid),
+      "nbody_free_act": len(m.body_free_actid),
       "nbody_fluid_ellipsoid": len(m.body_fluid_ellipsoid_adr),
       "nbody_fluid_box": len(m.body_fluid_box_adr),
       "njnt_limited_slide_hinge": len(m.jnt_limited_slide_hinge_adr),
