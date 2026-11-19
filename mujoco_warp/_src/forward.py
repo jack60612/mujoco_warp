@@ -2129,11 +2129,11 @@ def _tendon_actuator_force_clamp(
 
 
 @cache_kernel
-def _qfrc_actuator(nv: int, deterministic: bool = False):
+def _qfrc_actuator(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -2275,7 +2275,7 @@ def fwd_actuation(m: Model, d: Data):
     # TODO(team): optimize performance
     d.qfrc_actuator.zero_()
     wp.launch(
-      _qfrc_actuator(m.nv if det_atomics else 0, det_atomics),
+      _qfrc_actuator(derivative.actuator_moment_records(m, d) if det_atomics else 0, det_atomics),
       dim=(d.nworld, m.nactuator),
       inputs=[
         d.moment_rownnz,

@@ -385,12 +385,26 @@ def _qderiv_tendon_damping_owned(
   qDeriv_out[worldid, madr] = qderiv
 
 
+def actuator_moment_records(m: Model, d: Data) -> int:
+  """Per-thread deterministic scatter reservation of a launch with one record per moment nonzero.
+
+  Warp reserves launched threads x deterministic_max_records records per deterministic launch,
+  pooled over the threads, and a captured graph keeps every launch's pool. Every record of an
+  actuator launch scatters one moment nonzero and the moment arrays hold at most nJmom nonzeros
+  per world, so the pool needs nJmom records per world, not nv per actuator (nu * nv). Records are
+  ordered by thread and emission, so the capacity never changes the result.
+  """
+  if not m.nactuator:
+    return 0
+  return -(-d.actuator_moment.shape[1] // m.nactuator)
+
+
 @cache_kernel
-def _crosstree_actuator_damping_mul(nv: int, deterministic: bool = False):
+def _crosstree_actuator_damping_mul(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -1761,7 +1775,7 @@ def crosstree_damping_mul(m: Model, d: Data, actuator_vel: wp.array2d[float], ve
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
   if m.nactuator > 0 and not (m.opt.disableflags & DisableBit.ACTUATION):
     wp.launch(
-      _crosstree_actuator_damping_mul(m.nv if det_atomics else 0, det_atomics),
+      _crosstree_actuator_damping_mul(actuator_moment_records(m, d) if det_atomics else 0, det_atomics),
       dim=(d.nworld, m.nactuator),
       inputs=[
         m.opt.timestep,
@@ -1989,11 +2003,11 @@ def _eff_tendon_shift(max_ten_J_rownnz: int, deterministic: bool = False):
 
 
 @cache_kernel
-def _eff_actuator_actuation(nv: int, deterministic: bool = False):
+def _eff_actuator_actuation(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -2231,11 +2245,11 @@ def _eff_add_tendon_qH_diag(max_ten_J_rownnz: int, deterministic: bool = False):
 
 
 @cache_kernel
-def _eff_add_actuator_qH_diag(nv: int, deterministic: bool = False):
+def _eff_add_actuator_qH_diag(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -2414,11 +2428,11 @@ def _eff_mul_add_tendon(check_skip: bool, max_ten_J_rownnz: int, deterministic: 
 
 
 @cache_kernel
-def _eff_mul_add_actuator(check_skip: bool, nv: int, deterministic: bool = False):
+def _eff_mul_add_actuator(check_skip: bool, max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = nv
+    module_options["deterministic_max_records"] = max_records
 
   @wp.kernel(module="unique", module_options=module_options, grid_stride=False)
   def kernel(
@@ -4053,7 +4067,7 @@ def eff_actuation(m: Model, d: Data):
   d.efm_ca.zero_()
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
   wp.launch(
-    _eff_actuator_actuation(m.nv if det_atomics else 0, det_atomics),
+    _eff_actuator_actuation(actuator_moment_records(m, d) if det_atomics else 0, det_atomics),
     dim=(d.nworld, m.nactuator),
     inputs=[
       m.opt.timestep,
@@ -4117,7 +4131,7 @@ def eff_actuation(m: Model, d: Data):
     outputs=[d.qH],
   )
   wp.launch(
-    _eff_add_actuator_qH_diag(m.nv if det_atomics else 0, det_atomics),
+    _eff_add_actuator_qH_diag(actuator_moment_records(m, d) if det_atomics else 0, det_atomics),
     dim=(d.nworld, m.nactuator),
     inputs=[
       m.M_rownnz,
@@ -4261,7 +4275,7 @@ def eff_mul_m(
       outputs=[res],
     )
     wp.launch(
-      _eff_mul_add_actuator(check_skip, m.nv if det_atomics else 0, det_atomics),
+      _eff_mul_add_actuator(check_skip, actuator_moment_records(m, d) if det_atomics else 0, det_atomics),
       dim=(d.nworld, m.nactuator),
       inputs=[
         d.moment_rownnz,
@@ -4462,11 +4476,11 @@ def _eff_fold_tendon(max_ten_J_rownnz: int, deterministic: bool = False):
 
 
 @cache_kernel
-def _eff_fold_actuator(nv: int, deterministic: bool = False):
+def _eff_fold_actuator(max_records: int, deterministic: bool = False):
   module_options = {"enable_backward": False}
   if deterministic:
     module_options["deterministic"] = wp.DeterministicMode.RUN_TO_RUN
-    module_options["deterministic_max_records"] = 3 * nv
+    module_options["deterministic_max_records"] = 3 * max_records
 
   @wp.kernel(module="unique", module_options=module_options)
   def kernel(
@@ -4666,7 +4680,7 @@ def eff_prec_fold(m: Model, d: Data, out: Optional[wp.array] = None) -> wp.array
   )
 
   wp.launch(
-    _eff_fold_actuator(m.nv if det_atomics else 0, det_atomics),
+    _eff_fold_actuator(actuator_moment_records(m, d) if det_atomics else 0, det_atomics),
     dim=(d.nworld, m.nactuator),
     inputs=[
       m.efm_dofid,
