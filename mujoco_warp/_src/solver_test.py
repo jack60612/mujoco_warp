@@ -495,6 +495,69 @@ class SolverTest(parameterized.TestCase):
     self.assertEqual(nsolving.numpy()[0], 0)
     self.assertEqual(overflow.numpy()[0], 0)
 
+  @parameterized.parameters(False, True)
+  def test_cg_initial_strict_stop(self, strict_stop):
+    """The opt-in initial test uses the gradient, not the preconditioned cost gap."""
+    grad = wp.array([[1.0e-2], [1.0e-7]], dtype=float)
+    mgrad = wp.array([[1.0e-5], [1.0e-7]], dtype=float)
+    done = wp.zeros(2, dtype=bool)
+    nsolving = wp.array([2], dtype=int)
+    search = wp.zeros((2, 1), dtype=float)
+    search_dot = wp.zeros(2, dtype=float)
+    prev_grad = wp.zeros((2, 1), dtype=float)
+    prev_mgrad = wp.zeros((2, 1), dtype=float)
+    wp.launch_tiled(
+      solver._solve_init_search_cg_tiled(strict_stop),
+      dim=2,
+      inputs=[1, wp.array([1.0e-6], dtype=float), wp.array([1.0, 1.0], dtype=float), grad, mgrad],
+      outputs=[search, search_dot, prev_grad, prev_mgrad, done, nsolving],
+      block_dim=32,
+    )
+    np.testing.assert_array_equal(done.numpy(), [not strict_stop, True])
+    self.assertEqual(nsolving.numpy()[0], int(strict_stop))
+    np.testing.assert_allclose(search.numpy(), -mgrad.numpy())
+
+  @parameterized.named_parameters(
+    ("default_zero_alpha", False, 0.0, 1.0, 1.0, 2, True, False),
+    ("default_small_improvement", False, 1.0, 1.0e-7, 1.0, 2, True, False),
+    ("strict_zero_alpha", True, 0.0, 1.0, 1.0, 2, True, False),
+    ("strict_no_improvement", True, 1.0, 0.0, 1.0, 2, True, False),
+    ("strict_negative_improvement", True, 1.0, -1.0, 1.0, 2, True, False),
+    ("strict_small_improvement", True, 1.0, 1.0e-7, 1.0, 2, False, False),
+    ("strict_gradient_met", True, 1.0, 1.0e-7, 1.0e-14, 2, True, False),
+    ("strict_cap", True, 1.0, 1.0e-7, 1.0, 1, True, True),
+  )
+  def test_cg_strict_stop_termination(self, strict_stop, alpha, improvement, grad_dot, cap, expected, capped):
+    """Strict stop ignores a small improvement but stops when the line search makes no progress."""
+    niter = wp.zeros(1, dtype=int)
+    nsolving = wp.ones(1, dtype=int)
+    done = wp.zeros(1, dtype=bool)
+    overflow = wp.zeros(1, dtype=int)
+    beta = wp.zeros(1, dtype=float)
+    wp.launch(
+      solver._solve_beta_finalize_tiled(types.OverflowType.NONE, strict_stop),
+      dim=(1, 32),
+      inputs=[
+        1,
+        wp.array([1.0e-6], dtype=float),
+        cap,
+        wp.array([1.0], dtype=float),
+        wp.zeros((1, 1), dtype=float),
+        wp.zeros((1, 1), dtype=float),
+        wp.zeros((1, 1), dtype=float),
+        wp.zeros((1, 1), dtype=float),
+        wp.array([improvement], dtype=float),
+        wp.array([grad_dot], dtype=float),
+        wp.array([alpha], dtype=float),
+        done,
+      ],
+      outputs=[niter, overflow, beta, nsolving, done],
+    )
+    self.assertEqual(bool(done.numpy()[0]), expected)
+    self.assertEqual(niter.numpy()[0], 1)
+    self.assertEqual(nsolving.numpy()[0], int(not expected))
+    self.assertEqual(bool(overflow.numpy()[0] & types.OverflowType.ITERATIONS), capped)
+
   # Transition cases use powers of two so the exact delta is below the absolute-cost ulp.
   @parameterized.named_parameters(
     ("middle_zone", 1.0e-4, (0.0, 0.0, 0.0), (0.5, 1.0e-4, 1.0), (0.0, 0.0, 1.0e8), (-0.5, -5000.0, 1.0)),
@@ -1299,7 +1362,8 @@ class SolverTest(parameterized.TestCase):
   def test_cg_tiled_kernels_are_unique(self):
     """Ensure CG tiled kernels with custom block_dim do not share solver.py's module."""
     shared_module = solver._solve_init_efc.module
-    self.assertNotEqual(solver._solve_init_search_cg_tiled.module, shared_module)
+    for strict_stop in (False, True):
+      self.assertNotEqual(solver._solve_init_search_cg_tiled(strict_stop).module, shared_module)
     for tree_masked in (False, True):
       self.assertNotEqual(solver._update_gradient_grad_tiled(tree_masked).module, shared_module)
     self.assertNotEqual(solver._solve_search_update_cg_tiled.module, shared_module)
@@ -2428,6 +2492,7 @@ class SkipUnconstrainedTreesTest(parameterized.TestCase):
   def test_default_off(self):
     m = mjw.put_model(mujoco.MjModel.from_xml_string(_SKIP_TREES_XML))
     self.assertFalse(m.opt.skip_unconstrained_trees)
+    self.assertFalse(m.opt.cg_strict_stop)
 
   def test_unconstrained_chain_matches_mujoco(self):
     """The row-free chain's force and acceleration are as close to float64 MuJoCo C as stock CG."""

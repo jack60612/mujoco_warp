@@ -1034,6 +1034,10 @@ class Option:
                               tree_coupledid) are skipped only together, and only where the
                               metric is solved directly (no flex or body-transmission metric
                               terms); False (default) iterates every dof
+    cg_strict_stop: for CG, stop on the scaled gradient (also at the initial guess) or when the
+                    line search makes no progress (zero step or no cost improvement), instead of
+                    on a small cost improvement or gap; False (default) retains the cost and
+                    line-search exits
     warn_overflow: overflow warning bitmask (OverflowType)
     deterministic: determinism bitmask (DeterminismType)
   """
@@ -1070,6 +1074,7 @@ class Option:
   contact_sensor_maxmatch: int
   implicit_crosstree_iterations: int
   skip_unconstrained_trees: bool
+  cg_strict_stop: bool
   warn_overflow: int
   deterministic: int
 

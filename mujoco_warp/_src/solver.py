@@ -1919,53 +1919,66 @@ def _solve_init_jaref_kernel(is_sparse: bool, nv: int, dofs_per_thread: int, com
   return kernel
 
 
-@wp.kernel(module="unique")
-def _solve_init_search_cg_tiled(
-  # Model:
-  nv: int,
-  opt_tolerance: wp.array[float],
-  # In:
-  ctx_inertia_scale_in: wp.array[float],
-  ctx_grad_in: wp.array2d[float],
-  ctx_Mgrad_in: wp.array2d[float],
-  # Out:
-  ctx_search_out: wp.array2d[float],
-  ctx_search_dot_out: wp.array[float],
-  ctx_prev_grad_out: wp.array2d[float],
-  ctx_prev_Mgrad_out: wp.array2d[float],
-  ctx_done_out: wp.array[bool],
-  nsolving_out: wp.array[int],
-):
-  worldid, tid = wp.tid()
+@cache_kernel
+def _solve_init_search_cg_tiled(strict_stop: bool):
+  STRICT_STOP = strict_stop
 
-  local_search_dot = float(0.0)
-  local_grad_mgrad = float(0.0)
-  BLOCK_DIM = wp.block_dim()
+  @wp.kernel(module="unique")
+  def kernel(
+    # Model:
+    nv: int,
+    opt_tolerance: wp.array[float],
+    # In:
+    ctx_inertia_scale_in: wp.array[float],
+    ctx_grad_in: wp.array2d[float],
+    ctx_Mgrad_in: wp.array2d[float],
+    # Out:
+    ctx_search_out: wp.array2d[float],
+    ctx_search_dot_out: wp.array[float],
+    ctx_prev_grad_out: wp.array2d[float],
+    ctx_prev_Mgrad_out: wp.array2d[float],
+    ctx_done_out: wp.array[bool],
+    nsolving_out: wp.array[int],
+  ):
+    worldid, tid = wp.tid()
 
-  for dofid in range(tid, nv, BLOCK_DIM):
-    grad = ctx_grad_in[worldid, dofid]
-    mgrad = ctx_Mgrad_in[worldid, dofid]
-    search = -1.0 * mgrad
-    ctx_search_out[worldid, dofid] = search
-    local_search_dot += search * search
-    local_grad_mgrad += grad * mgrad
+    local_search_dot = float(0.0)
+    local_gradient_measure = float(0.0)
+    BLOCK_DIM = wp.block_dim()
 
-    ctx_prev_grad_out[worldid, dofid] = grad
-    ctx_prev_Mgrad_out[worldid, dofid] = mgrad
+    for dofid in range(tid, nv, BLOCK_DIM):
+      grad = ctx_grad_in[worldid, dofid]
+      mgrad = ctx_Mgrad_in[worldid, dofid]
+      search = -1.0 * mgrad
+      ctx_search_out[worldid, dofid] = search
+      local_search_dot += search * search
+      if wp.static(STRICT_STOP):
+        local_gradient_measure += grad * grad
+      else:
+        local_gradient_measure += grad * mgrad
 
-  search_dot_tile = wp.tile(local_search_dot, preserve_type=True)
-  search_dot_sum = wp.tile_reduce(wp.add, search_dot_tile)
-  grad_mgrad_tile = wp.tile(local_grad_mgrad, preserve_type=True)
-  grad_mgrad_sum = wp.tile_reduce(wp.add, grad_mgrad_tile)
+      ctx_prev_grad_out[worldid, dofid] = grad
+      ctx_prev_Mgrad_out[worldid, dofid] = mgrad
 
-  if tid == 0:
-    ctx_search_dot_out[worldid] = search_dot_sum[0]
-    if not ctx_done_out[worldid]:
-      tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
-      scale = ctx_inertia_scale_in[worldid]
-      if wp.max(0.0, 0.5 * scale * grad_mgrad_sum[0]) < tolerance:
-        ctx_done_out[worldid] = True
-        wp.atomic_sub(nsolving_out, 0, 1)  # kernel_analyzer: ignore[atomic]
+    search_dot_tile = wp.tile(local_search_dot, preserve_type=True)
+    search_dot_sum = wp.tile_reduce(wp.add, search_dot_tile)
+    measure_tile = wp.tile(local_gradient_measure, preserve_type=True)
+    measure_sum = wp.tile_reduce(wp.add, measure_tile)
+
+    if tid == 0:
+      ctx_search_dot_out[worldid] = search_dot_sum[0]
+      if not ctx_done_out[worldid]:
+        tolerance = opt_tolerance[worldid % opt_tolerance.shape[0]]
+        scale = ctx_inertia_scale_in[worldid]
+        if wp.static(STRICT_STOP):
+          converged = scale * wp.sqrt(wp.max(0.0, measure_sum[0])) < tolerance
+        else:
+          converged = wp.max(0.0, 0.5 * scale * measure_sum[0]) < tolerance
+        if converged:
+          ctx_done_out[worldid] = True
+          wp.atomic_sub(nsolving_out, 0, 1)  # kernel_analyzer: ignore[atomic]
+
+  return kernel
 
 
 @cache_kernel
@@ -3991,8 +4004,9 @@ def _solve_search_update_cg_tiled(
 
 
 @cache_kernel
-def _solve_beta_finalize_tiled(warn_overflow: int):
+def _solve_beta_finalize_tiled(warn_overflow: int, strict_stop: bool = False):
   WARN_OVERFLOW = warn_overflow
+  STRICT_STOP = strict_stop
 
   @wp.kernel(module="unique", enable_backward=False)
   def kernel(
@@ -4047,10 +4061,16 @@ def _solve_beta_finalize_tiled(warn_overflow: int):
 
       grad_dot = ctx_grad_dot_in[worldid]
 
-      alpha = ctx_alpha_in[worldid]
-      improvement = scale * ctx_improvement_in[worldid]
       gradient = scale * wp.sqrt(grad_dot)
-      done = (alpha == 0.0) or (improvement > 0.0 and improvement < tolerance) or (gradient < tolerance)
+      if wp.static(STRICT_STOP):
+        # Stop on the scaled gradient, or when the line search cannot lower the cost
+        # (zero step or no improvement: the float32 gradient floor). A small positive
+        # improvement alone does not stop CG.
+        done = (gradient < tolerance) or (ctx_alpha_in[worldid] == 0.0) or (ctx_improvement_in[worldid] <= 0.0)
+      else:
+        alpha = ctx_alpha_in[worldid]
+        improvement = scale * ctx_improvement_in[worldid]
+        done = (alpha == 0.0) or (improvement > 0.0 and improvement < tolerance) or (gradient < tolerance)
       if done or solver_niter_out[worldid] == opt_iterations:
         if not done and solver_niter_out[worldid] == opt_iterations:
           if wp.static(bool(WARN_OVERFLOW & OverflowType.ITERATIONS)):
@@ -4186,7 +4206,7 @@ def _solver_iteration(
   # polak-ribiere
   if m.opt.solver == types.SolverType.CG:
     wp.launch_tiled(
-      _solve_beta_finalize_tiled(int(m.opt.warn_overflow)),
+      _solve_beta_finalize_tiled(int(m.opt.warn_overflow), m.opt.cg_strict_stop),
       dim=d.nworld,
       inputs=[
         m.nv,
@@ -4454,7 +4474,7 @@ def _solve(m: types.Model, d: types.Data, ctx: SolverContext, compact: bool = Fa
   # CG search = -Mgrad
   if m.opt.solver == types.SolverType.CG:
     wp.launch_tiled(
-      _solve_init_search_cg_tiled,
+      _solve_init_search_cg_tiled(m.opt.cg_strict_stop),
       dim=d.nworld,
       inputs=[m.nv, m.opt.tolerance, ctx.inertia_scale, ctx.grad, ctx.Mgrad],
       outputs=[ctx.search, ctx.search_dot, ctx.prev_grad, ctx.prev_Mgrad, ctx.done, nsolving],
