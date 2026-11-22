@@ -89,6 +89,7 @@ def _create_solver_context(
   alloc_incremental = _use_incremental(m)
   # the discrete warm start, qacc_smooth + qacc_constraint, is formed in this scratch
   alloc_qacc_start = m.opt.integrator == types.IntegratorType.DISCRETE
+  alloc_efq = _use_equality_prec(m)
 
   return SolverContext(
     Jaref=wp.empty((nworld, njmax), dtype=float),
@@ -117,6 +118,27 @@ def _create_solver_context(
     state_changed_count=wp.empty((nworld,), dtype=int) if alloc_incremental else wp.empty((0,), dtype=int),
     inertia_scale=wp.empty((nworld,), dtype=float),
     qacc_start=wp.empty((nworld, nv_pad), dtype=float) if alloc_qacc_start else wp.empty((nworld, 0), dtype=float),
+    efq_H=wp.empty((nworld, m.efq_qH_madr.shape[0]), dtype=float) if alloc_efq else None,
+    efq_HLD=wp.empty((nworld, m.efq_qH_madr.shape[0]), dtype=float) if alloc_efq else None,
+    efq_diag_inv=wp.empty((nworld, nv), dtype=float) if alloc_efq else None,
+    efq_row0=wp.empty((nworld, m.neq), dtype=int) if alloc_efq else None,
+  )
+
+
+def _use_equality_prec(m: types.Model) -> bool:
+  """Whether CG preconditions with the metric plus its equality rows' stiffness (efq_qH_*).
+
+  That factor replaces the metric's own where the discrete metric is solved with `eff_solve_qH`: the
+  sparse Jacobian of a model with CONNECT, WELD or JOINT equalities (the collars of a branch, the
+  mimic joints of a gripper), not flex or sleeping models (`eff_prec`).
+  """
+  return (
+    m.efq_qH_active
+    and m.opt.solver == types.SolverType.CG
+    and m.opt.integrator == types.IntegratorType.DISCRETE
+    and not (m.opt.enableflags & types.EnableBit.SLEEP)
+    and m.nefmK == 0
+    and not m.efm0_active
   )
 
 
@@ -3647,6 +3669,9 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
     if is_discrete:
       if m.nefmK > 0 or m.efm0_active or (m.opt.enableflags & types.EnableBit.SLEEP):
         derivative.eff_prec(m, d, ctx.Mgrad, ctx.grad)
+      elif ctx.efq_HLD is not None:
+        # the metric with the stiffness of the equality rows, factored once by init_context
+        derivative.eff_solve_equality_prec(m, d, ctx.Mgrad, ctx.grad, ctx.efq_HLD, ctx.efq_diag_inv, done=ctx.done)
       else:
         derivative.eff_solve_qH(
           m, d, ctx.Mgrad, ctx.grad, done=ctx.done, tree_active=ctx.tree_active, sparse_active=ctx.sparse_active
@@ -4308,6 +4333,9 @@ def init_context(m: types.Model, d: types.Data, ctx: SolverContext | InverseCont
   _mul_m_compact_aware(m, d, ctx, d.efc.Ma, d.qacc, ctx.done)
 
   _update_constraint(m, d, ctx)
+
+  if isinstance(ctx, SolverContext) and ctx.efq_HLD is not None:
+    derivative.eff_equality_prec(m, d, ctx.efq_H, ctx.efq_HLD, ctx.efq_diag_inv, ctx.efq_row0)
 
   if grad:
     _update_gradient(m, d, ctx, compact=compact)

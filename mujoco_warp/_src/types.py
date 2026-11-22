@@ -1746,6 +1746,33 @@ class Model:
     efm_qH_solve_target_offsets: qLD_solve_target_offsets of the coupled metric factor
     efm_qH_solve_target_long: qLD_solve_target_long of the coupled metric factor
     efm_qH_block_adr: Q_LD_BLOCK_SPARSE for every dof (back-substitution guard)  (nv,)
+    efq_qH_active: discrete integrator with CG factors the metric together with the stiffness of its
+                   CONNECT, WELD and JOINT equality rows (efq_qH_* layout) as the constraint
+                   solver's preconditioner
+    efq_qH_rownnz: preconditioner factor row lengths (fill + diagonal)         (nv,)
+    efq_qH_rowadr: preconditioner factor row addresses                         (nv,)
+    efq_qH_madr: address of each preconditioner element in the metric (efm_qH when efm_qH_coupled,
+                 else qH), -1 outside it                                       (nefq_qH,)
+    efq_qH_eq_adr: start of each preconditioner element's segment in efq_qH_eq_pair, then the
+                   number of pairs                                             (nefq_qH + 1,)
+    efq_qH_eq_pair: (equality, dof i, dof j) of every CONNECT, WELD or JOINT equality whose rows
+                    can hold both dofs j <= i, grouped by preconditioner element (i, j), in
+                    equality order
+    efq_qH_eq_nrow: constraint rows of each equality (3 CONNECT, 6 WELD, 1 JOINT, 0 others)  (neq,)
+    efq_qH_all_updates: qLD_all_updates of the preconditioner factor
+    efq_qH_level_offsets: qLD_level_offsets of the preconditioner factor
+    efq_qH_factor_elem: qLD_factor_elem of the preconditioner factor
+    efq_qH_factor_elem_offsets: qLD_factor_elem_offsets of the preconditioner factor
+    efq_qH_level_offsets_host: host copy of efq_qH_level_offsets
+    efq_qH_factor_elem_offsets_host: host copy of efq_qH_factor_elem_offsets
+    efq_qH_factor_target_elem: qLD_factor_target_elem of the preconditioner factor
+    efq_qH_factor_target_adr: qLD_factor_target_adr of the preconditioner factor
+    efq_qH_factor_target_offsets_host: qLD_factor_target_offsets_host of the preconditioner factor
+    efq_qH_factor_target_long_host: qLD_factor_target_long_host of the preconditioner factor
+    efq_qH_solve_target_update: qLD_solve_target_update of the preconditioner factor
+    efq_qH_solve_target_adr: qLD_solve_target_adr of the preconditioner factor
+    efq_qH_solve_target_offsets: qLD_solve_target_offsets of the preconditioner factor
+    efq_qH_solve_target_long: qLD_solve_target_long of the preconditioner factor
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2317,6 +2344,27 @@ class Model:
   efm_qH_solve_target_offsets: array("nefm_qH_solve_target_offsets", int)
   efm_qH_solve_target_long: array("nefm_qH_solve_target_long", int)
   efm_qH_block_adr: array("nv", int)
+  efq_qH_active: bool
+  efq_qH_rownnz: array("nv", int)
+  efq_qH_rowadr: array("nv", int)
+  efq_qH_madr: array("nefq_qH", int)
+  efq_qH_eq_adr: array("nefq_qH_plus_1", int)
+  efq_qH_eq_pair: array("nefq_qH_eq_pair", wp.vec3i)
+  efq_qH_eq_nrow: array("neq", int)
+  efq_qH_all_updates: array("nefq_qH_all_updates", wp.vec3i)
+  efq_qH_level_offsets: array("nefq_qH_level_offsets", int)
+  efq_qH_factor_elem: array("nefq_qH_factor_elem", wp.vec4i)
+  efq_qH_factor_elem_offsets: array("nefq_qH_level_offsets", int)
+  efq_qH_level_offsets_host: tuple[int, ...]
+  efq_qH_factor_elem_offsets_host: tuple[int, ...]
+  efq_qH_factor_target_elem: array("nefq_qH_factor_elem", int)
+  efq_qH_factor_target_adr: array("nefq_qH_factor_target_adr", int)
+  efq_qH_factor_target_offsets_host: tuple[int, ...]
+  efq_qH_factor_target_long_host: tuple[int, ...]
+  efq_qH_solve_target_update: array("nefq_qH_solve_target_update", int)
+  efq_qH_solve_target_adr: array("nefq_qH_solve_target_adr", int)
+  efq_qH_solve_target_offsets: array("nefq_qH_solve_target_offsets", int)
+  efq_qH_solve_target_long: array("nefq_qH_solve_target_long", int)
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)
@@ -2860,6 +2908,13 @@ class SolverContext:
   # solve and M @ search skip trees without rows
   tree_active: Optional[wp.array] = None
   sparse_active: Optional[wp.array] = None
+  # CG preconditioner of a model with CONNECT, WELD or JOINT rows (efq_qH_*; None when the solve
+  # keeps the metric's own factor): the metric plus the stiffness of those rows (assembled and
+  # factored once per solve), the factor's reciprocal diagonal and the first row of every equality
+  efq_H: Optional[wp.array] = None
+  efq_HLD: Optional[wp.array] = None
+  efq_diag_inv: Optional[wp.array] = None
+  efq_row0: Optional[wp.array] = None
 
 
 @dataclasses.dataclass

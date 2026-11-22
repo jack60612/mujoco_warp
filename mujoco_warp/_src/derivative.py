@@ -2562,6 +2562,83 @@ def _eff_qH_assemble(
   efm_qH_out[worldid, adr] = value
 
 
+@wp.kernel
+def _eff_equality_rows(
+  # Data in:
+  ne_in: wp.array[int],
+  efc_id_in: wp.array2d[int],
+  # Out:
+  row0_out: wp.array2d[int],
+):
+  """Records the first constraint row of every equality that has rows, one thread per row.
+
+  The rows of an equality are consecutive and each equality is written by exactly one of them, so
+  the map is the same in every run whatever order the rows were allocated in.
+  """
+  worldid, rowid = wp.tid()
+  if rowid >= ne_in[worldid]:
+    return
+  eqid = efc_id_in[worldid, rowid]
+  if rowid == 0 or efc_id_in[worldid, rowid - 1] != eqid:
+    row0_out[worldid, eqid] = rowid
+
+
+@wp.kernel
+def _eff_equality_assemble(
+  # Model:
+  efq_qH_madr: wp.array[int],
+  efq_qH_eq_adr: wp.array[int],
+  efq_qH_eq_pair: wp.array[wp.vec3i],
+  efq_qH_eq_nrow: wp.array[int],
+  # Data in:
+  efc_J_rownnz_in: wp.array2d[int],
+  efc_J_rowadr_in: wp.array2d[int],
+  efc_J_colind_in: wp.array3d[int],
+  efc_J_in: wp.array3d[float],
+  efc_D_in: wp.array2d[float],
+  # In:
+  metric_in: wp.array2d[float],
+  row0_in: wp.array2d[int],
+  # Out:
+  H_out: wp.array2d[float],
+):
+  """Assembles the metric plus the stiffness of its equality rows, one thread per element.
+
+  An element takes the metric's value (zero outside its pattern), then adds
+  D * J(row, i) * J(row, j) of every row of every equality whose dofs hold both i and j, in
+  equality and row order: a fixed order with no atomics, the same result in every run. A row
+  lists the dofs of its two bodies' chains only, so either dof of the pair may be absent.
+  """
+  worldid, adr = wp.tid()
+  value = float(0.0)
+  madr = efq_qH_madr[adr]
+  if madr >= 0:
+    value = metric_in[worldid, madr]
+
+  nrow = efc_J_rownnz_in.shape[1]
+  for p in range(efq_qH_eq_adr[adr], efq_qH_eq_adr[adr + 1]):
+    pair = efq_qH_eq_pair[p]
+    row0 = row0_in[worldid, pair[0]]
+    if row0 < 0:
+      continue
+    for t in range(efq_qH_eq_nrow[pair[0]]):
+      row = row0 + t
+      if row >= nrow:
+        break
+      rowadr = efc_J_rowadr_in[worldid, row]
+      jrow = float(0.0)
+      jcol = float(0.0)
+      for k in range(efc_J_rownnz_in[worldid, row]):
+        dof = efc_J_colind_in[worldid, 0, rowadr + k]
+        if dof == pair[1]:
+          jrow = efc_J_in[worldid, 0, rowadr + k]
+        if dof == pair[2]:
+          jcol = efc_J_in[worldid, 0, rowadr + k]
+      value += efc_D_in[worldid, row] * jrow * jcol
+
+  H_out[worldid, adr] = value
+
+
 @cache_kernel
 def _eff_flex_stretch_stiff_vert(deterministic: bool = False):
   module_options = {"enable_backward": False}
@@ -4205,6 +4282,63 @@ def eff_solve_qH(
     smooth._solve_LD_sparse(m, d, d.efm_qHLD, d.qHDiagInv, res, vec, done=done, sparse_active=sparse_active, coupled=True)
   else:
     smooth.solve_LD(m, d, d.qHLD, d.qHDiagInv, res, vec, done=done, tree_active=tree_active, sparse_active=sparse_active)
+
+
+@event_scope
+def eff_equality_prec(
+  m: Model, d: Data, H: wp.array2d[float], HLD: wp.array2d[float], diag_inv: wp.array2d[float], row0: wp.array2d[int]
+):
+  """Assembles and factors the metric plus the stiffness of its CONNECT, WELD and JOINT rows.
+
+  P = M_hat + sum over the rows r of those equalities of D_r J_r^T J_r: the preconditioner of the
+  CG constraint solve, which then solves the stiff rows of a collar chain or a mimic joint exactly
+  and leaves the other rows (friction, limits, contacts) to the iterations. Its pattern is the
+  metric's plus the dofs of each equality, factored on its exact symbolic-Cholesky fill (efq_qH_*
+  layout); the metric is efm_qH when coupled, else qH. Rows (J, D) are those of the solve, so it
+  runs once per solve.
+
+  Args:
+    m: The model.
+    d: The data, with the constraint rows and the factored metric of this step.
+    H: Output, the assembled elements (nworld, nefq_qH).
+    HLD: Output, the factor (nworld, nefq_qH).
+    diag_inv: Output, the factor's reciprocal diagonal (nworld, nv).
+    row0: Scratch, the first row of every equality (nworld, neq).
+  """
+  row0.fill_(-1)
+  wp.launch(_eff_equality_rows, dim=(d.nworld, d.njmax), inputs=[d.ne, d.efc.id], outputs=[row0])
+  wp.launch(
+    _eff_equality_assemble,
+    dim=(d.nworld, H.shape[1]),
+    inputs=[
+      m.efq_qH_madr,
+      m.efq_qH_eq_adr,
+      m.efq_qH_eq_pair,
+      m.efq_qH_eq_nrow,
+      d.efc.J_rownnz,
+      d.efc.J_rowadr,
+      d.efc.J_colind,
+      d.efc.J,
+      d.efc.D,
+      d.efm_qH if m.efm_qH_coupled else d.qH,
+      row0,
+    ],
+    outputs=[H],
+  )
+  smooth._factor_i_sparse(m, d, H, HLD, diag_inv, layout=smooth._equality_layout(m))
+
+
+def eff_solve_equality_prec(
+  m: Model,
+  d: Data,
+  res: wp.array2d[float],
+  vec: wp.array2d[float],
+  HLD: wp.array2d[float],
+  diag_inv: wp.array2d[float],
+  done: Optional[wp.array] = None,
+):
+  """Solves with the factor of eff_equality_prec, leaving the rows of `done` worlds unchanged."""
+  smooth._solve_LD_sparse(m, d, HLD, diag_inv, res, vec, done=done, layout=smooth._equality_layout(m))
 
 
 def eff_mul_m_scratch(m: Model, d: Data) -> tuple[Optional[tuple], Optional[tuple]]:

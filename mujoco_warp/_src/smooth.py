@@ -1484,7 +1484,7 @@ def _qLD_multipliers_level(
   L_out[worldid, Madr_ki] = L_out[worldid, Madr_ki] / L_out[worldid, diag_k]
 
 
-def _factor_sparse_fused(m: Model, nworld: int, coupled: bool = False) -> bool:
+def _factor_sparse_fused(m: Model, nworld: int, coupled: bool = False, layout: Optional["_SparseLayout"] = None) -> bool:
   """Whether the fused kernel or per-level launches factor the sparse region faster.
 
   The fused kernel runs each world on one block, i.e. one SM, so its time is the world's element
@@ -1493,7 +1493,7 @@ def _factor_sparse_fused(m: Model, nworld: int, coupled: bool = False) -> bool:
   with thousands of dofs) while most SMs would otherwise idle; see M_SPARSE_LEVEL_WIDTH_MIN.
   """
   device = wp.get_device()
-  layout = _sparse_layout(m, coupled)
+  layout = layout if layout is not None else _sparse_layout(m, coupled)
   nlevels = layout.nlevels
   if not device.is_cuda or nlevels == 0:
     return True
@@ -1571,6 +1571,29 @@ def _sparse_layout(m: Model, coupled: bool) -> _SparseLayout:
   )
 
 
+def _equality_layout(m: Model) -> _SparseLayout:
+  """The layout of the metric plus the stiffness of its equality rows (efq_qH_*)."""
+  return _SparseLayout(
+    m.efq_qH_rownnz,
+    m.efq_qH_rowadr,
+    m.efm_qH_block_adr,  # every dof takes the sparse path
+    m.efq_qH_all_updates,
+    m.efq_qH_level_offsets,
+    m.efq_qH_factor_elem,
+    m.efq_qH_factor_elem_offsets,
+    m.efq_qH_level_offsets_host,
+    m.efq_qH_factor_elem_offsets_host,
+    m.efq_qH_factor_target_elem,
+    m.efq_qH_factor_target_adr,
+    m.efq_qH_factor_target_offsets_host,
+    m.efq_qH_factor_target_long_host,
+    m.efq_qH_solve_target_update,
+    m.efq_qH_solve_target_adr,
+    m.efq_qH_solve_target_offsets,
+    m.efq_qH_solve_target_long,
+  )
+
+
 def _factor_i_sparse(
   m: Model,
   d: Data,
@@ -1578,6 +1601,7 @@ def _factor_i_sparse(
   L: wp.array2d[float],
   D: wp.array2d[float],
   coupled: bool = False,
+  layout: Optional[_SparseLayout] = None,
 ):
   """Sparse L'*D*L factorization of inertia-like matrix M, assumed spd.
 
@@ -1586,11 +1610,12 @@ def _factor_i_sparse(
   atomics take the per-level launches with one thread, or one warp, per updated M(i,j), which sums
   its elements in a fixed order without atomics: the fused kernel reads its own atomics, and
   deterministic element atomics would reserve scatter records, which captured graphs sort in full
-  on every replay. `coupled` factors the discrete coupled metric's layout (efm_qH_*) instead of M's.
+  on every replay. `coupled` factors the discrete coupled metric's layout (efm_qH_*) instead of M's;
+  an explicit `layout` overrides both.
   """
-  layout = _sparse_layout(m, coupled)
+  layout = layout if layout is not None else _sparse_layout(m, coupled)
   det_atomics = bool(m.opt.deterministic & DeterminismType.ATOMICS)
-  fused = _factor_sparse_fused(m, d.nworld, coupled)
+  fused = _factor_sparse_fused(m, d.nworld, coupled, layout)
   if not det_atomics:
     kernel = _factor_i_sparse_fused(m.nv, layout.nlevels) if fused else _qLD_acc_level
     det_atomics = _deterministic_launch(kernel)
@@ -4198,14 +4223,15 @@ def _solve_LD_sparse(
   done: Optional[wp.array] = None,
   sparse_active: Optional[wp.array] = None,
   coupled: bool = False,
+  layout: Optional[_SparseLayout] = None,
 ):
   """Computes sparse backsubstitution: x = inv(L'*D*L)*y.
 
   Deterministic atomics take the owned fused kernel, as the fused kernel reads its own atomics.
   With `done`, either kernel leaves the rows of done worlds unchanged. `coupled` solves with the
-  discrete coupled metric's layout (efm_qH_*) instead of M's.
+  discrete coupled metric's layout (efm_qH_*) instead of M's; an explicit `layout` overrides both.
   """
-  layout = _sparse_layout(m, coupled)
+  layout = layout if layout is not None else _sparse_layout(m, coupled)
   nlevels, masked, tree_masked = layout.nlevels, done is not None, sparse_active is not None
   sparse_active = sparse_active if tree_masked else wp.empty(0, dtype=int)
   owned = bool(m.opt.deterministic & DeterminismType.ATOMICS) or _deterministic_launch(
