@@ -495,9 +495,8 @@ class SolverTest(parameterized.TestCase):
     self.assertEqual(nsolving.numpy()[0], 0)
     self.assertEqual(overflow.numpy()[0], 0)
 
-  @parameterized.parameters(False, True)
-  def test_cg_initial_strict_stop(self, strict_stop):
-    """The opt-in initial test uses the gradient, not the preconditioned cost gap."""
+  def test_cg_initial_gradient_stop(self):
+    """The initial test uses the scaled gradient, not the preconditioned cost gap."""
     grad = wp.array([[1.0e-2], [1.0e-7]], dtype=float)
     mgrad = wp.array([[1.0e-5], [1.0e-7]], dtype=float)
     done = wp.zeros(2, dtype=bool)
@@ -507,35 +506,33 @@ class SolverTest(parameterized.TestCase):
     prev_grad = wp.zeros((2, 1), dtype=float)
     prev_mgrad = wp.zeros((2, 1), dtype=float)
     wp.launch_tiled(
-      solver._solve_init_search_cg_tiled(strict_stop),
+      solver._solve_init_search_cg_tiled,
       dim=2,
       inputs=[1, wp.array([1.0e-6], dtype=float), wp.array([1.0, 1.0], dtype=float), grad, mgrad],
       outputs=[search, search_dot, prev_grad, prev_mgrad, done, nsolving],
       block_dim=32,
     )
-    np.testing.assert_array_equal(done.numpy(), [not strict_stop, True])
-    self.assertEqual(nsolving.numpy()[0], int(strict_stop))
+    np.testing.assert_array_equal(done.numpy(), [False, True])
+    self.assertEqual(nsolving.numpy()[0], 1)
     np.testing.assert_allclose(search.numpy(), -mgrad.numpy())
 
   @parameterized.named_parameters(
-    ("default_zero_alpha", False, 0.0, 1.0, 1.0, 2, True, False),
-    ("default_small_improvement", False, 1.0, 1.0e-7, 1.0, 2, True, False),
-    ("strict_zero_alpha", True, 0.0, 1.0, 1.0, 2, True, False),
-    ("strict_no_improvement", True, 1.0, 0.0, 1.0, 2, True, False),
-    ("strict_negative_improvement", True, 1.0, -1.0, 1.0, 2, True, False),
-    ("strict_small_improvement", True, 1.0, 1.0e-7, 1.0, 2, False, False),
-    ("strict_gradient_met", True, 1.0, 1.0e-7, 1.0e-14, 2, True, False),
-    ("strict_cap", True, 1.0, 1.0e-7, 1.0, 1, True, True),
+    ("zero_alpha", 0.0, 1.0, 1.0, 2, True, False),
+    ("no_improvement", 1.0, 0.0, 1.0, 2, True, False),
+    ("negative_improvement", 1.0, -1.0, 1.0, 2, True, False),
+    ("small_improvement", 1.0, 1.0e-7, 1.0, 2, False, False),
+    ("gradient_met", 1.0, 1.0e-7, 1.0e-14, 2, True, False),
+    ("cap", 1.0, 1.0e-7, 1.0, 1, True, True),
   )
-  def test_cg_strict_stop_termination(self, strict_stop, alpha, improvement, grad_dot, cap, expected, capped):
-    """Strict stop ignores a small improvement but stops when the line search makes no progress."""
+  def test_cg_stop_termination(self, alpha, improvement, grad_dot, cap, expected, capped):
+    """CG ignores a small improvement but stops when the line search makes no progress."""
     niter = wp.zeros(1, dtype=int)
     nsolving = wp.ones(1, dtype=int)
     done = wp.zeros(1, dtype=bool)
     overflow = wp.zeros(1, dtype=int)
     beta = wp.zeros(1, dtype=float)
     wp.launch(
-      solver._solve_beta_finalize_tiled(types.OverflowType.NONE, strict_stop),
+      solver._solve_beta_finalize_tiled(types.OverflowType.NONE),
       dim=(1, 32),
       inputs=[
         1,
@@ -1362,8 +1359,7 @@ class SolverTest(parameterized.TestCase):
   def test_cg_tiled_kernels_are_unique(self):
     """Ensure CG tiled kernels with custom block_dim do not share solver.py's module."""
     shared_module = solver._solve_init_efc.module
-    for strict_stop in (False, True):
-      self.assertNotEqual(solver._solve_init_search_cg_tiled(strict_stop).module, shared_module)
+    self.assertNotEqual(solver._solve_init_search_cg_tiled.module, shared_module)
     for tree_masked in (False, True):
       self.assertNotEqual(solver._update_gradient_grad_tiled(tree_masked).module, shared_module)
     self.assertNotEqual(solver._solve_search_update_cg_tiled.module, shared_module)
@@ -2337,12 +2333,12 @@ class SolverTest(parameterized.TestCase):
   def test_discrete_idle_solve_holds_its_start(self):
     """A CG solve that did not iterate is held, not restarted from the smooth acceleration.
 
-    A 1 kg slider rests on a dry-friction (frictionloss) row under a load 10x below it. The start
-    already satisfies CG's exit test, so the solve returns it after 0 iterations and its
-    qacc - qacc_smooth holds no response of the row (below the tolerance the row never engages).
-    The next start then follows qacc_smooth alone and the slider accelerates under the load, qvel
-    growing by h*load/m per step (2e-8, 8e-7 within 40 steps). The previous qacc is a fixed point
-    of the exit test: the slider sticks.
+    A 1 kg slider rests on a dry-friction (frictionloss) row under a load 10x below it. CG stops
+    on the scaled gradient, so the first steps iterate until the row's response is in qacc -
+    qacc_smooth; the solve is then idle and its start is held. A restart from qacc_smooth alone
+    would let the slider accelerate under the load, qvel growing by h*load/m per step (2e-8, 8e-7
+    within 40 steps). The slider instead creeps to the quasi-static velocity at which the row's
+    soft zone balances the load (1.1e-8) and stays there.
     """
     xml = """
     <mujoco>
@@ -2367,8 +2363,9 @@ class SolverTest(parameterized.TestCase):
       qvel.append(d.qvel.numpy()[0, 0])
 
     self.assertEqual(d.nefc.numpy()[0], 1)  # the friction row is active
-    self.assertEqual(d.solver_niter.numpy()[0], 0)  # and CG exits before its first iteration
-    np.testing.assert_array_less(np.abs(qvel), 1e-9)
+    self.assertEqual(d.solver_niter.numpy()[0], 0)  # and the last solve is idle
+    np.testing.assert_array_less(np.abs(qvel), 1e-7)  # far below the 8e-7 of a restart from qacc_smooth
+    self.assertLess(abs(qvel[-1] - qvel[-11]), 1e-9)  # the creep has stopped growing
 
   @parameterized.product(friction_only=(True, False), previous_niter=(0, 3))
   def test_discrete_idle_hold_is_for_friction_only_worlds(self, friction_only, previous_niter):
@@ -2492,7 +2489,6 @@ class SkipUnconstrainedTreesTest(parameterized.TestCase):
   def test_default_off(self):
     m = mjw.put_model(mujoco.MjModel.from_xml_string(_SKIP_TREES_XML))
     self.assertFalse(m.opt.skip_unconstrained_trees)
-    self.assertFalse(m.opt.cg_strict_stop)
 
   def test_unconstrained_chain_matches_mujoco(self):
     """The row-free chain's force and acceleration are as close to float64 MuJoCo C as stock CG."""

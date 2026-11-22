@@ -852,7 +852,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   opt.run_rne_postconstraint = False
   opt.implicit_crosstree_iterations = 0
   opt.skip_unconstrained_trees = False
-  opt.cg_strict_stop = False
   contact_sensor_maxmatch_id = mujoco.mj_name2id(mjm, mujoco.mjtObj.mjOBJ_NUMERIC, "contact_sensor_maxmatch")
   if contact_sensor_maxmatch_id > -1:
     opt.contact_sensor_maxmatch = mjm.numeric_data[mjm.numeric_adr[contact_sensor_maxmatch_id]]
@@ -3747,7 +3746,6 @@ def override_model(model: types.Model | mujoco.MjModel, overrides: dict[str, Any
     "opt.run_rne_postconstraint",
     "opt.implicit_crosstree_iterations",
     "opt.skip_unconstrained_trees",
-    "opt.cg_strict_stop",
   }
   mj_only_fields = {"actuator_dampingpoly", "opt.jacobian", "vis.quality.offsamples"}
 

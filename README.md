@@ -106,12 +106,11 @@ mjwarp-testspeed benchmarks/humanoid/humanoid.xml --event_trace
 
 There are many ways to use MuJoCo Warp in your projects. In many cases, you can directly install and use MJWarp as a drop-in replacement for MuJoCo.
 
-For stiff, near-rest scenes, `model.opt.cg_strict_stop = True` stops CG only when its scaled gradient is
-below the solver tolerance, when the line search makes no progress (zero step or no cost improvement,
-the float32 noise floor of the gradient), or at the iteration limit. A small cost improvement no longer
-stops CG while the gradient is above the tolerance, and the initial cost-gap exit becomes the
-scaled-gradient test. The option defaults to `False`, does not affect Newton, and must be set before
-capturing a step graph.
+MuJoCo Warp's CG solver stops only when its scaled gradient is below the solver tolerance, when the line
+search makes no progress (zero step or no cost improvement, the float32 noise floor of the gradient), or
+at the iteration limit. A small cost improvement does not stop CG while the gradient is above the
+tolerance, and the initial cost-gap exit is the same scaled-gradient test. This is stricter than MuJoCo
+C's cost-improvement exit, which leaves stiff, near-rest scenes far from the minimum; Newton is unchanged.
 
 If you prefer the [JAX](https://github.com/jax-ml/jax) ecosystem, you can use MJWarp via [MJX](https://mujoco.readthedocs.io/en/stable/mjx.html).  See [MuJoCo Playground](https://github.com/google-deepmind/mujoco_playground) for robotics machine learning recipes that use [JAX](https://github.com/jax-ml/jax) and MJWarp.
 
