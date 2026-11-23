@@ -2627,6 +2627,10 @@ def _eff_equality_assemble(
   adds D * J(row, i) * J(row, j) of every quadratic row of every group whose dofs hold both i and
   j, in group and row order: a fixed order with no atomics, the same result in every run. A row
   lists the dofs of its two bodies' chains only, so either dof of the pair may be absent.
+
+  The rows of a group (3 of a CONNECT, 6 of a WELD) list the same dofs in the same order, so the
+  slots of i and j found in one row address the others directly; a row whose entries at those slots
+  are not i and j is scanned instead, so the result is that of scanning every row.
   """
   worldid, adr = wp.tid()
   value = float(0.0)
@@ -2640,6 +2644,9 @@ def _eff_equality_assemble(
     row0 = row0_in[worldid, pair[0]]
     if row0 < 0:
       continue
+    # slots of dofs i and j in the rows of the group, -1 until a row has listed both
+    slot_i = int(-1)
+    slot_j = int(-1)
     for t in range(efq_qH_eq_nrow[pair[0]]):
       row = row0 + t
       if row >= nrow:
@@ -2647,14 +2654,32 @@ def _eff_equality_assemble(
       if efc_state_in[worldid, row] != ConstraintState.QUADRATIC.value:
         continue
       rowadr = efc_J_rowadr_in[worldid, row]
+      rownnz = efc_J_rownnz_in[worldid, row]
       jrow = float(0.0)
       jcol = float(0.0)
-      for k in range(efc_J_rownnz_in[worldid, row]):
-        dof = efc_J_colind_in[worldid, 0, rowadr + k]
-        if dof == pair[1]:
-          jrow = efc_J_in[worldid, 0, rowadr + k]
-        if dof == pair[2]:
-          jcol = efc_J_in[worldid, 0, rowadr + k]
+      # Warp evaluates every operand of `and`, so the checks nest and no slot is read unchecked
+      direct = int(0)
+      if slot_i >= 0 and slot_j >= 0:
+        if slot_i < rownnz and slot_j < rownnz:
+          if efc_J_colind_in[worldid, 0, rowadr + slot_i] == pair[1]:
+            if efc_J_colind_in[worldid, 0, rowadr + slot_j] == pair[2]:
+              direct = 1
+      if direct == 1:
+        jrow = efc_J_in[worldid, 0, rowadr + slot_i]
+        jcol = efc_J_in[worldid, 0, rowadr + slot_j]
+      else:
+        found_i = int(-1)
+        found_j = int(-1)
+        for k in range(rownnz):
+          dof = efc_J_colind_in[worldid, 0, rowadr + k]
+          if dof == pair[1]:
+            jrow = efc_J_in[worldid, 0, rowadr + k]
+            found_i = k
+          if dof == pair[2]:
+            jcol = efc_J_in[worldid, 0, rowadr + k]
+            found_j = k
+        slot_i = found_i
+        slot_j = found_j
       value += efc_D_in[worldid, row] * jrow * jcol
 
   H_out[worldid, adr] = value
