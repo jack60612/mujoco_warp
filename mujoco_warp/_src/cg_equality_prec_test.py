@@ -13,7 +13,7 @@
 # limitations under the License.
 # ==============================================================================
 
-"""CG preconditioner of CONNECT, WELD and JOINT rows: the discrete metric plus their stiffness."""
+"""CG preconditioner of CONNECT, WELD and JOINT rows and of sticking friction rows."""
 
 import re
 from unittest import mock
@@ -30,24 +30,35 @@ from mujoco_warp._src import derivative
 from mujoco_warp._src import io
 from mujoco_warp._src import smooth
 from mujoco_warp._src import solver
+from mujoco_warp._src.types import ConstraintState
+from mujoco_warp._src.types import ConstraintType
 from mujoco_warp._src.types import DeterminismType
 
 
 def _collars(
-  n: int = 6, weld: bool = False, tendon: bool = False, mimic: bool = False, jacobian: str = "sparse", tolerance: float = 1e-4
+  n: int = 6,
+  weld: bool = False,
+  tendon: bool = False,
+  mimic: bool = False,
+  jacobian: str = "sparse",
+  tolerance: float = 1e-4,
+  friction: bool = False,
 ) -> str:
   """A chain of free bodies (the collars of a branch) with stiff CONNECT rows between neighbours.
 
   With `weld`, every third equality is a WELD; with `tendon`, a stiff spatial tendon also couples
   the first and last body (a loop, so the metric's coupled factor holds fill the rows must join);
   with `mimic`, a three-hinge finger on its own tree is held by stiff JOINT rows (hinge 1 mimics
-  hinge 0, hinge 2 is locked), like the mimic joints of a gripper.
+  hinge 0, hinge 2 is locked), like the mimic joints of a gripper. With `friction`, the free joint
+  of every other collar has a dry friction that holds it (its rows stick), the others a negligible
+  one (their rows slide), the first hinge of the finger and the tendon have a holding friction too.
   """
   rng = np.random.default_rng(0)
   bodies, equalities, qpos, qvel = [], [], [], []
   for i in range(n):
+    joint = f'<joint type="free" frictionloss="{50.0 if i % 2 == 0 else 1e-7}"/>' if friction else "<freejoint/>"
     bodies.append(
-      f'<body name="b{i}" pos="{0.2 * i} 0 1"><freejoint/><geom type="sphere" size=".03" mass="{0.2 + 0.05 * i}"/>'
+      f'<body name="b{i}" pos="{0.2 * i} 0 1">{joint}<geom type="sphere" size=".03" mass="{0.2 + 0.05 * i}"/>'
       f'<site name="s{i}" pos=".05 0 0"/><site name="p{i}" pos="-.05 0 0"/></body>'
     )
     qpos.append(f"{0.2 * i} 0 1 1 0 0 0")
@@ -56,8 +67,10 @@ def _collars(
       kind = "weld" if weld and i % 3 == 0 else "connect"
       equalities.append(f'<{kind} site1="s{i - 1}" site2="p{i}" solref="-4000 -40" solimp=".95 .99 .001 .5 2"/>')
   if mimic:
+    hold = ' frictionloss=".5"' if friction else ""
     links = "".join(
-      f'<body name="f{j}" pos="{0.1 if j else -0.5} 0 {0 if j else 1}"><joint name="h{j}" type="hinge" axis="0 1 0"/>'
+      f'<body name="f{j}" pos="{0.1 if j else -0.5} 0 {0 if j else 1}">'
+      f'<joint name="h{j}" type="hinge" axis="0 1 0"{hold if j == 0 else ""}/>'
       f'<geom type="capsule" size=".01" fromto="0 0 0 .1 0 0" mass="{0.05 - 0.01 * j}"/>'
       for j in range(3)
     )
@@ -68,7 +81,8 @@ def _collars(
     qvel.append("0.3 -0.2 0.1")
   tendons = ""
   if tendon:
-    spatial = f'<spatial stiffness="300" damping="2" springlength=".5"><site site="s0"/><site site="p{n - 1}"/></spatial>'
+    loss = ' frictionloss="200"' if friction else ""
+    spatial = f'<spatial stiffness="300" damping="2" springlength=".5"{loss}><site site="s0"/><site site="p{n - 1}"/></spatial>'
     tendons = f"<tendon>{spatial}</tendon>"
   return f"""
   <mujoco>
@@ -108,13 +122,23 @@ def _dense_metric(m, d, worldid: int) -> np.ndarray:
   return dense
 
 
-def _reference(m, d, worldid: int) -> np.ndarray:
-  """M_hat + sum D J^T J over the active CONNECT, WELD and JOINT rows of a world, in float64."""
-  jac = _dense_jacobian(d, worldid, m.nv)
-  ids = d.efc.id.numpy()[worldid]
-  dvals = d.efc.D.numpy()[worldid]
+def _covered_rows(m, d, worldid: int) -> list[int]:
+  """The rows of the preconditioner: covered equalities and the quadratic rows of friction."""
+  typ, ids, state = (a.numpy()[worldid] for a in (d.efc.type, d.efc.id, d.efc.state))
   nrow = m.efq_qH_eq_nrow.numpy()
-  rows = [r for r in range(int(d.ne.numpy()[worldid])) if nrow[ids[r]] > 0]
+  first = {ConstraintType.EQUALITY: 0, ConstraintType.FRICTION_TENDON: m.neq, ConstraintType.FRICTION_DOF: m.neq + m.ntendon}
+  rows = []
+  for r in range(int(d.nefc.numpy()[worldid])):
+    if typ[r] in first and state[r] == ConstraintState.QUADRATIC and nrow[first[typ[r]] + ids[r]] > 0:
+      rows.append(r)
+  return rows
+
+
+def _reference(m, d, worldid: int) -> np.ndarray:
+  """M_hat + sum D J^T J over the covered rows of a world, in float64."""
+  jac = _dense_jacobian(d, worldid, m.nv)
+  dvals = d.efc.D.numpy()[worldid]
+  rows = _covered_rows(m, d, worldid)
   return _dense_metric(m, d, worldid) + (jac[rows].T * dvals[rows]) @ jac[rows]
 
 
@@ -136,10 +160,12 @@ def _layout_dense(mjm, values: np.ndarray) -> np.ndarray:
 
 
 class CgEqualityPrecTest(parameterized.TestCase):
-  @parameterized.product(weld=[False, True], tendon=[False, True], mimic=[False, True], nworld=[1, 2])
-  def test_assembled_matrix(self, weld, tendon, mimic, nworld):
+  @parameterized.product(weld=[False, True], tendon=[False, True], mimic=[False, True], friction=[False, True], nworld=[1, 2])
+  def test_assembled_matrix(self, weld, tendon, mimic, friction, nworld):
     """Elements are the metric plus D * J^T J of every active row of a covered equality."""
-    mjm, _, m, d = test_data.fixture(xml=_collars(weld=weld, tendon=tendon, mimic=mimic), keyframe=0, nworld=nworld)
+    mjm, _, m, d = test_data.fixture(
+      xml=_collars(weld=weld, tendon=tendon, mimic=mimic, friction=friction), keyframe=0, nworld=nworld
+    )
     self.assertTrue(m.efq_qH_active)
     self.assertEqual(m.efm_qH_coupled, tendon)
     if nworld == 2:
@@ -151,6 +177,12 @@ class CgEqualityPrecTest(parameterized.TestCase):
       d.eq_active = wp.array(active, dtype=bool)
     mjw.forward(m, d)
     ctx = _prec(m, d)
+    if friction:
+      # sticking (quadratic) and sliding friction rows both occur: only the sticking ones count
+      typ, state = d.efc.type.numpy()[0], d.efc.state.numpy()[0]
+      rows = np.isin(typ[: int(d.nefc.numpy()[0])], (ConstraintType.FRICTION_DOF, ConstraintType.FRICTION_TENDON))
+      quadratic = state[: len(rows)][rows] == ConstraintState.QUADRATIC
+      self.assertTrue(quadratic.any() and not quadratic.all())
     if nworld == 2:
       ne = d.ne.numpy()
       self.assertEqual(int(ne[0] - ne[1]), int(m.efq_qH_eq_nrow.numpy()[1]))
@@ -161,10 +193,10 @@ class CgEqualityPrecTest(parameterized.TestCase):
       actual = _layout_dense(mjm, ctx.efq_H.numpy()[worldid])
       np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6 * np.max(np.abs(expected)))
 
-  @parameterized.product(tendon=[False, True], mimic=[False, True], nworld=[1, 2])
-  def test_solve_inverts_the_stiffened_metric(self, tendon, mimic, nworld):
+  @parameterized.product(tendon=[False, True], mimic=[False, True], friction=[False, True], nworld=[1, 2])
+  def test_solve_inverts_the_stiffened_metric(self, tendon, mimic, friction, nworld):
     """The factor solves P z = g: the dense inverse of the metric plus the rows' stiffness."""
-    _, _, m, d = test_data.fixture(xml=_collars(tendon=tendon, mimic=mimic), keyframe=0, nworld=nworld)
+    _, _, m, d = test_data.fixture(xml=_collars(tendon=tendon, mimic=mimic, friction=friction), keyframe=0, nworld=nworld)
     mjw.forward(m, d)
     ctx = _prec(m, d)
     g = np.random.default_rng(1).normal(size=(nworld, m.nv)).astype(np.float32)
@@ -176,14 +208,14 @@ class CgEqualityPrecTest(parameterized.TestCase):
 
   def test_layout_is_the_symbolic_cholesky_structure(self):
     """Rows hold M's pattern, the couplings and the rows' dofs, plus the fill they cause."""
-    mjm = mujoco.MjModel.from_xml_string(_collars(weld=True, tendon=True, mimic=True))
+    mjm = mujoco.MjModel.from_xml_string(_collars(weld=True, tendon=True, mimic=True, friction=True))
     pattern = np.zeros((mjm.nv, mjm.nv), dtype=bool)
     for i in range(mjm.nv):
       cols = mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i]]
       pattern[i, cols] = pattern[cols, i] = True
     for group in io._efm_coupling_groups(mjm):
       pattern[np.ix_(group, group)] = True
-    groups = io._efm_equality_groups(mjm)
+    groups = io._efm_row_groups(mjm)
     for _, _, dofs in groups:
       pattern[np.ix_(dofs, dofs)] = True
     for k in reversed(range(mjm.nv)):
@@ -195,9 +227,13 @@ class CgEqualityPrecTest(parameterized.TestCase):
     # the equalities add couplings the tendons and actuators alone do not have
     self.assertGreater(io.efm_qH_nnz(mjm), 0)
     self.assertGreater(sum(len(row) for row in elimination[1]), sum(len(row) for row in io.efm_qH_elimination(mjm)[1]))
-    # every (i, j) of every equality's dofs is listed once, diagonal included
+    # every (i, j) of every row group's dofs is listed once, diagonal included
     layout = io.efm_qH_layout(mjm, elimination, equality=True)
     self.assertEqual(len(layout["eq_pair"]), sum(len(dofs) * (len(dofs) + 1) // 2 for _, _, dofs in groups))
+    kinds = [(g >= mjm.neq) + (g >= mjm.neq + mjm.ntendon) for g, _, _ in groups]
+    self.assertEqual(
+      np.bincount(kinds).tolist(), [len(io._efm_equality_groups(mjm)), mjm.ntendon, int((mjm.dof_frictionloss > 0).sum())]
+    )
     self.assertEqual(layout["eq_adr"][-1], len(layout["eq_pair"]))
 
   def test_cg_converges_in_far_fewer_iterations(self):
@@ -228,6 +264,48 @@ class CgEqualityPrecTest(parameterized.TestCase):
     self.assertLess(iterations[True], iterations[False] // 3)
     np.testing.assert_allclose(qacc[True], qacc[False], rtol=1e-3, atol=1e-4 * np.max(np.abs(qacc[False])))
 
+  def test_cg_with_sticking_friction(self):
+    """Sticking friction rows join the factor: fewer iterations than with the equalities alone."""
+    xml = _collars(n=8, mimic=True, tendon=True, friction=True)
+    iterations, qacc, nrow = {}, {}, None
+    for name in ("friction", "equalities", "off"):
+      _, _, m, d = test_data.fixture(xml=xml, keyframe=0)
+      if nrow is None:
+        nrow = m.efq_qH_eq_nrow.numpy().copy()
+      if name == "equalities":
+        only = nrow.copy()
+        only[m.neq :] = 0  # no tendon or dof friction group
+        m.efq_qH_eq_nrow = wp.array(only, dtype=int)
+      m.efq_qH_active = name != "off"
+      mjw.forward(m, d)
+      iterations[name] = int(d.solver_niter.numpy()[0])
+      qacc[name] = d.qacc.numpy()[0]
+    self.assertLess(iterations["friction"], iterations["equalities"])
+    self.assertLess(iterations["equalities"], iterations["off"])
+    # every variant agrees with MuJoCo's constrained acceleration, to the solver's tolerance
+    mjm, mjd, _, _ = test_data.fixture(xml=xml, keyframe=0)
+    mujoco.mj_forward(mjm, mjd)
+    for name in qacc:
+      np.testing.assert_allclose(qacc[name], mjd.qacc, rtol=2e-2, atol=1e-2 * np.max(np.abs(mjd.qacc)))
+
+  def test_sliding_friction_rows_are_not_in_the_factor(self):
+    """A row that is not quadratic when the factor is built adds nothing, whatever its D."""
+    mjm, _, m, d = test_data.fixture(xml=_collars(mimic=True, tendon=True, friction=True), keyframe=0)
+    mjw.forward(m, d)
+    ctx = _prec(m, d)
+    with_all = _layout_dense(mjm, ctx.efq_H.numpy()[0])
+    state = d.efc.state.numpy()
+    typ = d.efc.type.numpy()[0]
+    friction = np.isin(typ, (ConstraintType.FRICTION_DOF, ConstraintType.FRICTION_TENDON))
+    sliding = friction & (state[0] != ConstraintState.QUADRATIC)
+    self.assertTrue(sliding.any())
+    # sliding rows made quadratic stiffen the matrix, by a positive semidefinite amount
+    state[0, sliding] = ConstraintState.QUADRATIC
+    d.efc.state = wp.array(state, dtype=int)
+    stiffer = _layout_dense(mjm, _prec(m, d).efq_H.numpy()[0])
+    self.assertGreater(np.max(np.abs(stiffer - with_all)), 1e-3 * np.max(np.abs(with_all)))
+    self.assertGreater(np.linalg.eigvalsh(stiffer - with_all)[0], -1e-6 * np.max(np.abs(with_all)))
+
   def test_deterministic_atomics(self):
     """Deterministic atomics assemble, factor and solve the same preconditioner bitwise."""
     _, _, m, d = test_data.fixture(xml=_collars(tendon=True), keyframe=0)
@@ -257,6 +335,9 @@ class CgEqualityPrecTest(parameterized.TestCase):
     self.assertTrue(mjw.put_model(mujoco.MjModel.from_xml_string(_collars(n=1, mimic=True))).efq_qH_active)
     no_rows = re.sub(r"<equality>.*</equality>", "", xml, flags=re.S)
     self.assertFalse(mjw.put_model(mujoco.MjModel.from_xml_string(no_rows)).efq_qH_active)
+    # friction rows alone do not activate it: models without covered equalities keep their factor
+    friction_only = re.sub(r"<equality>.*</equality>", "", _collars(tendon=True, friction=True), flags=re.S)
+    self.assertFalse(mjw.put_model(mujoco.MjModel.from_xml_string(friction_only)).efq_qH_active)
     self.assertFalse(mjw.put_model(mujoco.MjModel.from_xml_string(_collars(jacobian="dense"))).efq_qH_active)
     implicitfast = xml.replace('integrator="discrete"', 'integrator="implicitfast"')
     self.assertFalse(mjw.put_model(mujoco.MjModel.from_xml_string(implicitfast)).efq_qH_active)

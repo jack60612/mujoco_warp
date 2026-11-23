@@ -1747,18 +1747,19 @@ class Model:
     efm_qH_solve_target_long: qLD_solve_target_long of the coupled metric factor
     efm_qH_block_adr: Q_LD_BLOCK_SPARSE for every dof (back-substitution guard)  (nv,)
     efq_qH_active: discrete integrator with CG factors the metric together with the stiffness of its
-                   CONNECT, WELD and JOINT equality rows (efq_qH_* layout) as the constraint
-                   solver's preconditioner
+                   CONNECT, WELD and JOINT equality rows and its tendon and dof friction rows
+                   (efq_qH_* layout) as the constraint solver's preconditioner
     efq_qH_rownnz: preconditioner factor row lengths (fill + diagonal)         (nv,)
     efq_qH_rowadr: preconditioner factor row addresses                         (nv,)
     efq_qH_madr: address of each preconditioner element in the metric (efm_qH when efm_qH_coupled,
                  else qH), -1 outside it                                       (nefq_qH,)
     efq_qH_eq_adr: start of each preconditioner element's segment in efq_qH_eq_pair, then the
                    number of pairs                                             (nefq_qH + 1,)
-    efq_qH_eq_pair: (equality, dof i, dof j) of every CONNECT, WELD or JOINT equality whose rows
-                    can hold both dofs j <= i, grouped by preconditioner element (i, j), in
-                    equality order
-    efq_qH_eq_nrow: constraint rows of each equality (3 CONNECT, 6 WELD, 1 JOINT, 0 others)  (neq,)
+    efq_qH_eq_pair: (row group, dof i, dof j) of every row group whose rows can hold both dofs
+                    j <= i, grouped by preconditioner element (i, j), in group order
+    efq_qH_eq_nrow: constraint rows of each row group: an equality id has 3 rows for a CONNECT, 6
+                    for a WELD, 1 for a JOINT, 0 otherwise; neq + tendon and neq + ntendon + dof
+                    have 1 friction row  (neq + ntendon + nv,)
     efq_qH_all_updates: qLD_all_updates of the preconditioner factor
     efq_qH_level_offsets: qLD_level_offsets of the preconditioner factor
     efq_qH_factor_elem: qLD_factor_elem of the preconditioner factor
@@ -2350,7 +2351,7 @@ class Model:
   efq_qH_madr: array("nefq_qH", int)
   efq_qH_eq_adr: array("nefq_qH_plus_1", int)
   efq_qH_eq_pair: array("nefq_qH_eq_pair", wp.vec3i)
-  efq_qH_eq_nrow: array("neq", int)
+  efq_qH_eq_nrow: array("nefq_group", int)
   efq_qH_all_updates: array("nefq_qH_all_updates", wp.vec3i)
   efq_qH_level_offsets: array("nefq_qH_level_offsets", int)
   efq_qH_factor_elem: array("nefq_qH_factor_elem", wp.vec4i)

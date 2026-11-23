@@ -121,16 +121,17 @@ def _create_solver_context(
     efq_H=wp.empty((nworld, m.efq_qH_madr.shape[0]), dtype=float) if alloc_efq else None,
     efq_HLD=wp.empty((nworld, m.efq_qH_madr.shape[0]), dtype=float) if alloc_efq else None,
     efq_diag_inv=wp.empty((nworld, nv), dtype=float) if alloc_efq else None,
-    efq_row0=wp.empty((nworld, m.neq), dtype=int) if alloc_efq else None,
+    efq_row0=wp.empty((nworld, m.efq_qH_eq_nrow.shape[0]), dtype=int) if alloc_efq else None,
   )
 
 
 def _use_equality_prec(m: types.Model) -> bool:
-  """Whether CG preconditions with the metric plus its equality rows' stiffness (efq_qH_*).
+  """Whether CG preconditions with the metric plus its equality and friction rows (efq_qH_*).
 
   That factor replaces the metric's own where the discrete metric is solved with `eff_solve_qH`: the
   sparse Jacobian of a model with CONNECT, WELD or JOINT equalities (the collars of a branch, the
-  mimic joints of a gripper), not flex or sleeping models (`eff_prec`).
+  mimic joints of a gripper), whose sticking friction rows join it, not flex or sleeping models
+  (`eff_prec`).
   """
   return (
     m.efq_qH_active
@@ -3670,7 +3671,7 @@ def _update_gradient(m: types.Model, d: types.Data, ctx: SolverContext, compact:
       if m.nefmK > 0 or m.efm0_active or (m.opt.enableflags & types.EnableBit.SLEEP):
         derivative.eff_prec(m, d, ctx.Mgrad, ctx.grad)
       elif ctx.efq_HLD is not None:
-        # the metric with the stiffness of the equality rows, factored once by init_context
+        # the metric plus its quadratic equality and friction rows, factored once by init_context
         derivative.eff_solve_equality_prec(m, d, ctx.Mgrad, ctx.grad, ctx.efq_HLD, ctx.efq_diag_inv, done=ctx.done)
       else:
         derivative.eff_solve_qH(

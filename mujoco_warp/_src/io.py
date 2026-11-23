@@ -466,6 +466,24 @@ def _efm_equality_groups(mjm: mujoco.MjModel) -> list[tuple[int, int, np.ndarray
   return groups
 
 
+def _efm_row_groups(mjm: mujoco.MjModel) -> list[tuple[int, int, np.ndarray]]:
+  """(group, rows, dofs) of every row family stiffening the CG preconditioner's metric.
+
+  The groups are the equalities of `_efm_equality_groups` (group = equality id), then the friction
+  row of each tendon on the dofs of its Jacobian row (group = neq + tendon), then the friction row
+  of each dof (group = neq + ntendon + dof). The constraint solver's row states decide which rows
+  stiffen the preconditioner: those that are quadratic (sticking) when it is assembled.
+  """
+  groups = _efm_equality_groups(mjm)
+  for t in np.flatnonzero(mjm.tendon_frictionloss > 0):
+    dofs = np.unique(_efm_tendon_dofs(mjm, int(t)))
+    if dofs.size:
+      groups.append((mjm.neq + int(t), 1, dofs))
+  for dof in np.flatnonzero(mjm.dof_frictionloss > 0):
+    groups.append((mjm.neq + mjm.ntendon + int(dof), 1, np.array([dof], dtype=int)))
+  return groups
+
+
 def tree_coupledid(mjm: mujoco.MjModel) -> np.ndarray:
   """Per kinematic tree, the smallest id of the trees its acceleration metric couples it to.
 
@@ -506,8 +524,9 @@ def efm_qH_elimination(mjm: mujoco.MjModel, equality: bool = False) -> Optional[
   columns j < i of row i. The rows are not every ancestor of the tree: a dof is coupled only to its
   own collar's dofs and its parent's, and the fill adds to that only what elimination creates.
 
-  With `equality`, the dofs of every CONNECT, WELD and JOINT equality (_efm_equality_groups) are
-  coupled too: the structure of the metric plus the stiffness of those rows, the CG preconditioner.
+  With `equality`, the dofs of every row group of `_efm_row_groups` (CONNECT, WELD and JOINT
+  equalities, tendon and dof friction) are coupled too: the structure of the metric plus the
+  stiffness of those rows, the CG preconditioner.
 
   Returns None (the backbone path) when the integrator is not discrete, flexes contribute metric
   terms, an actuator's moment depends on the state (body transmission), or no tendon or actuator
@@ -517,7 +536,7 @@ def efm_qH_elimination(mjm: mujoco.MjModel, equality: bool = False) -> Optional[
     return None
   groups = _efm_coupling_groups(mjm)
   if groups is not None and equality:
-    groups = groups + [dofs for _, _, dofs in _efm_equality_groups(mjm)]
+    groups = groups + [dofs for _, _, dofs in _efm_row_groups(mjm)]
   if not groups:
     return None
 
@@ -572,9 +591,8 @@ def efm_qH_layout(
   addresses of i and j) and the actuators (i and j) whose pair product enters it, in tendon then
   actuator order: an owned assembly sums them in that order, with no atomics.
   With `equality` (the elimination of the same flag), the lists `eq_adr` and `eq_pair` give for
-  every element (i, j) the CONNECT, WELD and JOINT equalities whose rows can hold both dofs
-  j <= i, in equality order: the diagonal elements included, as the rows stiffen the metric's
-  diagonal too.
+  every element (i, j) the row groups (`_efm_row_groups`) whose rows can hold both dofs j <= i, in
+  group order: the diagonal elements included, as the rows stiffen the metric's diagonal too.
   """
   couplings = _efm_couplings(mjm) if elimination is not None else ([], [])
   nv = mjm.nv
@@ -655,7 +673,7 @@ def efm_qH_layout(
   actuator_dofs = [(a, np.unique(np.asarray(dofs, dtype=int))) for a, dofs in actuators]
   act_adr, act_pair = pairs([(a, dofs, dofs) for a, dofs in actuator_dofs])
   # an equality's pairs carry the equality id and its dofs
-  eq_adr, eq_pair = pairs([(eq, dofs, dofs) for eq, _, dofs in _efm_equality_groups(mjm)] if equality else [], diagonal=True)
+  eq_adr, eq_pair = pairs([(eq, dofs, dofs) for eq, _, dofs in _efm_row_groups(mjm)] if equality else [], diagonal=True)
 
   return {
     "rownnz": rownnz,
@@ -1692,11 +1710,13 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.efm_qH_solve_target_long = efm_targets["solve_target_long"]
   m.efm_qH_block_adr = np.full(mjm.nv, types.Q_LD_BLOCK_SPARSE, dtype=int)
 
-  # Discrete CG: the metric factored with the stiffness of its CONNECT, WELD and JOINT rows, the
-  # constraint solver's preconditioner (efq_qH_*). Its layout adds the dofs of those equalities to
-  # the coupled metric's; a model without them, with a dense Jacobian or with couplings unknown
+  # Discrete CG: the metric factored with the stiffness of its CONNECT, WELD and JOINT rows and, on
+  # a model that has such rows, of its quadratic tendon and dof friction rows too, the constraint
+  # solver's preconditioner (efq_qH_*). Its layout adds the dofs of those rows to the coupled
+  # metric's; a model without a covered equality, with a dense Jacobian or with couplings unknown
   # statically keeps the metric's own factor.
-  efq_elimination = efm_qH_elimination(mjm, equality=True) if _efm_equality_groups(mjm) and is_sparse(mjm) else None
+  efq_groups = _efm_row_groups(mjm) if _efm_equality_groups(mjm) else []
+  efq_elimination = efm_qH_elimination(mjm, equality=True) if efq_groups and is_sparse(mjm) else None
   efq_lay = efm_qH_layout(mjm, efq_elimination, equality=efq_elimination is not None)
   efq_targets = _ldl_targets(
     efq_lay["factor_elem"], efq_lay["factor_elem_offsets"], efq_lay["all_updates"], efq_lay["level_offsets"]
@@ -1715,7 +1735,10 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.efq_qH_madr = efq_madr
   m.efq_qH_eq_adr = efq_lay["eq_adr"]
   m.efq_qH_eq_pair = efq_lay["eq_pair"]
-  m.efq_qH_eq_nrow = np.array([_EQUALITY_ROWS.get(int(t), 0) for t in mjm.eq_type], dtype=int)
+  efq_nrow = np.zeros(mjm.neq + mjm.ntendon + mjm.nv, dtype=int)
+  for group, rows, _ in efq_groups:
+    efq_nrow[group] = rows
+  m.efq_qH_eq_nrow = efq_nrow
   m.efq_qH_all_updates = efq_lay["all_updates"]
   m.efq_qH_level_offsets = efq_lay["level_offsets"]
   m.efq_qH_factor_elem = efq_lay["factor_elem"]
@@ -2000,6 +2023,7 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nefq_qH": len(m.efq_qH_madr),
       "nefq_qH_plus_1": len(m.efq_qH_eq_adr),
       "nefq_qH_eq_pair": len(m.efq_qH_eq_pair),
+      "nefq_group": len(m.efq_qH_eq_nrow),
       "nefq_qH_all_updates": len(m.efq_qH_all_updates),
       "nefq_qH_level_offsets": len(m.efq_qH_level_offsets),
       "nefq_qH_factor_elem": len(m.efq_qH_factor_elem),
