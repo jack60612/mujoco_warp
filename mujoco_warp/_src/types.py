@@ -1713,6 +1713,9 @@ class Model:
                               then the number of segments
     qLD_solve_target_long: first segment of each up-pass, then down-pass level with more than
                            M_SPARSE_SEGMENT_SERIAL_MAX indices
+    qLD_subtree_updates: solve updates grouped by independent subtree, then trunk, and level
+    qLD_subtree_offsets: start and end of each subtree's level segments in qLD_subtree_updates
+    qLD_subtree_count: number of independent subtrees (zero disables the multi-block path)
     tree_coupledid: smallest id of the trees the acceleration metric couples to each tree
                     (with the discrete metric's tendon and actuator couplings; every tree 0
                     when those are not known statically) (ntree,)
@@ -1745,6 +1748,9 @@ class Model:
     efm_qH_solve_target_adr: qLD_solve_target_adr of the coupled metric factor
     efm_qH_solve_target_offsets: qLD_solve_target_offsets of the coupled metric factor
     efm_qH_solve_target_long: qLD_solve_target_long of the coupled metric factor
+    efm_qH_subtree_updates: qLD_subtree_updates of the coupled metric factor
+    efm_qH_subtree_offsets: qLD_subtree_offsets of the coupled metric factor
+    efm_qH_subtree_count: qLD_subtree_count of the coupled metric factor
     efm_qH_block_adr: Q_LD_BLOCK_SPARSE for every dof (back-substitution guard)  (nv,)
     efq_qH_active: discrete integrator with CG factors the metric together with the stiffness of its
                    CONNECT, WELD and JOINT equality rows and its tendon and dof friction rows
@@ -1774,6 +1780,9 @@ class Model:
     efq_qH_solve_target_adr: qLD_solve_target_adr of the preconditioner factor
     efq_qH_solve_target_offsets: qLD_solve_target_offsets of the preconditioner factor
     efq_qH_solve_target_long: qLD_solve_target_long of the preconditioner factor
+    efq_qH_subtree_updates: qLD_subtree_updates of the preconditioner factor
+    efq_qH_subtree_offsets: qLD_subtree_offsets of the preconditioner factor
+    efq_qH_subtree_count: qLD_subtree_count of the preconditioner factor
     M_fullm_i: sparse mass matrix addressing
     M_fullm_j: sparse mass matrix addressing
     M_elemid: (row, col) -> CSR madr addresses; -1 if not a chain ancestor
@@ -2320,6 +2329,9 @@ class Model:
   qLD_solve_target_adr: array("nqLD_solve_target_adr", int)
   qLD_solve_target_offsets: array("nqLD_solve_target_offsets", int)
   qLD_solve_target_long: array("nqLD_solve_target_long", int)
+  qLD_subtree_updates: array("nqLD_subtree_updates", wp.vec3i)
+  qLD_subtree_offsets: array("nqLD_subtree_offsets", int)
+  qLD_subtree_count: int
   tree_coupledid: array("ntree", int)
   efm_qH_coupled: bool
   efm_qH_rownnz: array("nv", int)
@@ -2344,6 +2356,9 @@ class Model:
   efm_qH_solve_target_adr: array("nefm_qH_solve_target_adr", int)
   efm_qH_solve_target_offsets: array("nefm_qH_solve_target_offsets", int)
   efm_qH_solve_target_long: array("nefm_qH_solve_target_long", int)
+  efm_qH_subtree_updates: array("nefm_qH_subtree_updates", wp.vec3i)
+  efm_qH_subtree_offsets: array("nefm_qH_subtree_offsets", int)
+  efm_qH_subtree_count: int
   efm_qH_block_adr: array("nv", int)
   efq_qH_active: bool
   efq_qH_rownnz: array("nv", int)
@@ -2366,6 +2381,9 @@ class Model:
   efq_qH_solve_target_adr: array("nefq_qH_solve_target_adr", int)
   efq_qH_solve_target_offsets: array("nefq_qH_solve_target_offsets", int)
   efq_qH_solve_target_long: array("nefq_qH_solve_target_long", int)
+  efq_qH_subtree_updates: array("nefq_qH_subtree_updates", wp.vec3i)
+  efq_qH_subtree_offsets: array("nefq_qH_subtree_offsets", int)
+  efq_qH_subtree_count: int
   # TODO(team): Remove M_fullm_i/j and M_elemid by iterating the M CSR layout
   # directly in the solver/derivative kernels
   M_fullm_i: array("nM_fullm", int)

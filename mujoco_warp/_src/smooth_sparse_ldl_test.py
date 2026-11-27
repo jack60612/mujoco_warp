@@ -25,6 +25,7 @@ from absl.testing import parameterized
 
 import mujoco_warp as mjw
 from mujoco_warp import test_data
+from mujoco_warp._src import io
 from mujoco_warp._src import smooth
 from mujoco_warp._src import types
 from mujoco_warp._src import warp_util
@@ -135,6 +136,68 @@ def _assert_solves(mjm, M, x, y):
 
 
 class SparseLDLTest(parameterized.TestCase):
+  def test_subtree_schedule_dependencies(self):
+    """Each update is assigned once, without dependencies across independent subtrees."""
+    nv = 1025
+    updates = []
+    for k in range(1, nv):
+      parent = 0 if (k - 1) % 64 == 0 else k - 1
+      updates.append((parent, k, k - 1))
+    updates = np.asarray(updates, dtype=np.int32)
+    schedule, offsets, nblocks = io._ldl_subtrees(nv, updates, [0, len(updates)])
+    self.assertGreater(nblocks, 1)
+    np.testing.assert_array_equal(np.sort(schedule[:, 2]), np.arange(nv - 1))
+    self.assertEqual(offsets[-1], len(updates))
+    for block in range(nblocks):
+      subset = schedule[offsets[block * 2] : offsets[block * 2 + 1]]
+      targets = set(subset[:, 1])
+      for other in range(nblocks):
+        if block != other:
+          separate = schedule[offsets[other * 2] : offsets[other * 2 + 1]]
+          self.assertFalse(targets.intersection(separate[:, 0]))
+
+  def test_subtree_solve_captured_and_masks(self):
+    if not wp.get_device().is_cuda:
+      self.skipTest("multi-block sparse solve requires CUDA")
+    branch = '<body pos="0 0 .02"><joint/><geom size=".01" mass=".01"/>' * 44 + "</body>" * 44
+    xml = (
+      '<mujoco><default><joint armature=".1"/><geom contype="0" conaffinity="0"/></default><worldbody>'
+      '<body><freejoint/><geom size=".1" mass="1"/>'
+      + branch * 24
+      + "</body></worldbody></mujoco>"
+    )
+    mjm, _, m, d = test_data.fixture(xml=xml, nworld=1)
+    self.assertGreater(m.qLD_subtree_count, 1)
+    mjw.fwd_position(m, d, factorize=False)
+    mjw.factor_m(m, d)
+    y = wp.array(np.random.default_rng(1).normal(size=(1, m.nv)).astype(np.float32), dtype=float)
+    x = wp.zeros_like(y)
+    count = m.qLD_subtree_count
+    try:
+      m.qLD_subtree_count = 0
+      mjw.solve_m(m, d, x, y)
+      expected = x.numpy()
+    finally:
+      m.qLD_subtree_count = count
+    with wp.ScopedCapture() as capture:
+      mjw.solve_m(m, d, x, y)
+    wp.capture_launch(capture.graph)
+    _assert_same_class(x.numpy(), expected, "subtree solve")
+    _assert_solves(mjm, d.M.numpy(), x.numpy(), y.numpy())
+
+    L = d.qLD[:, m.qLD_block_total :]
+    done = wp.ones(1, dtype=bool)
+    active = wp.ones(1, dtype=int)
+    x.fill_(3.0)
+    smooth._solve_LD_sparse(m, d, L, d.qLDiagInv, x, y, done=done, sparse_active=active)
+    np.testing.assert_array_equal(x.numpy(), np.full((1, m.nv), 3.0))
+    done.zero_()
+    active.zero_()
+    smooth._solve_LD_sparse(m, d, L, d.qLDiagInv, x, y, done=done, sparse_active=active)
+    sparse = m.qLD_block_adr.numpy() == types.Q_LD_BLOCK_SPARSE
+    np.testing.assert_array_equal(x.numpy()[0, sparse], np.zeros(np.count_nonzero(sparse)))
+
+
   @parameterized.parameters(0, 1, 2)
   def test_factor_element_serial_oracle(self, shape):
     """The vectorized schedule is identical to the former serial expansion."""

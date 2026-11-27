@@ -114,6 +114,55 @@ def _group_by_target(passes: Sequence[tuple[np.ndarray, int, Sequence[int]]]) ->
   return np.concatenate((np.zeros(0, dtype=np.int32), *index)), np.concatenate(start), level_first, level_long
 
 
+def _ldl_subtrees(nv, all_updates, level_offsets):
+  """Partition a sparse elimination forest into independent subtrees and a shared trunk."""
+  updates = np.asarray(all_updates, dtype=np.int32).reshape(-1, 3)
+  nlevels = len(level_offsets) - 1
+  if nv < 1024 or not len(updates) or not nlevels:
+    return np.zeros((1, 3), dtype=np.int32), np.zeros(1, dtype=np.int32), 0
+
+  # The closest preceding column in a factor row is its elimination-tree parent.
+  parent = np.full(nv, -1, dtype=np.int32)
+  np.maximum.at(parent, updates[:, 1], updates[:, 0])
+  children = [[] for _ in range(nv)]
+  size = np.ones(nv, dtype=np.int32)
+  for i, p in enumerate(parent):
+    if p >= 0:
+      children[p].append(i)
+  for i in range(nv - 1, -1, -1):
+    if parent[i] >= 0:
+      size[parent[i]] += size[i]
+
+  owner = np.full(nv, -1, dtype=np.int32)
+  nblocks = 0
+  for i in range(nv):
+    if size[i] <= 256 and ((parent[i] < 0 and size[i] > 1) or (parent[i] >= 0 and size[parent[i]] > 256)):
+      stack = [i]
+      while stack:
+        node = stack.pop()
+        owner[node] = nblocks
+        stack.extend(children[node])
+      nblocks += 1
+  # No subtree can depend on a different subtree. Fall back if the supplied pattern does not
+  # have this property, or there is not enough independent work to justify extra launches.
+  if nblocks < 2 or np.any((owner[updates[:, 0]] >= 0) & (owner[updates[:, 0]] != owner[updates[:, 1]])):
+    return np.zeros((1, 3), dtype=np.int32), np.zeros(1, dtype=np.int32), 0
+
+  chunks = []
+  offsets = np.empty((nblocks + 1, nlevels + 1), dtype=np.int32)
+  start = 0
+  for block in range(nblocks + 1):
+    block_owner = block if block < nblocks else -1
+    for level in range(nlevels):
+      offsets[block, level] = start
+      level_updates = updates[level_offsets[level] : level_offsets[level + 1]]
+      chunk = level_updates[owner[level_updates[:, 1]] == block_owner]
+      chunks.append(chunk)
+      start += len(chunk)
+    offsets[block, nlevels] = start
+  return np.concatenate(chunks), offsets.ravel(), nblocks
+
+
 def _ldl_targets(factor_elem, factor_elem_offsets, all_updates, level_offsets) -> dict:
   """The sparse L'*D*L schedule grouped by what each factorization element and update writes.
 
@@ -1686,6 +1735,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.qLD_solve_target_adr = targets["solve_target_adr"]
   m.qLD_solve_target_offsets = targets["solve_target_offsets"]
   m.qLD_solve_target_long = targets["solve_target_long"]
+  m.qLD_subtree_updates, m.qLD_subtree_offsets, m.qLD_subtree_count = _ldl_subtrees(
+    mjm.nv, all_updates_flat, level_offsets
+  )
 
   # trees that the solver starts together (row-free sets start at qacc_smooth)
   m.tree_coupledid = tree_coupledid(mjm)
@@ -1719,6 +1771,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.efm_qH_solve_target_adr = efm_targets["solve_target_adr"]
   m.efm_qH_solve_target_offsets = efm_targets["solve_target_offsets"]
   m.efm_qH_solve_target_long = efm_targets["solve_target_long"]
+  m.efm_qH_subtree_updates, m.efm_qH_subtree_offsets, m.efm_qH_subtree_count = _ldl_subtrees(
+    mjm.nv, efm_lay["all_updates"], efm_lay["level_offsets"]
+  )
   m.efm_qH_block_adr = np.full(mjm.nv, types.Q_LD_BLOCK_SPARSE, dtype=int)
 
   # Discrete CG: the metric factored with the stiffness of its CONNECT, WELD and JOINT rows and, on
@@ -1764,6 +1819,9 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   m.efq_qH_solve_target_adr = efq_targets["solve_target_adr"]
   m.efq_qH_solve_target_offsets = efq_targets["solve_target_offsets"]
   m.efq_qH_solve_target_long = efq_targets["solve_target_long"]
+  m.efq_qH_subtree_updates, m.efq_qH_subtree_offsets, m.efq_qH_subtree_count = _ldl_subtrees(
+    mjm.nv, efq_lay["all_updates"], efq_lay["level_offsets"]
+  )
 
   # Indices for sparse M_fullm (used in solver). M_fullm_i/j are built by
   # walking dof_parentid for each dof, so for joint types whose internal block
@@ -2016,6 +2074,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nqLD_solve_target_adr": len(m.qLD_solve_target_adr),
       "nqLD_solve_target_offsets": len(m.qLD_solve_target_offsets),
       "nqLD_solve_target_long": len(m.qLD_solve_target_long),
+      "nqLD_subtree_updates": len(m.qLD_subtree_updates),
+      "nqLD_subtree_offsets": len(m.qLD_subtree_offsets),
       "nten_J_pair": len(m.ten_J_pair),
       "nten_J_pair_adr": len(m.ten_J_pair_adr),
       "nten_J_pair_madr": len(m.ten_J_pair_madr),
@@ -2031,6 +2091,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nefm_qH_solve_target_adr": len(m.efm_qH_solve_target_adr),
       "nefm_qH_solve_target_offsets": len(m.efm_qH_solve_target_offsets),
       "nefm_qH_solve_target_long": len(m.efm_qH_solve_target_long),
+      "nefm_qH_subtree_updates": len(m.efm_qH_subtree_updates),
+      "nefm_qH_subtree_offsets": len(m.efm_qH_subtree_offsets),
       "nefq_qH": len(m.efq_qH_madr),
       "nefq_qH_plus_1": len(m.efq_qH_eq_adr),
       "nefq_qH_eq_pair": len(m.efq_qH_eq_pair),
@@ -2043,6 +2105,8 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
       "nefq_qH_solve_target_adr": len(m.efq_qH_solve_target_adr),
       "nefq_qH_solve_target_offsets": len(m.efq_qH_solve_target_offsets),
       "nefq_qH_solve_target_long": len(m.efq_qH_solve_target_long),
+      "nefq_qH_subtree_updates": len(m.efq_qH_subtree_updates),
+      "nefq_qH_subtree_offsets": len(m.efq_qH_subtree_offsets),
       "nM_fullm": len(m.M_fullm_i),
       "nqD_fullm": len(m.qD_fullm_i),
       "nv_plus_1": len(m.M_mulm_rowadr),

@@ -1522,6 +1522,9 @@ class _SparseLayout(NamedTuple):
   solve_target_adr: wp.array
   solve_target_offsets: wp.array
   solve_target_long: wp.array
+  subtree_updates: wp.array
+  subtree_offsets: wp.array
+  subtree_count: int
 
   @property
   def nlevels(self) -> int:
@@ -1549,6 +1552,9 @@ def _sparse_layout(m: Model, coupled: bool) -> _SparseLayout:
       m.efm_qH_solve_target_adr,
       m.efm_qH_solve_target_offsets,
       m.efm_qH_solve_target_long,
+      m.efm_qH_subtree_updates,
+      m.efm_qH_subtree_offsets,
+      m.efm_qH_subtree_count,
     )
   return _SparseLayout(
     m.M_rownnz,
@@ -1568,6 +1574,9 @@ def _sparse_layout(m: Model, coupled: bool) -> _SparseLayout:
     m.qLD_solve_target_adr,
     m.qLD_solve_target_offsets,
     m.qLD_solve_target_long,
+    m.qLD_subtree_updates,
+    m.qLD_subtree_offsets,
+    m.qLD_subtree_count,
   )
 
 
@@ -1591,6 +1600,9 @@ def _equality_layout(m: Model) -> _SparseLayout:
     m.efq_qH_solve_target_adr,
     m.efq_qH_solve_target_offsets,
     m.efq_qH_solve_target_long,
+    m.efq_qH_subtree_updates,
+    m.efq_qH_subtree_offsets,
+    m.efq_qH_subtree_count,
   )
 
 
@@ -4213,6 +4225,84 @@ def _solve_LD_sparse_fused(nv: int, nlevels: int, masked: bool = False, tree_mas
   return kernel
 
 
+@cache_kernel
+def _solve_LD_subtree_init(masked: bool, tree_masked: bool):
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    block_adr: wp.array[int],
+    y: wp.array2d[float],
+    done: wp.array[bool],
+    sparse_active: wp.array[int],
+    x: wp.array2d[float],
+  ):
+    i = wp.tid()
+    if wp.static(masked):
+      if done[0]:
+        return
+    if block_adr[i] == Q_LD_BLOCK_SPARSE:
+      if wp.static(tree_masked):
+        if sparse_active[0] == 0:
+          x[0, i] = 0.0
+          return
+      x[0, i] = y[0, i]
+
+  return kernel
+
+
+@cache_kernel
+def _solve_LD_subtree_phase(nv: int, nlevels: int, phase: int, masked: bool, tree_masked: bool):
+  """Subtree up, trunk up/diagonal/down, or subtree down, in separate graph launches."""
+  @wp.func_native(snippet="WP_TILE_SYNC();")
+  def _syncthreads():
+    pass
+
+  @wp.kernel(module="unique", enable_backward=False)
+  def kernel(
+    updates: wp.array[wp.vec3i],
+    offsets: wp.array[int],
+    block_adr: wp.array[int],
+    L: wp.array2d[float],
+    D: wp.array2d[float],
+    done: wp.array[bool],
+    sparse_active: wp.array[int],
+    trunk: int,
+    x: wp.array2d[float],
+  ):
+    block, tid = wp.tid()
+    width = wp.block_dim()
+    if wp.static(masked):
+      if done[0]:
+        return
+    if wp.static(tree_masked):
+      if sparse_active[0] == 0:
+        return
+    if wp.static(phase == 1):
+      block = trunk
+    if wp.static(phase != 2):
+      for n in range(wp.static(nlevels)):
+        level = wp.static(nlevels) - 1 - n
+        start = offsets[block * (wp.static(nlevels) + 1) + level]
+        end = offsets[block * (wp.static(nlevels) + 1) + level + 1]
+        if start != end:
+          for j in range(start + tid, end, width):
+            _solve_LD_sparse_update_fn(L, x, updates[j], 0, True, x)  # kernel_analyzer: ignore[atomic]
+          _syncthreads()
+    if wp.static(phase == 1):
+      for i in range(tid, wp.static(nv), width):
+        _solve_LD_sparse_diag_fn(block_adr, D, x, 0, i, x)
+      _syncthreads()
+    if wp.static(phase != 0):
+      for level in range(wp.static(nlevels)):
+        start = offsets[block * (wp.static(nlevels) + 1) + level]
+        end = offsets[block * (wp.static(nlevels) + 1) + level + 1]
+        if start != end:
+          for j in range(start + tid, end, width):
+            _solve_LD_sparse_update_fn(L, x, updates[j], 0, False, x)  # kernel_analyzer: ignore[atomic]
+          _syncthreads()
+
+  return kernel
+
+
 def _solve_LD_sparse(
   m: Model,
   d: Data,
@@ -4261,6 +4351,26 @@ def _solve_LD_sparse(
       outputs=[x],
       block_dim=dim_block,
     )
+    return
+
+  if wp.get_device().is_cuda and d.nworld == 1 and layout.subtree_count:
+    wp.launch(
+      _solve_LD_subtree_init(masked, tree_masked),
+      dim=m.nv,
+      inputs=[layout.block_adr, y, done, sparse_active],
+      outputs=[x],
+    )
+    for phase, blocks, width in ((0, layout.subtree_count, 256), (1, 1, 1024), (2, layout.subtree_count, 256)):
+      wp.launch(
+        _solve_LD_subtree_phase(m.nv, nlevels, phase, masked, tree_masked),
+        dim=(blocks, width),
+        inputs=[
+          layout.subtree_updates, layout.subtree_offsets, layout.block_adr, L, D, done, sparse_active,
+          layout.subtree_count,
+        ],
+        outputs=[x],
+        block_dim=width,
+      )
     return
 
   wp.launch(
