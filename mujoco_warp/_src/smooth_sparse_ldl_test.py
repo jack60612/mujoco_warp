@@ -143,7 +143,7 @@ class SparseLDLTest(parameterized.TestCase):
     elif shape == 1:
       xml = _tree_xml()
     else:
-      body = '<body><joint/><geom size=".1"/>' * 80 + '</body>' * 80
+      body = '<body><joint/><geom size=".1"/>' * 140 + '</body>' * 140
       xml = f"<mujoco><worldbody>{body}</worldbody></mujoco>"
     mjm = mujoco.MjModel.from_xml_string(xml)
     m = mjw.put_model(mjm)

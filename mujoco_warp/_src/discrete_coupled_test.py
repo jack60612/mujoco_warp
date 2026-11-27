@@ -358,6 +358,23 @@ class DiscreteCoupledFactorTest(parameterized.TestCase):
       mjw.forward(m, d)
     np.testing.assert_allclose(d.efm_qHLD.numpy(), expected, rtol=1e-5, atol=1e-6 * np.max(np.abs(expected)))
 
+  def test_deep_factor_layout_serial_oracle(self):
+    """Cross the construction chunk boundary while preserving the original update order."""
+    body = '<body><joint/><geom size=".1"/>' * 140 + '</body>' * 140
+    mjm = mujoco.MjModel.from_xml_string(f"<mujoco><worldbody>{body}</worldbody></mujoco>")
+    last = mjm.M_rowadr + mjm.M_rownnz - 2
+    parent = np.where(mjm.M_rownnz > 1, mjm.M_colind[np.maximum(last, 0)], -1)
+    rows = [mjm.M_colind[mjm.M_rowadr[i] : mjm.M_rowadr[i] + mjm.M_rownnz[i] - 1] for i in range(mjm.nv)]
+    layout = io.efm_qH_layout(mjm, (parent, rows))
+    rowadr, rownnz, colind = (layout[key] for key in ("rowadr", "rownnz", "colind"))
+    expected = []
+    for i, k, ki in layout["all_updates"]:
+      for src in range(rowadr[k], ki + 1):
+        dst = rowadr[i] + np.searchsorted(colind[rowadr[i] : rowadr[i] + rownnz[i]], colind[src])
+        expected.append((dst, src, ki, rowadr[k] + rownnz[k] - 1))
+    self.assertGreater(len(expected), 262144)
+    np.testing.assert_array_equal(layout["factor_elem"], expected)
+
   def test_layout_matches_m_without_couplings(self):
     """With M's own elimination tree and no pairs, the layout and schedules are M's sparse LDL."""
     with (

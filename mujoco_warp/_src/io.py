@@ -64,7 +64,7 @@ def _create_array(data: Any, spec, sizes: dict[str, int], batch_size: int = 1) -
   if data is None:
     array = wp.zeros(shape, dtype=spec.dtype)
   else:
-    data = np.array(data)
+    data = np.asarray(data)
     if is_batched and shape[0] != 1:
       target_shape = shape + getattr(spec.dtype, "_shape_", ())
       if data.shape != target_shape:
@@ -104,14 +104,14 @@ def _group_by_target(passes: Sequence[tuple[np.ndarray, int, Sequence[int]]]) ->
       first, size = first[segment], size[segment]
       segment_start = np.cumsum(size) - size
       member = np.arange(size.sum()) - np.repeat(segment_start, size) + np.repeat(first, size)
-      index.append(lo + order[member])
+      index.append((lo + order[member]).astype(np.int32))
       start.append(nindex + segment_start)
       level_long.append(nsegment + int(serial.sum()))
       nindex += int(size.sum())
       nsegment += len(segment)
       level_first.append(nsegment)
   start.append(np.array([nindex]))
-  return np.concatenate((np.zeros(0, dtype=int), *index)), np.concatenate(start), level_first, level_long
+  return np.concatenate((np.zeros(0, dtype=np.int32), *index)), np.concatenate(start), level_first, level_long
 
 
 def _ldl_targets(factor_elem, factor_elem_offsets, all_updates, level_offsets) -> dict:
@@ -632,16 +632,24 @@ def efm_qH_layout(
 
     # element (i, j) -= (k, j) * (k, i) / (k, k) for every element (k, j) of row k up to column i
     n = uadr - rowadr[uk] + 1
-    j = np.arange(n.sum()) - np.repeat(np.cumsum(n) - n, n)
-    src = np.repeat(rowadr[uk], n) + j
-    want = np.repeat(ui, n).astype(np.int64) * nv + colind[src]
-    dst = np.searchsorted(keys, want)
-    assert np.array_equal(keys[dst], want), "the factor's fill must lie in the coupled metric's layout"
-    factor_elem = np.stack((dst, src, np.repeat(uadr, n), np.repeat(rowadr[uk] + rownnz[uk] - 1, n)), axis=1)
+    starts = np.concatenate(([0], np.cumsum(n, dtype=np.int64)))
+    factor_elem = np.empty((max(int(starts[-1]), 1), 4), dtype=np.int32)
+    # Bound construction scratch independently of the total number of factor updates.
+    for lo in range(0, int(starts[-1]), 262144):
+      hi = min(lo + 262144, int(starts[-1]))
+      e = np.arange(lo, hi, dtype=np.int64)
+      update = np.searchsorted(starts, e, side="right") - 1
+      src = rowadr[uk[update]] + e - starts[update]
+      want = ui[update].astype(np.int64) * nv + colind[src]
+      dst = np.searchsorted(keys, want)
+      assert np.array_equal(keys[dst], want), "the factor's fill must lie in the coupled metric's layout"
+      factor_elem[lo:hi, 0] = dst
+      factor_elem[lo:hi, 1] = src
+      factor_elem[lo:hi, 2] = uadr[update]
+      factor_elem[lo:hi, 3] = rowadr[uk[update]] + rownnz[uk[update]] - 1
     if not len(ui):
-      factor_elem = np.zeros((1, 4), dtype=int)
-    elems = np.bincount(udepth, weights=n).astype(int) if len(ui) else np.zeros(0, dtype=int)
-    factor_elem_offsets = [0, *np.cumsum(elems[levels > 0])]
+      factor_elem.fill(0)
+    factor_elem_offsets = starts[np.asarray(level_offsets)].tolist()
 
   def element(rows: np.ndarray, cols: np.ndarray) -> np.ndarray:
     """Addresses of the elements (rows[n], cols[n]) of the factor's layout."""
