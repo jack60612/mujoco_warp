@@ -68,6 +68,28 @@ class SupportTest(parameterized.TestCase):
 
     _assert_eq(res.numpy()[0], mj_res, f"mul_m ({jacobian})")
 
+  def test_mul_m_warp_rows_match_serial(self):
+    if not wp.get_device().is_cuda:
+      self.skipTest("warp row reduction requires CUDA")
+    rng = np.random.default_rng(2)
+    nv, width = 129, 113
+    rowadr = wp.array(np.arange(nv + 1, dtype=np.int32) * width, dtype=int)
+    cols = wp.array(rng.integers(0, nv, size=nv * width, dtype=np.int32), dtype=int)
+    addresses = wp.array(np.arange(nv * width, dtype=np.int32), dtype=int)
+    matrix = wp.array(rng.standard_normal((1, nv * width)).astype(np.float32), dtype=float)
+    vec = wp.array(rng.standard_normal((1, nv)).astype(np.float32), dtype=float)
+    tree = wp.zeros(nv, dtype=int)
+    empty_bool = wp.empty(0, dtype=bool)
+    empty_tree = wp.empty((0, 0), dtype=int)
+    serial = wp.zeros((1, nv), dtype=float)
+    warp = wp.zeros((1, nv), dtype=float)
+    kernel = support.mul_m_kernel(False, False)
+    for lanes, result in ((1, serial), (32, warp)):
+      wp.launch(kernel, dim=(1, nv * lanes), inputs=[
+        tree, rowadr, cols, addresses, matrix, vec, empty_bool, empty_tree, lanes
+      ], outputs=[result])
+    np.testing.assert_allclose(warp.numpy(), serial.numpy(), rtol=2e-5, atol=2e-5)
+
   def test_xfrc_accumulated(self):
     """Tests that xfrc_accumulate output matches mj_xfrcAccumulate."""
     mjm, mjd, m, d = test_data.fixture("pendula.xml")

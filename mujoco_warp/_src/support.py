@@ -151,6 +151,22 @@ def compute_interp_cell_quat(
   return mat33_to_quat_polar(F)
 
 
+@wp.func_native(
+  snippet="""
+  float sum = value;
+#if defined(__CUDA_ARCH__)
+  if (lanes == 32) {
+    for (int offset = 16; offset > 0; offset >>= 1)
+      sum += __shfl_down_sync(0xffffffffu, sum, offset);
+  }
+#endif
+  return sum;
+"""
+)
+def _mul_m_warp_sum(value: float, lanes: int) -> float:
+  ...
+
+
 @cache_kernel
 def mul_m_kernel(check_skip: bool, tree_masked: bool = False):
   @wp.kernel(module="unique", grid_stride=False)
@@ -166,11 +182,14 @@ def mul_m_kernel(check_skip: bool, tree_masked: bool = False):
     vec: wp.array2d[float],
     skip: wp.array[bool],
     tree_active_in: wp.array2d[int],
+    lanes: int,
     # Out:
     res: wp.array2d[float],
   ):
-    """Sparse matmul: one thread per DOF, gather-based (no atomics)."""
-    worldid, dofid = wp.tid()
+    """Sparse matmul, with a warp per row on CUDA."""
+    worldid, threadid = wp.tid()
+    dofid = threadid // lanes
+    lane = threadid % lanes
 
     if wp.static(check_skip):
       if skip[worldid]:
@@ -179,19 +198,22 @@ def mul_m_kernel(check_skip: bool, tree_masked: bool = False):
     # M is block diagonal over kinematic trees: an inactive tree's row gathers only zero entries
     if wp.static(tree_masked):
       if tree_active_in[worldid, dof_treeid[dofid]] == 0:
-        res[worldid, dofid] = 0.0
+        if lane == 0:
+          res[worldid, dofid] = 0.0
         return
 
     # Gather all contributions (diagonal + off-diagonal).
     acc = float(0.0)
     start = M_mulm_rowadr[dofid]
     end = M_mulm_rowadr[dofid + 1]
-    for k in range(start, end):
+    for k in range(start + lane, end, lanes):
       col = M_mulm_col[k]
       madr = M_mulm_madr[k]
       acc += M_in[worldid, madr] * vec[worldid, col]
 
-    res[worldid, dofid] = acc
+    acc = _mul_m_warp_sum(acc, lanes)
+    if lane == 0:
+      res[worldid, dofid] = acc
 
   return _mul_m
 
@@ -261,9 +283,10 @@ def mul_m(
       outputs=[res],
     )
   else:
+    lanes = 32 if M.device.is_cuda and d.nworld == 1 and m.nv >= 1024 else 1
     wp.launch(
       mul_m_kernel(check_skip, tree_masked),
-      dim=(d.nworld, m.nv),
+      dim=(d.nworld, m.nv * lanes),
       inputs=[
         m.dof_treeid,
         m.M_mulm_rowadr,
@@ -273,6 +296,7 @@ def mul_m(
         vec,
         skip,
         tree_active if tree_masked else wp.empty((0, 0), dtype=int),
+        lanes,
       ],
       outputs=[res],
     )

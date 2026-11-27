@@ -4238,6 +4238,8 @@ def _solve_LD_sparse(
     _solve_LD_sparse_fused(m.nv, nlevels, masked, tree_masked)
   )
   dim_block = m.block_dim.solve_LD_sparse_fused if wp.get_device().is_cuda else 1
+  if wp.get_device().is_cuda and d.nworld == 1 and m.nv >= 1024:
+    dim_block = 1024
   if owned:
     wp.launch(
       _solve_LD_sparse_fused_owned(m.nv, nlevels, masked, tree_masked),
