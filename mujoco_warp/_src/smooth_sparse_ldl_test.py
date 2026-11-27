@@ -135,6 +135,30 @@ def _assert_solves(mjm, M, x, y):
 
 
 class SparseLDLTest(parameterized.TestCase):
+  @parameterized.parameters(0, 1, 2)
+  def test_factor_element_serial_oracle(self, shape):
+    """The vectorized schedule is identical to the former serial expansion."""
+    if shape == 0:
+      xml = '<mujoco><worldbody><body><joint/><geom size=".1"/></body></worldbody></mujoco>'
+    elif shape == 1:
+      xml = _tree_xml()
+    else:
+      body = '<body><joint/><geom size=".1"/>' * 80 + '</body>' * 80
+      xml = f"<mujoco><worldbody>{body}</worldbody></mujoco>"
+    mjm = mujoco.MjModel.from_xml_string(xml)
+    m = mjw.put_model(mjm)
+    updates, offsets = m.qLD_all_updates.numpy(), m.qLD_level_offsets.numpy()
+    expected, elem_offsets = [], [0]
+    for lo, hi in zip(offsets[:-1], offsets[1:]):
+      for i, k, ki in updates[lo:hi]:
+        expected.extend(
+          (mjm.M_rowadr[i] + j, mjm.M_rowadr[k] + j, ki, mjm.M_rowadr[k] + mjm.M_rownnz[k] - 1)
+          for j in range(mjm.M_rownnz[i])
+        )
+      elem_offsets.append(len(expected))
+    np.testing.assert_array_equal(m.qLD_factor_elem.numpy(), np.asarray(expected or [(0, 0, 0, 0)]))
+    np.testing.assert_array_equal(m.qLD_factor_elem_offsets.numpy(), elem_offsets)
+
   def test_model_layout(self):
     """The element list covers every (update, j) pair of each level, in serial order."""
     mjm, m, _ = _fixture(nworld=1)

@@ -121,7 +121,7 @@ def _ldl_targets(factor_elem, factor_elem_offsets, all_updates, level_offsets) -
   elements by the address M(i,j) they update, the backsubstitution's updates by the dof they
   update, x(i) in the up pass of every level, then x(k) in the down pass.
   """
-  factor_elem = np.asarray(factor_elem, dtype=int).reshape(-1, 4)
+  factor_elem = np.asarray(factor_elem).reshape(-1, 4)
   all_updates = np.asarray(all_updates, dtype=int).reshape(-1, 3)
   elem, adr, offsets, long = _group_by_target([(factor_elem, 0, factor_elem_offsets)])
   update, solve_adr, solve_offsets, solve_long = _group_by_target(
@@ -1641,17 +1641,25 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
   # factorization splits every update's row loop into one element M(i,j) -= M(k,j) * M(k,i) / M(k,k)
   # per row entry j, in the serial (update, j) order, with its four CSR addresses precomputed.
   all_updates_flat, level_offsets = [], [0]
-  factor_elem, factor_elem_offsets = [], [0]
   for level in sorted(sparse_updates):
-    for i, k, Madr_ki in sparse_updates[level]:
-      diag_k = mjm.M_rowadr[k] + mjm.M_rownnz[k] - 1
-      factor_elem.extend((mjm.M_rowadr[i] + j, mjm.M_rowadr[k] + j, Madr_ki, diag_k) for j in range(mjm.M_rownnz[i]))
-      all_updates_flat.append((i, k, Madr_ki))
+    all_updates_flat.extend(sparse_updates[level])
     level_offsets.append(len(all_updates_flat))
-    factor_elem_offsets.append(len(factor_elem))
+  updates = np.asarray(all_updates_flat, dtype=np.int32).reshape(-1, 3)
+  i, k, ki = updates.T
+  counts = mjm.M_rownnz[i]
+  starts = np.concatenate(([0], np.cumsum(counts, dtype=np.int64)))
+  factor_elem_offsets = starts[np.asarray(level_offsets)].tolist()
+  n = int(starts[-1])
+  factor_elem = np.empty((n, 4), dtype=np.int32)
+  j = np.arange(n, dtype=np.int32) - np.repeat(starts[:-1], counts)
+  factor_elem[:, 0] = np.repeat(mjm.M_rowadr[i], counts) + j
+  factor_elem[:, 1] = np.repeat(mjm.M_rowadr[k], counts) + j
+  factor_elem[:, 2] = np.repeat(ki, counts)
+  factor_elem[:, 3] = np.repeat(mjm.M_rowadr[k] + mjm.M_rownnz[k] - 1, counts)
+  del j, updates, i, k, ki, counts, starts
   m.qLD_all_updates = all_updates_flat if all_updates_flat else [(0, 0, 0)]
   m.qLD_level_offsets = level_offsets
-  m.qLD_factor_elem = factor_elem if factor_elem else [(0, 0, 0, 0)]
+  m.qLD_factor_elem = factor_elem if n else np.zeros((1, 4), dtype=np.int32)
   m.qLD_factor_elem_offsets = factor_elem_offsets
   m.qLD_level_offsets_host = tuple(level_offsets)
   m.qLD_factor_elem_offsets_host = tuple(factor_elem_offsets)
