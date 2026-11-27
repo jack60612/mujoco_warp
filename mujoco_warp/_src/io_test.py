@@ -599,6 +599,13 @@ class IOTest(parameterized.TestCase):
         ),
       )
 
+  @parameterized.parameters(1e-8, 1e-6, 1e-4)
+  def test_put_model_preserves_solver_tolerance(self, tolerance):
+    mjm = mujoco.MjModel.from_xml_string("<mujoco/>")
+    mjm.opt.tolerance = tolerance
+    model = mjwarp.put_model(mjm)
+    np.testing.assert_allclose(model.opt.tolerance.numpy(), [tolerance], rtol=1e-6, atol=0)
+
   @parameterized.parameters(*_IO_TEST_MODELS)
   def test_put_data_sizes(self, xml):
     EXPECTED_SIZES = {

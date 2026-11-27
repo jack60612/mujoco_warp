@@ -908,11 +908,6 @@ def put_model(mjm: mujoco.MjModel, batch_sizes: dict[str, int] | None = None) ->
     opt_kwargs["impratio_invsqrt"] = 1.0 / np.sqrt(np.maximum(mjm.opt.impratio, mujoco.mjMINVAL))
   opt = types.Option(**opt_kwargs)
 
-  # C MuJoCo tolerance was chosen for float64 architecture, but we default to float32 on GPU
-  # adjust the tolerance for lower precision, to avoid the solver spending iterations needlessly
-  # bouncing around the optimal solution
-  opt.tolerance = max(opt.tolerance, 1e-6)
-
   # warp only fields
   opt.broadphase = types.BroadphaseType.NXN
   opt.broadphase_filter = types.BroadphaseFilter.PLANE | types.BroadphaseFilter.SPHERE | types.BroadphaseFilter.OBB
